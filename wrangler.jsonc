@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kandra-site",
+  "compatibility_date": "2026-07-23",
+  // This is a fully static export (`output: "export"` in next.config.ts) — no
+  // Worker script, no OpenNext/SSR adapter. Deploy `out/` as static assets
+  // only. Without this file, Cloudflare's Next.js framework auto-detection
+  // routes the build through `opennextjs-cloudflare`, which expects a full
+  // server build (`.next/standalone/...`) that a static export never
+  // produces — that mismatch is what causes the ENOENT on deploy.
+  "assets": {
+    "directory": "./out",
+    "not_found_handling": "404-page"
+  }
+}
