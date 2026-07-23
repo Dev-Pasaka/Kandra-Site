@@ -57,5 +57,12 @@ depends on upstream state, not just this repo's own changes.
 
 ## Deployment
 
-`.github/workflows/deploy.yml` builds and deploys to GitHub Pages on every push to `main`. The site
-has no backend — it deploys equally well to Vercel, Netlify, or any static host.
+Cloudflare owns build and deploy: this repo is connected to a Cloudflare Workers project via its
+own Git integration (Workers Builds), which runs on every push to `main` independently of GitHub —
+`wrangler.jsonc` (a static-assets Worker, no `main` script) plus a `wrangler deploy` deploy command
+configured in the Cloudflare dashboard is the whole pipeline. Nothing here triggers that deploy.
+
+`.github/workflows/deploy.yml` is validation only — `check-stale-api` + `next build` on every push
+and PR, to catch content/build errors before Cloudflare ever sees them. It doesn't deploy anything.
+The site has no backend, so it would deploy equally well to Vercel, Netlify, or any static host if
+that ever changes.
