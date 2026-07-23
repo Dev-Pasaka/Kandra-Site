@@ -1,4 +1,4 @@
-name: Build and deploy docs site
+name: Build and validate docs site
 
 on:
   push:
@@ -9,10 +9,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: deploy
-  cancel-in-progress: false
 
 jobs:
   build:
@@ -29,28 +25,6 @@ jobs:
       - run: npm run check-stale-api
       - run: npm run build
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: site-out
-          path: out
-          retention-days: 1
-
-  deploy:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: site-out
-          path: out
-
-      # wrangler.jsonc has no "main" worker script, just `assets.directory: ./out` — this is a
-      # Workers static-assets deploy (`wrangler deploy`), not the older `wrangler pages deploy`.
-      - uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
+  # Deploy is handled by Cloudflare's own Git integration (auto-builds and deploys this repo on
+  # every push to main) — not by this workflow. This job exists only to catch content/build
+  # errors on PRs and pushes before Cloudflare's own build runs.

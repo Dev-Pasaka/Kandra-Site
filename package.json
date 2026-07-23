@@ -42,7 +42,6 @@
     "eslint-config-next": "16.2.11",
     "pagefind": "^1.5.2",
     "tailwindcss": "^4",
-    "typescript": "^5",
-    "wrangler": "^4.113.0"
+    "typescript": "^5"
   }
 }
