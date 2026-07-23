@@ -17,6 +17,9 @@ const STALE_PATTERNS = [
     message:
       "Found what looks like the removed `+`-prefixed query DSL (e.g. `+UserTable.email.eq(...)`). " +
       "Current syntax has no unary plus: `UserTable.email eq \"x\"`.",
+    // /changelog quotes this exact removed syntax verbatim as the "before" half of documenting
+    // the breaking change itself (0.4.5's entry) — that's the page's job, not a live mistake.
+    excludeFiles: ["app/(docs)/changelog/page.mdx"],
   },
   {
     name: "pre-rename KandraBatchScope.save/delete",
@@ -28,6 +31,17 @@ const STALE_PATTERNS = [
       "Found a bare save(/delete(/saveIfNotExists( call inside what looks like a batch scope block. " +
       "KandraBatchScope's methods are saveInBatch/deleteInBatch/saveIfNotExistsInBatch, not the bare names " +
       "(Kotlin resolves a same-named repository member over the batch scope's extension).",
+    // These three pages are *about* the pre-rename bug — a battle-scars retrospective, the
+    // changelog's original (pre-0.4.3) release entry, and a capstone recipe's "here's the bug
+    // this broke" aside — and each one legitimately quotes the old, broken save()/delete() shape
+    // as a labeled historical example, always annotated as fixed/renamed right next to it. Not a
+    // live mistake to fix; excluding them here is what keeps this check meaningful for every page
+    // that isn't inherently about this exact history.
+    excludeFiles: [
+      "app/(docs)/battle-scars/batch-scope-shadowing/page.mdx",
+      "app/(docs)/changelog/page.mdx",
+      "app/(docs)/recipes/social-feed-capstone/page.mdx",
+    ],
   },
   {
     name: "hand-hardcoded dependency version",
@@ -59,6 +73,8 @@ async function main() {
     const rel = relative(ROOT, file);
 
     for (const pattern of STALE_PATTERNS) {
+      if (pattern.excludeFiles?.includes(rel)) continue;
+
       if (pattern.contextRegex) {
         if (pattern.contextRegex.test(text)) {
           console.error(`\n✗ ${rel}\n  [${pattern.name}] ${pattern.message}`);
