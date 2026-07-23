@@ -1,0 +1,161 @@
+export const metadata = {
+  title: "14. Running it and shipping it",
+  description:
+    "From the page 02 docker-compose to a real multi-node deployment, the schemaMode choice for production, and a rolling-deploy walkthrough of health checks and graceful shutdown.",
+};
+
+# 14. Running it and shipping it
+
+Everything so far has run against [page 02](/tutorial/02-project-setup)'s single-node
+`docker-compose` ScyllaDB. This page closes the loop: what actually changes between that and a real
+deployment, and what a rolling deploy of this app looks like once [page 11](/tutorial/11-observability)'s
+health check and graceful shutdown are in the picture.
+
+## Local dev, recapped
+
+```yaml title="docker-compose.yml"
+services:
+  scylla:
+    image: scylladb/scylla:latest
+    ports:
+      - "9042:9042"
+    command: --smp 1 --memory 750M --overprovisioned 1 --api-address 0.0.0.0
+```
+
+```bash
+docker compose up -d
+./gradlew run
+```
+
+One node, `ReplicationStrategy.SimpleStrategy(replicationFactor = 1)` ([page 04](/tutorial/04-plugin-install)'s
+default), no real availability story — and that's the correct tradeoff for a laptop dev loop:
+fast to start, nothing to configure, disposable. Nothing about the app's code changes for
+production; everything below is configuration.
+
+## What actually changes for a real cluster
+
+<Callout kind="note">
+This section is deliberately brief — [`/recipes/multi-dc-deployment`](/recipes/multi-dc-deployment)
+covers multi-node/multi-DC configuration in full depth (replication strategy math, `loadBalancing`/
+`failover` tuning, cross-DC consistency tradeoffs). This page only maps this app's specific config
+knobs to what changes, not why each knob works the way it does.
+</Callout>
+
+- **`replicationStrategy`** moves from `SimpleStrategy(replicationFactor = 1)` to
+  `NetworkTopologyStrategy(mapOf("us-east" to 3, "eu-west" to 3))` (or whatever your real DC layout
+  is) — replication factor per datacenter, not a single cluster-wide number.
+- **`contactPoints`** becomes a real multi-node seed list, not `localhost:9042`.
+- **`localDatacenter`** must match the actual DC name the driver connects through — a mismatch here
+  fails at session-build time, not silently.
+- **`auth`**: this app already uses `KandraAuth.fromEnv()` ([page 04](/tutorial/04-plugin-install)),
+  which needs no code change — just real `SCYLLA_USERNAME`/`SCYLLA_PASSWORD` values in the
+  production environment instead of local dev's (or none, if the local Scylla container has auth
+  disabled entirely).
+- **`autoCreateKeyspace`**: `true` locally is convenient; a real deployment's keyspace is normally
+  provisioned by ops with a deliberately-chosen replication strategy, not created on the fly by
+  whichever app instance happens to start first with elevated permissions it may not even have.
+
+## `schemaMode` for production: not `AUTO_CREATE`
+
+This app has used `SchemaMode.AUTO_CREATE` since [page 04](/tutorial/04-plugin-install), and
+[page 13](/tutorial/13-migrations) explained why that stayed safe even after introducing
+`kandra-migrate`: `AUTO_CREATE` only ever issues `CREATE TABLE IF NOT EXISTS`, never touches an
+existing table's columns. That's exactly why it's the wrong mode to leave on for a production
+deploy pipeline, even though it never broke anything so far — it's not that it's dangerous, it's
+that it's silent. Every instance start re-runs schema DDL nobody reviewed as part of the deploy,
+and if the entity ever drifted from the real table for a reason `AUTO_CREATE` can't fix
+(a genuine column type change, say), nothing about `AUTO_CREATE` tells you.
+
+`SchemaMode.VALIDATE` is the honest production default once schema changes go through
+[page 13](/tutorial/13-migrations)'s migrations instead: read-only at startup, diffs every
+registered entity's columns against `system_schema.columns`, and **throws `KandraSchemaException`**
+if anything the entity expects is missing — failing the deploy at startup, loudly, instead of
+having some route discover a missing column via a runtime codec error hours later. Pair it with
+`SchemaMode.NONE` for the tables `kandra-migrate` now fully owns (`todos`, after page 13's
+`priority` migration) — `NONE` means "no DDL, no diff, migrations already did this" — and
+`VALIDATE` for anything still convenient to let Kandra check but not alter.
+
+```kotlin title="Application.kt" {3}
+install(Kandra) {
+    // ...
+    schemaMode = if (environment.config.property("app.env").getString() == "production")
+        SchemaMode.VALIDATE else SchemaMode.AUTO_CREATE
+    // ...
+}
+```
+
+<Callout kind="tip">
+`AUTO_MIGRATE` sits between these two and is worth naming explicitly here: convenient for adding
+columns automatically, but — per [page 13](/tutorial/13-migrations)'s argument — it does so with no
+locking between concurrently-starting instances and no `IF NOT EXISTS` guard on its `ALTER TABLE
+ADD`. It's a reasonable choice for a single-instance deployment; for anything that rolling-deploys
+multiple instances at once, prefer `kandra-migrate` + `VALIDATE`/`NONE` over `AUTO_MIGRATE`.
+</Callout>
+
+## A rolling deploy, walked through
+
+A new version of this app is being deployed — three running instances, one replaced at a time. The
+orchestrator (Kubernetes, ECS, whatever) is about to terminate the first old instance and start a
+new one in its place.
+
+**1. The orchestrator stops routing new traffic to the instance being replaced**, typically by
+marking it not-ready and pulling it out of load-balancer rotation — this step happens in your
+deployment platform, not in Kandra.
+
+<Callout kind="danger" title="GET /kandra/health does not know about the shutdown drain">
+It's tempting to assume the health check and graceful shutdown are the same mechanism working
+together — they aren't. `runtime.isHealthy()`, the function backing `GET /kandra/health`, is a
+plain `SELECT release_version FROM system.local` against the still-open session — nothing in its
+implementation reads `isShuttingDown`, verified directly from `KandraRuntime.kt`. During the entire
+drain window described below, `/kandra/health` keeps returning `200 {"status":"UP"}`, because the
+session genuinely is still up. If your orchestrator's traffic-removal step depends on this endpoint
+starting to fail, it never will — traffic-removal has to be driven by the deploy/orchestration
+lifecycle (a `preStop` hook, a deregistration step) independently of this health route, which this
+app's `GET /kandra/health` was never meant to drive in the first place. It answers "is ScyllaDB
+reachable," not "should you still be sending this instance requests."
+</Callout>
+
+**2. The orchestrator sends `SIGTERM`.** Ktor's `ApplicationStopping` event fires. With
+`shutdown { graceful = true; drainTimeoutMs = 5_000 }` ([page 11](/tutorial/11-observability)):
+`runtime.isShuttingDown` is set `true` immediately. From this instant, every new call into a
+Kandra repository method on this instance — `save`, `findById`, `update`, everything that routes
+through `checkNotShuttingDown()` — throws `KandraQueryException("Kandra is shutting down — new
+queries are rejected")`. Any request that reached this instance after step 1 should have failed to
+arrive at all (the orchestrator already pulled it from rotation); a request that's already
+in-flight and only *starts* its Kandra call now is the edge case this guards.
+
+**3. Kandra blocks the shutdown thread, waiting for `inFlightCount` to reach zero.** Every
+already-in-progress query — a `todoRepo.save(todo)` mid-flight, a page 06 `KandraBatchScope` commit
+that started a moment before `SIGTERM` — gets to finish. This is the concrete, operational payoff of
+"graceful": without it, `ApplicationStopped` would close the `CqlSession` immediately underneath a
+write that was already committed on ScyllaDB's side but whose response hadn't come back to the
+caller yet, or underneath the second statement of a two-repo batch scope whose first statement
+already landed.
+
+**4. Either every in-flight query finishes, or `drainTimeoutMs` (5 seconds here) elapses first.**
+If the deadline hits with queries still outstanding, Kandra logs a `WARN` naming the remaining
+`inFlightCount` and proceeds anyway — graceful shutdown is a best-effort drain window, not a
+guarantee nothing is ever cut off.
+
+**5. `ApplicationStopped` fires: the `CqlSession` closes, then `pluginScope` (the coroutine scope
+backing `EVENTUAL` lookup writes and credential rotation) is cancelled** — in that order,
+specifically, so no coroutine on that scope can start new work against an already-closed session.
+The process exits. The new instance, meanwhile, has already gone through its own startup sequence —
+schema validation (`VALIDATE`, above), `GET /kandra/health` returning `UP` — before the orchestrator
+adds it back to rotation.
+
+<Callout kind="tip">
+If `drainTimeoutMs` is tuned shorter than `pool.requestTimeoutMillis` ([page 04](/tutorial/04-plugin-install)'s
+`10_000`) plus retry backoff, the drain can hit its deadline while a request is still legitimately
+retrying a transient timeout, not stuck — see [page 11](/tutorial/11-observability)'s note on
+sizing this relative to the request timeout.
+</Callout>
+
+That's the full loop this tutorial builds toward: a schema designed from access patterns
+([page 01](/tutorial/01-modeling)), atomicity applied only where two writes genuinely need it
+([page 06](/tutorial/06-denormalization)), concurrency handled where it's a real risk
+([page 07](/tutorial/07-concurrency), [page 09](/tutorial/09-counters)), and a process that starts
+up validated and shuts down without losing an in-flight write.
+
+Next: [`/tutorial/15-what-we-didnt-do`](/tutorial/15-what-we-didnt-do) — a deliberate list of what
+this app doesn't have, and why each absence is a decision, not a gap.

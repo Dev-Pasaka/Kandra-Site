@@ -1,0 +1,218 @@
+import { dokkaClassUrl, dokkaModuleUrl } from "@/lib/dokka";
+
+export const metadata = {
+  title: "kandra-migrate",
+  description:
+    "KandraMigration and KandraMigrationRunner — versioned, checksummed, LWT-claim-locked CQL migrations for when SchemaMode.AUTO_MIGRATE isn't enough.",
+};
+
+# kandra-migrate
+
+`kandra-migrate` is the module for versioned, checksummed CQL schema migrations — reach for it when
+`kandra-ktor`'s `SchemaMode.AUTO_MIGRATE` isn't enough: renames, backfills, index changes, drops,
+anything that isn't "add a column that's missing." It's a small module,
+`io.kandra.migrate.{KandraMigration, KandraMigrationRunner, MigrationHistory}`, built around one
+idea — a migration is a Kotlin `object`, applied at most once, tracked in a `kandra_migrations`
+table, with a checksum that detects if you edited it after it ran.
+
+## Why this exists as a separate module
+
+`kandra-migrate` depends on `kandra-core` and the raw DataStax driver directly
+(`implementation(project(":kandra-core"))`, `implementation(libs.datastax.driver)`) — notably, it
+does **not** depend on `kandra-runtime` or `kandra-ktor` at all. A `KandraMigration.up(session)`
+takes the plain driver `CqlSession` and issues CQL with `session.execute(...)`, not through a
+`KandraRepository`. That's deliberate: migrations are meant to run **before** `install(Kandra)`, with
+`schemaMode = SchemaMode.NONE` so the plugin's own DDL doesn't race the migration runner's — which
+means a migration runner has to be usable with nothing more than a session, before any Kandra
+runtime or plugin exists yet. Keeping this module free of the `kandra-runtime`/`kandra-ktor`
+dependency is what makes that ordering possible at all.
+
+```kotlin title="Application.kt"
+fun Application.configureMigrations(session: CqlSession) {
+    // Run BEFORE install(Kandra) so schemaMode = NONE has a schema to see.
+    KandraMigrationRunner(session).run(V1_CreateUsers, V2_AddPhoneToUsers, V3_AddPhoneIndex)
+
+    install(Kandra) {
+        contactPoints = "127.0.0.1:9042"
+        keyspace = "myapp"
+        localDatacenter = "dc1"
+        schemaMode = SchemaMode.NONE   // migrations own the schema, plugin does no DDL
+        register(User::class)
+    }
+}
+```
+
+## `KandraMigration` — abstract class
+
+```kotlin
+abstract class KandraMigration(val version: Int, val name: String) {
+    abstract fun up(session: CqlSession)
+    internal fun checksum(): String
+}
+```
+
+`version` determines apply order (ascending) and is the tracking table's partition key — must be
+unique across every migration you ever define. `name` is a free-text label stored alongside
+`version` and echoed in log lines and exception messages. `up(session)` is **blocking, not
+`suspend`** — call `session.execute(...)` directly with plain CQL.
+
+```kotlin
+object V3_AddPhoneIndex : KandraMigration(version = 3, name = "add phone lookup index") {
+    override fun up(session: CqlSession) {
+        session.execute("CREATE INDEX IF NOT EXISTS users_phone_idx ON users (phone)")
+    }
+}
+```
+
+<Callout kind="danger" title="checksum() hashes the migration's compiled bytecode, not just its identity">
+`checksum()` is SHA-256 of `"${version}:${name}:${this::class.qualifiedName}"` **plus the migration
+class's own compiled `.class` bytecode**, read via `getResourceAsStream` and folded into the same
+digest:
+
+```kotlin
+internal fun checksum(): String {
+    val digest = java.security.MessageDigest.getInstance("SHA-256")
+    digest.update("${version}:${name}:${this::class.qualifiedName}".toByteArray())
+    val resourceName = "/" + this::class.java.name.replace('.', '/') + ".class"
+    this::class.java.getResourceAsStream(resourceName)?.use { digest.update(it.readBytes()) }
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+```
+
+This means editing the CQL inside an already-applied migration's `up()` body **does** change its
+checksum, and **will** be caught as a mismatch the next time `run()` sees that version — the runner
+is not blind to body edits. What it still cannot detect is a change that recompiles to
+byte-identical class output (extremely rare in practice) or a change to something the migration's
+`up()` calls that lives in a *different* class file. The practical rule stands regardless: never
+modify a migration after it has been applied anywhere — the checksum check exists specifically to
+catch you if you do, not to be routed around.
+</Callout>
+
+## `KandraMigrationRunner`
+
+```kotlin
+class KandraMigrationRunner(private val session: CqlSession) {
+    fun run(vararg migrations: KandraMigration)
+    fun history(): List<MigrationHistory>
+}
+```
+
+The constructor's `init` block immediately runs
+`CREATE TABLE IF NOT EXISTS kandra_migrations (version INT, name TEXT, applied_at TIMESTAMP,
+checksum TEXT, PRIMARY KEY (version))` — every time a runner is constructed, not just once;
+`IF NOT EXISTS` makes this a no-op on subsequent app starts.
+
+### `run(vararg migrations)` — exact control flow
+
+1. Loads every applied migration's history in one `SELECT` (a snapshot, not refreshed mid-loop).
+2. Sorts the vararg array ascending by `version`, regardless of the order you passed them in.
+3. For each migration, in ascending version order:
+   - **Already applied, checksum matches** → logs DEBUG, skips to the next migration.
+   - **Already applied, checksum mismatches** → throws `KandraMigrationException` immediately,
+     aborting the rest of the run.
+   - **Not yet applied** → attempts to **claim** the version via an LWT
+     `INSERT INTO kandra_migrations (...) VALUES (...) IF NOT EXISTS`, with `applied_at` stamped
+     *before* `up()` runs and `checksum()` computed up front. If the claim fails (another runner
+     instance already inserted that version concurrently), logs INFO and skips — this is what makes
+     it safe to run migrations from multiple app instances starting up at once without two of them
+     racing to execute the same migration. If the claim succeeds, calls `migration.up(session)`.
+     - `up()` succeeds → logs INFO; the claim row **is** the applied record, nothing further to
+       insert.
+     - `up()` throws → the claim row is deleted (`DELETE FROM kandra_migrations WHERE version = ?`),
+       releasing the claim so a retried `run()` can pick this version up again, then rethrows as
+       `KandraMigrationException("Migration v${version} ('${name}') failed: ${e.message}", e)` —
+       wrapping the original exception as `cause`.
+
+```kotlin
+// Applied in a previous deploy — version, name, and class identity/bytecode must never change now.
+object V1_CreateUsers : KandraMigration(version = 1, name = "create users table") {
+    override fun up(session: CqlSession) {
+        session.execute("""
+            CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, email TEXT)
+        """.trimIndent())
+    }
+}
+
+KandraMigrationRunner(session).run(V1_CreateUsers)
+```
+
+<Callout kind="gotcha" title="Claiming happens via LWT — locking, not just bookkeeping">
+The `INSERT ... IF NOT EXISTS` claim step is a real Lightweight Transaction, not a plain insert —
+it's what stops two application instances starting up simultaneously against the same keyspace from
+both running the same migration's `up()` concurrently. Only the instance whose `IF NOT EXISTS` wins
+the Paxos round actually calls `up()`; the loser sees the claim already taken and skips. This costs a
+consensus round per not-yet-applied migration on every startup — negligible compared to running
+migrations, but worth knowing it's there if you're wondering why a migration runner issues an LWT at
+all.
+</Callout>
+
+<Callout kind="gotcha" title="Fail-fast per run(), not transactional across migrations">
+An exception from one migration's `up()` aborts every later migration in that same `run()` call, but
+does not roll back any migration that already succeeded earlier in the same call — those stay
+applied. Whatever CQL the *failing* migration already executed before throwing also stays applied to
+the keyspace (ScyllaDB DDL isn't transactional either), even though its claim was released and it
+will be retried from the top on the next `run()`. Write `up()` bodies idempotently
+(`IF NOT EXISTS`/`IF EXISTS`) so a partial-then-retried migration doesn't blow up on the second
+attempt.
+</Callout>
+
+### `history(): List<MigrationHistory>`
+
+```kotlin
+data class MigrationHistory(val version: Int, val name: String, val appliedAt: Instant, val checksum: String)
+```
+
+Public, safe to call any time — e.g. from a health/admin endpoint. Reads and re-sorts client-side by
+`version` ascending (CQL gives no ordering guarantee here, since `version` is the partition key).
+
+## `KandraMigrationException`
+
+```kotlin
+class KandraMigrationException(message: String, cause: Throwable? = null) : KandraException(message, cause)
+```
+
+Defined in `kandra-core`'s exception package, thrown from two places in this module: a checksum
+mismatch on an already-applied version (no `cause` — there's no underlying exception to wrap for a
+mismatch), and a failing `up()` (wrapped, with the original exception as `cause`).
+
+```kotlin
+try {
+    KandraMigrationRunner(session).run(V1_CreateUsers, V2_AddPhoneToUsers, V3_AddPhoneIndex)
+} catch (e: KandraMigrationException) {
+    logger.error(e) { "Migration failed — refusing to start with an unmigrated schema." }
+    throw e
+}
+```
+
+## Gotchas worth double-checking in review
+
+- Migrations must be Kotlin `object`s, not `class`es you instantiate fresh each time — the runner
+  needs one stable, comparable instance per version.
+- `checksum()` hashes `version`, `name`, the class's qualified name, **and** the compiled class
+  bytecode — editing an already-applied migration's `up()` body is caught, not silently ignored.
+  Never edit one anyway; add a new migration with a new version instead.
+- `run()` is fail-fast per call, not transactional: one migration's failure aborts every later
+  migration in that call, while everything before it (and whatever the failing one already ran)
+  stays applied. Idempotent `up()` bodies are what make a retried run safe.
+- The LWT claim step means concurrent app-instance startups racing the same migration set is a
+  supported, safe scenario — exactly one instance runs each not-yet-applied migration, the rest skip
+  it after losing the claim.
+- Call the runner **before** `install(Kandra)`, paired with `schemaMode = SchemaMode.NONE` — running
+  it after `install(Kandra)` with `AUTO_CREATE`/`AUTO_MIGRATE` risks the plugin's own DDL racing the
+  runner's.
+- `KandraMigrationException` fires on both a checksum mismatch (no `cause`) and a failing `up()`
+  (wrapped `cause`) — check `e.cause` if you need to distinguish which happened.
+
+## Full API reference
+
+[`kandra-migrate` on Dokka →]({dokkaModuleUrl("kandra-migrate")}) ·
+[`KandraMigrationRunner` →]({dokkaClassUrl("kandra-migrate", "io.kandra.migrate", "KandraMigrationRunner")})
+
+## Where this shows up elsewhere on this site
+
+- [`/battle-scars/migration-safety`](/battle-scars/migration-safety) — the checksum and
+  LWT-claim-locking design in more depth, including why the earlier "insert-then-run" ordering
+  wasn't safe under concurrent startups.
+- [`/recipes/migrations`](/recipes/migrations) — a full worked migration set.
+- [`/modules/kandra-ktor`](/modules/kandra-ktor#schemamode) — `SchemaMode.NONE` and where
+  `AUTO_MIGRATE` stops being enough.

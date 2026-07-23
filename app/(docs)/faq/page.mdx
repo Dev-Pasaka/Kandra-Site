@@ -1,0 +1,213 @@
+export const metadata = {
+  title: "FAQ",
+  description:
+    "Direct answers to the questions a working engineer actually asks before adopting Kandra — mental model, driver overhead, Cassandra/ScyllaDB compatibility, testing, and version requirements.",
+};
+
+# FAQ
+
+Straight answers, not marketing copy. If something genuinely isn't verifiable from the source or
+docs, that's stated plainly below instead of guessed at.
+
+## Why not Hibernate / Spring Data Cassandra / Exposed?
+
+Because they start from the wrong question. A relational ORM's whole job is to let you write
+`findByEmail(email)` against *any* column and have the database figure out how — that's the
+mental model an ORM exists to serve, and it's a mental model built for a database where "add an
+index and the query just works" is basically true.
+
+Cassandra/ScyllaDB doesn't work that way, and no ORM can paper over that without lying to you.
+Every table is designed around the specific queries it needs to serve — "query-first modeling" —
+and a query against a column that isn't the partition key, a clustering key, or an explicitly
+indexed column doesn't get slower, it becomes a cluster-wide scatter-gather scan. An ORM whose
+mental model is "hide the database, expose an object graph" hides exactly the fact you most need
+to see: that "find X by Y" on a non-key column is either a table you haven't built yet or a
+scatter-gather query you're choosing on purpose.
+
+Kandra's mental model is the opposite: partition-oriented modeling, surfaced in the type system,
+not hidden behind it. `@LookupIndex` makes "I need to query by a second field" an explicit,
+generated denormalized table instead of an ORM secretly running `ALLOW FILTERING` for you.
+`@PartitionKey`/`@ClusteringKey` make "where does this row physically live, and in what order" a
+property of the entity definition, not an implementation detail the ORM promises to handle. This
+isn't Kandra being stricter than Hibernate for strictness's sake — it's Kandra refusing to build
+the one abstraction (arbitrary-column querying) that doesn't actually exist on this database. See
+[`/why`](/why) and [`/foundations`](/foundations) for the full argument.
+
+## Why not just use the DataStax driver directly?
+
+You can — Kandra is built on top of the DataStax Java driver, not a replacement for it, and
+nothing stops you from dropping to `CqlSession` directly (`repo.raw()`/`repo.rawQuery()` exist
+precisely for that). What Kandra buys you over hand-written CQL:
+
+- **DDL generation and startup validation.** Kandra generates `CREATE TABLE`/`ALTER TABLE` from
+  your entity's annotations and, depending on `SchemaMode`, either creates, migrates, or validates
+  the real schema *when the plugin installs* — not on the first request that happens to hit a
+  mismatched column. Hand-written CQL has no equivalent: a typo in a column name in raw CQL fails
+  at query time, in whatever environment first exercises that code path.
+- **A query DSL that structurally cannot express `ALLOW FILTERING`.** There's no method on
+  `QueryContext` that produces it. Hand-building CQL strings, you can always type
+  `ALLOW FILTERING` — nothing stops you, and it'll run fine on a small dataset. Kandra's DSL fails
+  at query-build time instead, pointing you at `@SecondaryIndex`.
+- **Denormalization as annotations, not hand-maintained duplicate write paths.** `@LookupIndex`
+  generates the lookup table's DDL and keeps its writes/deletes in sync with the primary table.
+  With the raw driver, "also write `users_by_email`" is a line of code someone has to remember to
+  add to every write path that touches `users`, forever.
+  See [`/why#where-did-my-lookup-table-go-out-of-sync`](/why#where-did-my-lookup-table-go-out-of-sync).
+- **Batch scope safety.** `KandraBatchScope` (`saveInBatch`/`deleteInBatch`) makes a `LOGGED
+  BATCH` an explicit, bounded block instead of a raw driver `BatchStatement` you assemble by hand
+  and hope every call site remembers to use consistently.
+- **Type-safe codecs and generated `*Table` refs.** `kandra-codegen`'s KSP processor generates
+  `UserTable.email`-style column references from your entity, so a renamed field is a compile
+  error in every query that referenced it, instead of a silently-wrong bound CQL string.
+
+The honest tradeoff: all of that is a layer between you and the driver, and every layer is a
+place a bug can hide that wouldn't exist in raw CQL — see [`/battle-scars`](/battle-scars) for a
+full accounting of the bugs this project has actually shipped in that layer, and how each one was
+found and fixed. Kandra's bet is that structural safety (can't-express-`ALLOW FILTERING`,
+startup-time schema validation, generated lookup tables) is worth the surface area. If your
+access patterns are simple enough, or you want zero abstraction between you and the wire protocol,
+the driver alone is a completely reasonable choice.
+
+## Does this work with plain Apache Cassandra, or only ScyllaDB?
+
+Kandra is built on the DataStax Java Driver (4.17.0), which targets the CQL wire protocol both
+Cassandra and ScyllaDB implement — ScyllaDB is wire-compatible with Cassandra's CQL and client
+protocol by design, and Kandra doesn't talk to anything below that protocol layer. Nothing in
+`kandra-core`'s DDL generation or `kandra-runtime`'s query/codec layer is ScyllaDB-specific CQL —
+it's the same `CREATE TABLE`, `INSERT`, LWT, and batch syntax either database accepts.
+
+That said, verify the specific claim you're relying on:
+
+- The project's own integration tests (`kandra-test`, `KandraTestcontainers`) run against the
+  `org.testcontainers:cassandra` Testcontainers module — an actual Apache Cassandra container —
+  even though the prose throughout `README.md`/`docs/USER_GUIDE.md` consistently says "ScyllaDB."
+  That's a real signal the driver-level compatibility holds in practice, not just in theory.
+  (Verified against `docs/USER_GUIDE.md`'s testing section, current Kandra source as of v0.4.5.)
+- The project's real-cluster test plan (`docs/test-plan/`, `docs/report:1.0/`) was run
+  exclusively against a 3-node **ScyllaDB** cluster, not Cassandra. So while nothing in the code
+  is Scylla-specific, the deepest, most adversarial real-cluster verification Kandra has actually
+  had was against ScyllaDB, not Cassandra.
+- The docs use ScyllaDB-specific language in a few places worth knowing about even though they
+  don't change behavior — e.g. `batchWarnThresholdKb`'s default is described as ScyllaDB's batch
+  size recommendation, and `gc_grace_seconds`/compaction defaults are described in ScyllaDB terms.
+  These are configuration defaults, not hard-coded ScyllaDB dependencies — nothing prevents
+  tuning them for a Cassandra deployment's own defaults.
+
+Bottom line: nothing Kandra-specific is ScyllaDB-only by design or by code path, but the project's
+own heaviest real-cluster testing has been against ScyllaDB, and that's a meaningfully different
+level of confidence than "the driver protocol is compatible."
+
+## What's the performance overhead?
+
+Verifiable, plainly: Kandra wraps every read and write with a codec layer (Kotlin type ⇄ CQL
+type), and every `save()`/`update()` path with schema/validation lookups (`SchemaRegistry`,
+optional `KandraValidator`) before the statement reaches the driver. All suspend read and write
+paths use the driver's true async API (`executeAsync().await()`) rather than blocking a coroutine
+dispatcher thread — see [ISS-014](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-014-blocking-query-executor.md)
+— so the concurrency model doesn't add thread-blocking overhead on top of the driver's own.
+
+What's **not** verifiable, and not measured: there is no published benchmark comparing Kandra's
+per-query latency or throughput against the bare DataStax driver. `docs/test-plan/` and
+`docs/report:1.0/` are a *functional and correctness* test plan against a real 3-node ScyllaDB
+cluster — they confirm behavior (does `save()` do what it says, does a dropped quorum fail fast
+rather than hang, ~90ms observed for one quorum-loss write scenario) — not a latency/throughput
+benchmark of Kandra's overhead versus raw CQL. If you need a number for capacity planning, this
+site doesn't have one to give you honestly; you'd need to benchmark your own access patterns.
+
+## How do I test this?
+
+Two genuinely different tools, for two genuinely different things — don't reach for the wrong
+one:
+
+- **`FakeKandraSession`** — an in-memory session for fast, structural unit tests (did this code
+  call `save` on the right repository, did the batch scope collect the statements you expected).
+  It does not exercise real LWT semantics, real codec/parameter binding, or real data
+  round-trips — see [ISS-020](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-020-fake-session-lwt-semantics.md)
+  for exactly where that line is, deliberately.
+- **`KandraTestcontainers`** — a real Cassandra/ScyllaDB container per test class, isolated
+  keyspace per class, for tests that need real semantics: real LWT conflicts, real tombstone
+  behavior, real consistency-level effects.
+
+Full walkthrough: [`/tutorial/12-testing`](/tutorial/12-testing). The reasoning for why both tools
+exist and where the line between them sits: [`/philosophy/testing`](/philosophy/testing).
+
+## Is Kandra production-ready? Who uses it?
+
+No named production adopters are documented anywhere in the project — this site won't claim
+otherwise. What *is* verifiable: as of the current issue tracker
+(`docs/issues/README.md`), there are zero open issues, and the fixed issues each carry the
+real-cluster verification method used (unit test only, vs. confirmed live against a real
+3-node ScyllaDB cluster). The 0.4.3/0.4.4/0.4.5 changelog entries are specifically a
+find-fix-reverify cycle driven by running a real-cluster test plan (`docs/test-plan/`,
+`docs/report:1.0/`) against the published Maven Central artifact — and that report is explicit
+that its own first run was **partial** (roughly 43% of its functional coverage matrix), not a
+clean bill of health it's hiding a gap in. Read
+[`docs/report:1.0/SUMMARY.md`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/report:1.0/SUMMARY.md)
+yourself before deciding what "tested" means for your use case — the honest summary is: rigorously
+tested for the bugs it has found and fixed, incompletely tested against the full matrix it set out
+to cover, and not yet claimed as production-proven by any named adopter.
+
+## What Kotlin/JVM/Ktor versions does this need?
+
+Per `gradle.properties` and `docs/USER_GUIDE.md` (current as of v0.4.5):
+
+- Kotlin **2.1.21** (pinned deliberately — Kotlin 2.0.0 has a parser bug against Java 25 in
+  Gradle's embedded compiler)
+- Build/run with **JDK 21** — the default JDK 25 breaks the Kotlin compiler embedded in Gradle
+  8.11 for this project; `README.md` calls this out explicitly (`JAVA_HOME=<jdk-21-path>`)
+- Ktor **2.3.13**
+- DataStax Java Driver **4.17.0**
+- Gradle **8.11** (per `gradle.properties`; the project's own real-cluster test report notes the
+  actual wrapper it ran with was 9.3.0 — a known, low-severity doc/config drift, not a Kandra bug)
+- KSP **2.1.21-2.0.1** (for `kandra-codegen`)
+
+## How do I adopt Kandra on an existing Cassandra/ScyllaDB app incrementally?
+
+Nothing in the docs describes a dedicated "adopt Kandra on an existing schema" migration guide —
+here's what's actually verifiable from the schema-mode and migration primitives that exist:
+
+- Start with **`SchemaMode.VALIDATE`** against your existing keyspace. It checks every entity
+  column exists with a compatible type and throws `KandraSchemaException` on mismatch, without
+  ever running `CREATE`/`ALTER` — the safest way to point Kandra entities at a schema Kandra
+  didn't create, and find out immediately where your entity definitions and the real table
+  disagree.
+- Model entities for the tables you actually have first, one at a time — Kandra doesn't require
+  every table in a keyspace to be modeled as a Kandra entity simultaneously; unmapped tables are
+  simply untouched.
+- `kandra-migrate`'s versioned, checksum-validated `KandraMigration`/`KandraMigrationRunner` is
+  the tool for schema changes going forward once you're on Kandra, not a tool for describing your
+  existing schema retroactively.
+- `SchemaMode.NONE` disables all Kandra-managed DDL entirely if you'd rather manage schema
+  externally (existing Liquibase/Flyway-for-CQL tooling, ops-managed DDL) while still getting
+  Kandra's repositories, codecs, and query DSL against that schema.
+
+If your existing schema doesn't cleanly map to Kandra's assumptions (e.g. a table whose delete
+semantics don't match `@SoftDelete`'s TTL model, or a key shape Kandra's clustering-key handling
+doesn't expect), that's a real gap this FAQ can't paper over — model it by hand against
+`SchemaMode.VALIDATE`/`NONE` and adopt Kandra's generated-DDL modes only for genuinely new tables.
+
+## What if I actually need `ALLOW FILTERING`, or a query the DSL can't express?
+
+`repo.raw()`/`repo.rawQuery()` — an explicit, parameterized escape hatch for exactly this. It
+takes a real CQL string (including `ALLOW FILTERING`, if that's genuinely what you need) with
+`KandraRawQuery.cql(template).bind(...)` for safe positional parameter binding, or the `raw()`
+shorthand for quick cases (it logs a `WARN` if you call it with string-literal CQL and no bound
+parameters — a deliberate nudge against building CQL by interpolation). This is the honest answer
+to "Kandra's DSL refuses to build this query": the refusal is in the *DSL*, not a hard ban on the
+underlying CQL feature. You can still reach for it — but only by writing the CQL yourself, in
+plain sight in your own code, not by a DSL method that quietly does it for you.
+
+## What's still rough — what should make me hesitate?
+
+Reading `/battle-scars` and `docs/issues/` honestly: several of the bugs Kandra has shipped and
+fixed (ISS-025 clustering-key WHERE clauses, ISS-026/027 batch scope shadowing, ISS-028/029/030
+found during 0.4.4's own re-verification pass) were exactly the kind of "compiles, looks correct,
+silently wrong at runtime" failure this library exists to prevent — found in Kandra's *own* code,
+not a user's. That's evidence the correctness bar is taken seriously (every one was caught by
+real-cluster testing and fixed with a permanent regression test), but it's also evidence that a
+library this young, wrapping a genuinely hard problem (distributed schema + codec + batch
+correctness), has had real gaps between "looks right" and "is right." `FakeKandraSession`'s
+deliberate real-semantics gap (ISS-020) means a green unit test suite alone doesn't prove your
+code is correct against a real cluster — budget for `KandraTestcontainers` runs, not just fakes,
+before you trust a release. See [`/battle-scars`](/battle-scars) for the full, unflattering
+history.

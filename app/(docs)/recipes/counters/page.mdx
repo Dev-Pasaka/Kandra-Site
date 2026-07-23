@@ -1,0 +1,126 @@
+export const metadata = {
+  title: "Recipe: counters",
+  description:
+    "@Counter tables, increment()/decrement(), why they're a genuinely distinct write path from save() — and why plain UPDATE-based counting isn't safe under concurrency.",
+};
+
+# Recipe: counters
+
+**Problem:** you need a number that many concurrent writers increment/decrement safely — likes on a
+post, a running total, an inventory count. The relational instinct is `UPDATE t SET n = n + 1 WHERE
+id = ?` under a row lock. Cassandra has no row locks across a leaderless, replicated cluster, so that
+read-modify-write pattern isn't safe under concurrent writes — two replicas can each apply "add 1 to
+the value I last saw" and one increment silently disappears. Counter columns are Cassandra's actual
+answer: a distinct CQL type with a commutative write path every replica can apply independently and
+still converge correctly.
+
+## The scenario
+
+Likes on a post — exactly the classic Cassandra counter workload, and the one this pattern was
+verified against directly (see
+[`/recipes/social-feed-capstone`](/recipes/social-feed-capstone#flow-4-likes-counter-contention)).
+
+```kotlin title="PostLikeCounter.kt"
+import io.kandra.core.annotations.*
+import java.util.UUID
+
+@ScyllaTable(name = "post_like_counters")
+data class PostLikeCounter(
+    @PartitionKey val postId: UUID,
+    @Counter val likes: Long = 0L,
+)
+```
+
+<Callout kind="gotcha" title="A counter table can only contain counters, plus its key">
+`SchemaRegistry` validates this at startup: if a class mixes `@Counter` and non-`@Counter` non-key
+columns, registration fails with `"Class '...' mixes @Counter and non-@Counter columns. All non-key
+columns must be @Counter in a counter table."` This isn't a Kandra restriction layered on top of
+Cassandra — CQL itself doesn't allow a counter column to share a table with an ordinary column. If
+you need `likes` alongside other post metadata, that's two tables: `Post` (as modeled in
+[`/recipes/social-feed-capstone`](/recipes/social-feed-capstone)) and a separate counter table keyed
+by the same ID, exactly as above.
+</Callout>
+
+## `increment()` / `decrement()` — not `save()`
+
+```kotlin title="KandraSuspendRepository.kt"
+suspend fun increment(field: KProperty1<T, Long?>, partitionKeys: Map<String, Any>, by: Long = 1L, consistency: KandraConsistency? = null)
+suspend fun decrement(field: KProperty1<T, Long?>, partitionKeys: Map<String, Any>, by: Long = 1L, consistency: KandraConsistency? = null)
+```
+
+```kotlin
+postLikeCounterRepo.increment(PostLikeCounter::likes, mapOf("postId" to postId))
+postLikeCounterRepo.increment(PostLikeCounter::likes, mapOf("postId" to postId), by = 5L)
+postLikeCounterRepo.decrement(PostLikeCounter::likes, mapOf("postId" to postId))
+```
+
+`partitionKeys` is a `Map<String, Any>` keyed by property name (or CQL column name — both are
+checked), not a full entity — you don't need to construct a `PostLikeCounter` instance just to
+increment it. Both methods throw `KandraSchemaException("increment() is only valid on counter
+tables.")` if the schema isn't a counter table, and `save()` throws its own explicit guard —
+`"Counter tables cannot use save(). Use increment()/decrement() instead."` — so reaching for the
+familiar `save()` on a counter entity fails loudly at the call, not silently at runtime with wrong
+numbers.
+
+Under the hood, `increment`/`decrement` both compile to the same statement shape:
+
+```sql
+UPDATE post_like_counters SET likes = likes + ? WHERE post_id = ?
+```
+
+(`decrement` just negates the delta before binding it — there's one `counterUpdate` statement
+builder underneath both.)
+
+<Callout kind="note" title="Counter writes are forced non-idempotent">
+`counterUpdate`'s bound statement is explicitly marked `.setIdempotent(false)`. This matters if
+you're using speculative execution (see
+[`/recipes/multi-dc-deployment`](/recipes/multi-dc-deployment)) — a speculative retry of a
+non-idempotent counter update would double-apply the increment if both the original and the retry
+land, so Kandra excludes counter writes (along with plain inserts and collection mutations) from
+speculative retry eligibility by design, not by omission.
+</Callout>
+
+## Consistency on counter operations — a real historical gap, now fixed
+
+<Callout kind="danger" title="ISS-019: increment/decrement/append/remove/put silently ignored consistency overrides">
+Found in a pre-real-database-testing audit: `StatementBuilder.appendToCollection`,
+`removeFromCollection`, and `counterUpdate` never called `.setConsistencyLevel(...)` at all — unlike
+`insertPrimary`/`selectById`. That meant `@WriteConsistency` on the entity, and any explicit
+`consistency = ...` parameter passed to `increment()`/`decrement()`/`append()`/`remove()`/`put()`,
+were silently ignored; only the driver profile's own default consistency ever applied to those
+specific operations, regardless of what the entity or call site actually asked for.
+
+**Fixed**: all three statement builders now take an optional `consistency: KandraConsistency?`
+parameter, resolved through the normal chain (per-call override → `@WriteConsistency` → configured
+default) exactly like every other write. If you're running a version predating this fix, verify a
+`consistency` argument on `increment()` actually takes effect before relying on it for a
+counter table with a non-default `@WriteConsistency`.
+</Callout>
+
+## Why not just retry a read-modify-write in application code
+
+It's tempting to reach for `findById` + `save(copy(likes = likes + 1))` if you don't want to learn a
+separate API. Don't — this isn't slower-but-safe, it's actively unsafe:
+
+- **`save()` on a counter table throws.** Kandra won't even let you try the naive path on an entity
+  annotated `@Counter` — it's a hard error, not a foot-gun left open.
+- **Even without that guard, read-then-write races.** Two concurrent "read 41, write 42" requests
+  both write `42` — one increment is lost, and nothing in a plain `UPDATE`-based write path detects
+  it. This is exactly the failure mode counter columns exist to prevent: a commutative `+1`/`-1`
+  operation that every replica applies independently and converges correctly, instead of a
+  last-writer-wins overwrite of a value nobody coordinated on.
+
+## What was actually verified
+
+Fifty concurrent `increment()` calls against the same `postId`, fired from many simulated clients at
+once, landed the counter on **exactly 50** — no lost increments under real concurrency, against a
+live 3-node ScyllaDB cluster. This is the one feature Cassandra counters exist to make safe, and it
+held up cleanly. See
+[`/recipes/social-feed-capstone`](/recipes/social-feed-capstone#flow-4-likes-counter-contention) for
+the full write-up.
+
+For the broader mental model — why counters are their own CQL type at all, not an integer column
+with extra rules — see
+[`/foundations`](/foundations#counter-columns-are-a-genuinely-distinct-type). For the tutorial
+version with a completion-stats dashboard, see
+[`/tutorial/09-counters`](/tutorial/09-counters).

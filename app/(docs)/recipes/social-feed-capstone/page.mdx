@@ -1,0 +1,278 @@
+export const metadata = {
+  title: "Recipe: social feed capstone",
+  description:
+    "The most complete worked example on this site — a real social feed (posts, tags, likes) built end to end, sourced from Kandra's own live-cluster capstone test and its real, honestly-reported results.",
+};
+
+# Recipe: social feed capstone
+
+This is the most complete worked example on this site — not a synthetic snippet, but the actual
+domain model and flows from Kandra's own realistic-workload capstone
+(`docs/test-plan/07-realistic-workload-capstone.md`), run against a live 3-node ScyllaDB cluster as
+part of verifying Kandra itself. It composes almost every recipe on this site into one thing: a
+social feed with time-series posts, tag search, and like counters. Where the original run found real
+bugs, they're reported here plainly, with what fixed them — that's the whole point of sourcing this
+page from an actual test, not an idealized example.
+
+<Callout kind="note" title="Classic Cassandra workload, on purpose">
+Time-series per-partition data, fan-out reads, counters, tagging — this is a deliberately canonical
+Cassandra shape, chosen because it's the shape most real applications on this database eventually
+need, not because it flatters Kandra.
+</Callout>
+
+## The domain
+
+```kotlin title="Post.kt"
+import io.kandra.core.annotations.*
+import java.time.Instant
+import java.util.UUID
+
+@ScyllaTable(name = "posts")
+@SoftDelete(ttlSeconds = 86_400, markerProperty = "isDeleted")
+data class Post(
+    @PartitionKey val authorId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
+    @LookupIndex(tableSuffix = "by_id", consistency = LookupConsistency.BATCH) val postId: UUID,
+    val content: String,
+    val tags: Set<String> = emptySet(),
+    val isDeleted: Boolean = false,
+)
+
+@ScyllaTable(name = "post_like_counters")
+data class PostLikeCounter(
+    @PartitionKey val postId: UUID,
+    @Counter val likes: Long = 0L,
+)
+```
+
+`Post` is partitioned by `authorId` and clustered by `createdAt DESC` — the correct Cassandra model
+for "this author's posts, newest first," the cheapest possible read pattern on this database:
+single-partition, pre-sorted, no in-memory work. `postId` is `@LookupIndex`'d so a permalink
+(`GET /posts/{postId}`) can resolve one post without knowing its author — textbook denormalized
+lookup, see [`/recipes/lookup-tables`](/recipes/lookup-tables). Likes live in their own counter
+table keyed by `postId`, because a counter column can't coexist with regular columns in the same CQL
+table — see [`/recipes/counters`](/recipes/counters) — mirroring how you'd model "likes" in
+production Cassandra with or without an ORM.
+
+### The tag problem: why `PostByTag` is hand-rolled, not `@LookupIndex`
+
+`@LookupIndex` only supports a **single-valued** property per lookup table. `tags` is a
+`Set<String>` — there's no annotation that automatically maintains a "posts by tag" table for a
+multi-valued field, and that's expected, not a gap to route around. Cassandra itself doesn't have
+performant multi-valued secondary indexing at scale either; real applications hand-roll a
+`posts_by_tag(tag, created_at, post_id, author_id)` table and maintain it themselves — exactly the
+same shape Kandra's own generated `@LookupIndex` tables use internally, just without the codegen:
+
+```kotlin title="PostByTag.kt"
+@ScyllaTable(name = "posts_by_tag")
+data class PostByTag(
+    @PartitionKey val tag: String,
+    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
+    val postId: UUID,
+    val authorId: UUID,
+)
+```
+
+<Callout kind="tip" title="Same pattern as the tutorial's TodosByAssignee">
+If you've built the tutorial, this is structurally identical to
+[`/tutorial/06-denormalization`](/tutorial/06-denormalization)'s `TodosByAssignee` table — a
+hand-rolled denormalized view maintained explicitly by application code inside a
+`KandraBatchScope`, because the access pattern ("todos assigned to me" / "posts tagged X") doesn't
+map onto a single-valued `@LookupIndex`. The lesson generalizes: `@LookupIndex` covers single-valued
+denormalization; anything multi-valued (a set of tags, a set of assignees) is a hand-rolled table
+maintained the same way you'd maintain any other Cassandra denormalized view — explicitly, atomically,
+in application code.
+</Callout>
+
+## Flow 1: the multi-write problem
+
+Creating a post needs to insert the `Post` row **and** one `PostByTag` row per tag, atomically — a
+partial failure here leaves a post visible in the author's feed but invisible to tag search, or vice
+versa.
+
+```kotlin
+post("/posts") {
+    val req = call.receive<CreatePostRequest>()
+    val post = Post(
+        authorId = req.authorId,
+        createdAt = Instant.now(),
+        postId = UUID.randomUUID(),
+        content = req.content,
+        tags = req.tags,
+    )
+    application.kandra.batchBlocking {
+        postRepo.saveInBatch(post)
+        req.tags.forEach { tag ->
+            postByTagRepo.saveInBatch(PostByTag(tag, post.createdAt, post.postId, post.authorId))
+        }
+    }
+    call.respond(HttpStatusCode.Created, post)
+}
+```
+
+<Callout kind="danger" title="What the original run against this exact flow found">
+The capstone's first real run used the API shape that looked obviously correct —
+`application.kandra.batchBlocking { with(postRepo) { save(post) } }` — and it was the single
+highest-value finding of the whole exercise: `debug.logBatches` showed **three independent `LOGGED
+BATCH` executions** (the post's own insert+lookup, then each tag row separately) instead of one
+combined atomic batch. Zero atomicity, returned 200, no error anywhere. This was `ISS-026`/`ISS-027`
+— the exact Kotlin member-over-extension resolution bug covered in full in
+[`/recipes/multi-table-writes`](/recipes/multi-table-writes#saveinbatch-deleteinbatch--not-save-delete-and-thats-deliberate).
+The code above uses the fixed shape (`saveInBatch`, not `save`) — this is not a hypothetical
+warning, it's the reason that method name exists at all, discovered by this exact flow.
+</Callout>
+
+## Flow 2: the paginated author feed
+
+```kotlin
+get("/users/{authorId}/feed") {
+    val authorId = UUID.fromString(call.parameters["authorId"]!!)
+    val pageSize = call.request.queryParameters["size"]?.toIntOrNull() ?: 20
+    val token = call.request.queryParameters["token"]
+    val page = postRepo.findPage(pageSize, token) { PostTable.authorId eq authorId }
+    call.respond(page)
+}
+```
+
+The cheapest, most idiomatic Cassandra read there is — a single-partition range scan with driver-
+native paging. **Verified live**: 30 posts created across 3 authors (10 each), walked every page at
+`size = 3` via `nextPageToken` until `hasMore == false` — **10 unique posts per author, zero
+duplicates, zero gaps**, newest-first order confirmed (clustering `DESC` honored end to end).
+
+### The soft-delete-in-a-feed problem
+
+`findActive()` cannot be used here as-is — it always runs an unscoped, whole-table `ALLOW FILTERING`
+scan (see [`/recipes/soft-delete`](/recipes/soft-delete#findactive-a-real-query-with-a-real-cost)),
+which for a table partitioned by `authorId` means scanning **every** author's posts, not just this
+one's. The realistic fix is client-side filtering after the partition-scoped `findPage`:
+
+```kotlin
+suspend fun activeFeedPage(authorId: UUID, pageSize: Int, token: String?): List<Post> {
+    val active = mutableListOf<Post>()
+    var nextToken = token
+    do {
+        val page = postRepo.findPage(pageSize, nextToken) { PostTable.authorId eq authorId }
+        active += page.items.filterNot { it.isDeleted }
+        nextToken = page.nextPageToken
+    } while (active.size < pageSize && nextToken != null)
+    return active
+}
+```
+
+A page can come back with fewer live items than `pageSize` after filtering — the loop keeps fetching
+until it has enough live items or genuinely runs out of pages, rather than returning a short page
+after one fetch. **This is a real, load-bearing design constraint of `@SoftDelete`'s current
+marker-column approach, not a workaround to route around** — `findActive()`'s own documentation
+should (and now does, here) say plainly: it's an unscoped, whole-table scan; don't reach for it on a
+partitioned, time-series-style table without understanding that cost.
+
+## Flow 3: tag search
+
+```kotlin
+get("/tags/{tag}/posts") {
+    val tag = call.parameters["tag"]!!
+    val pageSize = call.request.queryParameters["size"]?.toIntOrNull() ?: 20
+    val token = call.request.queryParameters["token"]
+    val page = postByTagRepo.findPage(pageSize, token) { PostByTagTable.tag eq tag }
+    call.respond(page)
+}
+```
+
+Cheap, partition-scoped, no `ALLOW FILTERING` — `PostByTag` was deliberately modeled with `tag` as
+the partition key. **Verified live**: `GET /tags/tech/posts` correctly returned all 13 posts tagged
+`tech`, paginated. A post with multiple tags legitimately appears once per tag it was written under
+— `posts_by_tag` has one row per `(tag, postId)` pair by design, not a bug.
+
+<Callout kind="gotcha" title="Deleting a post does not clean up its PostByTag rows — confirmed, expected">
+There is no lookup-table mechanism here at all — `PostByTag` is a hand-rolled table, not a
+`@LookupIndex`, so cleanup is entirely the application's responsibility, same as it would be in a
+hand-rolled Cassandra data model with no ORM. A soft-deleted post still shows up in tag search
+results unless you write the cleanup yourself — confirmed as expected behavior for this design, not
+a bug. If you want cleanup, delete the matching `PostByTag` rows for each of the post's tags inside
+the same `KandraBatchScope` used for the delete, using `deleteInBatch`.
+</Callout>
+
+## Flow 4: likes (counter contention)
+
+```kotlin
+post("/posts/{postId}/like") {
+    val postId = UUID.fromString(call.parameters["postId"]!!)
+    postLikeCounterRepo.increment(PostLikeCounter::likes, mapOf("postId" to postId))
+    call.respond(HttpStatusCode.NoContent)
+}
+```
+
+**Verified live**: 50 concurrent `POST /posts/{id}/like` requests against one post, fired from many
+simulated clients at once. Final counter value: **exactly 50**. Counters held up perfectly under
+real concurrency — the one feature Cassandra counters exist specifically to make safe, working
+correctly. See [`/recipes/counters`](/recipes/counters) for why this holds and a plain
+`UPDATE ... SET n = n + 1` wouldn't.
+
+## Flow 5: delete a post
+
+```kotlin
+delete("/posts/{postId}") {
+    val postId = UUID.fromString(call.parameters["postId"]!!)
+    val post = postRepo.find { PostTable.postId eq postId } ?: return@delete call.respond(HttpStatusCode.NotFound)
+    postRepo.delete(post)   // soft delete — TTL on non-key columns, marker set immediately
+    call.respond(HttpStatusCode.NoContent)
+}
+```
+
+<Callout kind="danger" title="This flow originally failed, and stayed broken for three layered reasons">
+The first live run got `InvalidQueryException: Missing mandatory PRIMARY KEY part created_at` —
+`Post`'s soft-delete rewrite built its `WHERE` clause from the partition key (`authorId`) alone,
+omitting the clustering key (`createdAt`). This was `ISS-025`, also covered in
+[`/battle-scars/clustering-keys-and-lookup-tables`](/battle-scars/clustering-keys-and-lookup-tables)
+— any entity combining a clustering key with `@SoftDelete` (exactly `Post`'s own, individually
+idiomatic design) was completely unable to delete individual rows.
+
+Fixing that far enough to actually reach the next step surfaced two more layered bugs, only visible
+once the first was fixed: `GET`/`DELETE /posts/{postId}` resolve through `Post`'s `@LookupIndex`
+(`postId`), not its real primary key — and lookup resolution on a clustering-keyed entity was itself
+broken (`ISS-029`, since it never reconstructed the primary table's clustering key from the lookup
+row, only the partition key). Fixing *that* exposed a third, pre-existing bug: soft-delete
+unconditionally removed `@LookupIndex` rows, contradicting the documented "soft delete does not
+remove lookup rows" behavior (`ISS-030`) — see
+[`/recipes/soft-delete`](/recipes/soft-delete#lookup-rows-survive-a-soft-delete--on-purpose) and
+[`/recipes/lookup-tables`](/recipes/lookup-tables) for why that matters.
+
+All three (`ISS-025`, `ISS-029`, `ISS-030`) are fixed as of `0.4.4`, verified via permanent
+regression tests and a live smoke test against a real cluster. The code above reflects the fixed
+behavior: `DELETE /posts/{postId}` resolves through the lookup table correctly, applies the
+soft-delete TTL rewrite with the full key, and the `posts_by_id` lookup row survives the delete —
+`GET /posts/{postId}` still resolves the post immediately afterward, exactly matching a direct
+`findById` on any other soft-deleted entity.
+</Callout>
+
+## Node resilience
+
+Verified against the live 3-node cluster as part of this same capstone:
+
+- **1 of 3 nodes killed**: the app stayed healthy (`GET /kandra/health` → 200) and successfully
+  created a new post *during* the outage — `LOCAL_QUORUM` held with 2/3 replicas up. Restarting the
+  killed node, it rejoined automatically and the app kept serving without a restart of its own.
+- **2 of 3 nodes killed**: a write correctly failed fast (~90ms, not hanging) once quorum was lost —
+  the right behavior. The specific exception surfaced as a raw
+  `AllNodesFailedException`/`UnavailableException`, not a `KandraQueryException` wrapper, because
+  `UnavailableException` isn't in `RetryConfig`'s default retryable set
+  (`WriteTimeoutException`/`ReadTimeoutException`/`NoNodeAvailableException` only) — worth knowing if
+  your error-handling code pattern-matches on Kandra's own exception types specifically.
+
+## Did Kandra's primitives compose into a working real app?
+
+Reported honestly, the way this whole site tries to: **the read-side patterns worked cleanly from
+the start** — the partition-scoped paginated feed, the denormalized tag-search table, counter likes
+— genuinely idiomatic, well-supported Cassandra patterns that held up under real concurrency and
+real pagination on the first live run. **The write side did not, initially** — the documented
+atomic-multi-write primitive silently failed to batch at all, and a clustering key combined with
+`@SoftDelete` completely broke row-level deletes. Neither was a "this needed different data
+modeling" situation — both were internal implementation bugs that a consumer following the
+documented API in good faith would hit without warning. Both are fixed now, with the fixes
+themselves — `saveInBatch`/`deleteInBatch`'s renaming, the full-key WHERE clause, lookup-row
+preservation through soft delete — covered in
+[`/recipes/multi-table-writes`](/recipes/multi-table-writes),
+[`/recipes/soft-delete`](/recipes/soft-delete), and
+[`/recipes/lookup-tables`](/recipes/lookup-tables) respectively, and in full incident detail under
+[`/battle-scars`](/battle-scars). That arc — real bug, found against a real cluster, fixed, verified
+live — is the same standard every other recipe on this site tries to meet.

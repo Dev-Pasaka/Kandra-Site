@@ -1,0 +1,135 @@
+import { dokkaClassUrl, dokkaModuleUrl } from "@/lib/dokka";
+
+export const metadata = {
+  title: "kandra-koin",
+  description:
+    "Application.kandraKoin() — auto-binds a KandraRepository/KandraSuspendRepository pair per registered entity into a Koin container, sharing the plugin's BatchEngine.",
+};
+
+# kandra-koin
+
+`kandra-koin` bridges Kandra's `KandraRepository<T>`/`KandraSuspendRepository<T>` into a
+[Koin](https://insert-koin.io/) container. It has exactly one public entry point,
+`Application.kandraKoin()`, which auto-wires one repository pair per entity already registered with
+`kandra-core`'s `SchemaRegistry`.
+
+## Why this exists as a separate module
+
+Wiring Kandra repositories into Koin is entirely optional — `kandra-runtime`'s
+`KandraRuntime.repository<T>()`/`suspendRepository<T>()` work without any DI framework at all, and
+plenty of Kandra apps call those directly. `kandra-koin` exists so that a Koin-based app doesn't have
+to hand-write `single { KandraRepository(session, schema, User::class, batchEngine) }` boilerplate
+for every entity, with the qualifier-naming convention decided once, in this module, instead of
+reinvented per project. It depends on `kandra-core`, `kandra-runtime`, and `kandra-ktor`
+(`implementation`, not `api` — a consumer of `kandra-koin` doesn't automatically get `kandra-ktor`'s
+symbols visible without also declaring it) plus Koin itself
+(`implementation(libs.koin.ktor)`/`implementation(libs.koin.core)`) — nothing else in Kandra depends
+on Koin, so choosing `kandra-koin` over `kandra-kodein` (or neither) never pulls Koin's classes into
+an app that doesn't want them.
+
+## `Application.kandraKoin()`
+
+```kotlin
+@Suppress("OPT_IN_USAGE")
+fun Application.kandraKoin()
+```
+
+Iterates `SchemaRegistry.all()` and, for each entity, binds two `single` bindings with **named
+qualifiers** (not generic-type-only lookups — Koin can't distinguish `KandraRepository<User>` from
+`KandraRepository<Wallet>` at runtime due to type erasure, so the qualifier is mandatory, not
+optional):
+
+| Binding | Qualifier |
+|---|---|
+| `KandraRepository<*>` | `named("${EntityName}Repo")` |
+| `KandraSuspendRepository<*>` | `named("${EntityName}SuspendRepo")` |
+
+For an entity `User`, the qualifiers are exactly `"UserRepo"` and `"UserSuspendRepo"`. Both bindings
+construct the repository with the plugin's own `CqlSession` and — critically — the **same
+`BatchEngine`** instance as the installed `Kandra` plugin, so Koin-resolved repositories share the
+plugin's shutdown-drain guard and in-flight query counter, not an independent lifecycle.
+
+```kotlin
+import io.kandra.ktor.Kandra
+import io.kandra.koin.kandraKoin
+import org.koin.core.qualifier.named
+import org.koin.ktor.ext.inject
+import org.koin.ktor.plugin.Koin
+
+fun Application.module() {
+    install(Koin) { /* your own app-level modules, if any */ }
+
+    install(Kandra) {
+        contactPoints = "localhost:9042"
+        keyspace = "coinx"
+        localDatacenter = "datacenter1"
+        register(User::class, Wallet::class)
+    }
+
+    kandraKoin()   // after both install(Koin) and install(Kandra) —
+                   // binds "UserRepo", "WalletRepo", "UserSuspendRepo", "WalletSuspendRepo"
+
+    routing {
+        get("/users/{id}") {
+            val repo: KandraSuspendRepository<*> by inject(qualifier = named("UserSuspendRepo"))
+            @Suppress("UNCHECKED_CAST")
+            val userRepo = repo as KandraSuspendRepository<User>
+            val user = userRepo.findById(call.parameters["id"]!!)
+            call.respond(user ?: HttpStatusCode.NotFound)
+        }
+    }
+}
+```
+
+Outside an `Application` receiver — a plain service class — the same lookup works via
+`KoinComponent`:
+
+```kotlin
+class UserService : KoinComponent {
+    private val userRepo: KandraSuspendRepository<*> by inject(named("UserSuspendRepo"))
+
+    suspend fun getUser(id: String): User? {
+        @Suppress("UNCHECKED_CAST")
+        return (userRepo as KandraSuspendRepository<User>).findById(id)
+    }
+}
+```
+
+<Callout kind="gotcha" title="Call order: after install(Kandra) AND after Koin is installed">
+`kandraKoin()` calls `getKoin()`, which throws if no Koin instance is attached to the application yet
+— so it must run after `install(Koin) { }` (or `startKoin { }`). It also reads
+`Application.kandraSession`/`Application.kandra`, both `AttributeKey`s populated inside
+`install(Kandra) { }`'s block — so it must run after that too. The order *between* `install(Koin)`
+and `install(Kandra)` relative to each other doesn't matter; only `kandraKoin()`'s position relative
+to both does.
+</Callout>
+
+<Callout kind="gotcha" title="Qualifier suffixes are exact strings, not a formula you can guess">
+`"UserRepo"` and `"UserSuspendRepo"` — not `"UserRepository"`/`"UserSuspendRepository"`, and not
+`"SuspendUserRepo"`. If an `inject()` call throws a "no definition found" error, check the qualifier
+string against this exact pattern before assuming the entity wasn't registered.
+</Callout>
+
+<Callout kind="gotcha" title="Type-erased bindings always need an unchecked cast">
+`kandraKoin()` binds `KandraRepository<*>`/`KandraSuspendRepository<*>` — star-projected, because
+Koin has no way to recover the entity type parameter at resolution time. Every `inject()`/`get()`
+call needs `as KandraRepository<User>` (or similar) before you get typed `save`/`update` overloads
+back. Unlike `kandra-kodein`, there is no reified single-entity binder here — `kandraKoin()` is the
+only public entry point, and it always binds every entity in `SchemaRegistry` at once. If you need
+Koin bindings outside a Ktor `Application`, write the `module { single(...) }` block yourself,
+following the same qualifier convention.
+</Callout>
+
+If an entity class has no `simpleName` (an anonymous class — not a realistic scenario for a
+`@ScyllaTable` entity, but checked anyway), `kandraKoin()` throws `KandraException`.
+
+## Full API reference
+
+[`kandra-koin` on Dokka →]({dokkaModuleUrl("kandra-koin")})
+
+## Where this shows up elsewhere on this site
+
+- [`/getting-started`](/getting-started) and [`/tutorial/04-plugin-install`](/tutorial/04-plugin-install) —
+  `kandraKoin()` in a working app.
+- [`/modules/kandra-kodein`](/modules/kandra-kodein) — the same pattern for Kodein, including the
+  standalone binder Koin doesn't have.

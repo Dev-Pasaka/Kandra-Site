@@ -1,0 +1,37 @@
+export const metadata = {
+  title: "Recipes",
+  description:
+    "Task-oriented, worked examples for real problems — lookup tables, time-series, soft delete, counters, optimistic locking, multi-table writes, caching, migrations, multi-DC, and a full social-feed capstone.",
+};
+
+# Recipes
+
+The rest of this site is organized by module and by concept. This section is organized by problem.
+Each recipe below starts from a concrete scenario — not "here's what `@LookupIndex` does," but "you
+need to find a user by email, here's the whole thing end to end" — and every code example is
+verified against real, current Kandra source, not idealized. Where the source material includes a
+real bug that shaped the current API (an `ISS-*` postmortem), the recipe says so plainly instead of
+smoothing it over.
+
+If you haven't read [`/foundations`](/foundations) yet, most of these will make more sense after you
+have — they assume the partition/clustering-key mental model, not a relational one.
+
+| Recipe | What problem it solves |
+|---|---|
+| [Lookup tables](/recipes/lookup-tables) | You need to query a table by a column that isn't its partition key — `@LookupIndex` end to end, including the real tradeoff between `BATCH` (atomic, slower) and `EVENTUAL` (fast, a real lag window) consistency, verified against the actual `CoroutineScope.launch` write path. |
+| [Time-series data](/recipes/time-series) | You need "this owner's records, newest first," paginated or as a bounded top-N — clustering keys, `findPage`/`pageToken`, and why the sort order is a schema decision, not a query-time one. |
+| [Soft delete](/recipes/soft-delete) | You need "delete" to mean "hide, with an undo window" instead of an immediate tombstone — `@SoftDelete`'s TTL-based timing model, why `findActive()` is a whole-table scan (not what you want for a per-owner view), and a real historical bug where one delete path bypassed it entirely. |
+| [Counters](/recipes/counters) | You need a number many concurrent writers can safely increment — `@Counter` tables, `increment()`/`decrement()`, and why a plain `UPDATE ... SET n = n + 1` isn't safe under concurrency on a leaderless database. |
+| [Optimistic locking](/recipes/optimistic-locking) | You need to detect (not just allow) two concurrent edits to the same row — `@Version`, the real LWT cost, a worked two-editor conflict, and when `updateForce()`'s blind overwrite is the right call instead. |
+| [Multi-table writes](/recipes/multi-table-writes) | You need more than one table updated atomically — `KandraBatchScope` done correctly, and the exact Kotlin resolution bug that made the obvious-looking `save()`-inside-a-batch-block API silently non-atomic. |
+| [Caching](/recipes/caching) | You need a hot `findById` path to stop hitting ScyllaDB on every request — `@CacheResult`, Caffeine's `compileOnly` split, and a real bug where cache invalidation silently missed every clustering-keyed entity. |
+| [Migrations](/recipes/migrations) | You need versioned, safe schema changes instead of `AUTO_CREATE` in production — `kandra-migrate`, a checksum that actually detects an edited migration, and claim-first LWT locking so two starting instances can't double-apply one. |
+| [Multi-DC deployment](/recipes/multi-dc-deployment) | You're running across more than one datacenter and need to decide, concretely, how reads/writes/failover behave — a full `KandraConfig` walkthrough, the consistency resolution order, and the `LOCAL_SERIAL`-vs-`SERIAL` footgun. |
+| [Social feed capstone](/recipes/social-feed-capstone) | You want to see it all composed into one real app — posts, tags, likes, pagination, soft delete, built and run against a live 3-node cluster, bugs and all, honestly reported. |
+
+<Callout kind="tip">
+Start with [Lookup tables](/recipes/lookup-tables) or [Time-series data](/recipes/time-series) if
+you're new to Cassandra data modeling — those two patterns underpin most of the others. End with
+[Social feed capstone](/recipes/social-feed-capstone) once you've read a few of the others; it's the
+one place all of them show up together in a single working app.
+</Callout>

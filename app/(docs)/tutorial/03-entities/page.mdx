@@ -1,0 +1,266 @@
+export const metadata = {
+  title: "03. Entities",
+  description:
+    "User and Todo, one annotation at a time, with the generated DDL shown next to the code that produces it — including why Todo's clustering key does not also carry @CreatedAt.",
+};
+
+# 03. Entities
+
+[Page 01](/tutorial/01-modeling) decided `Todo`'s partition key is `ownerId` and its clustering key
+is `createdAt DESC`, and `User`'s partition key is `userId` with a denormalized lookup on `email`.
+This page turns those decisions into the two entity classes, one annotation at a time, and shows the
+DDL each one produces — so the annotation-to-schema mapping is never abstract.
+
+## `User`
+
+```kotlin title="model/User.kt"
+package com.example.todos.model
+
+import io.kandra.core.annotations.*
+import java.time.Instant
+import java.util.UUID
+
+@ScyllaTable("users")
+data class User(
+    @PartitionKey val userId: UUID,
+    @LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
+    val email: String,
+    val displayName: String,
+    @CreatedAt val createdAt: Instant = Instant.EPOCH,
+)
+```
+
+- **`@PartitionKey val userId: UUID`** — every access pattern from page 01 that touches `User` (load
+  a user to attach to a todo, show a profile) already has the user's ID in hand. One partition per
+  user, no clustering key needed — there's no "many rows per user" shape here.
+- **`@LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)`** — login needs
+  "find the user with this email," and `email` isn't the partition key, so it needs its own
+  maintained index. This generates a second table, `users_by_email`, and keeps it in sync on every
+  write — `BATCH` consistency means the lookup row is written in the same `LOGGED BATCH` as the
+  primary row, atomically, at a small latency cost (the alternative, `EVENTUAL`, trades that
+  atomicity for lower latency — see [`/why`](/why#where-did-my-lookup-table-go-out-of-sync) for the
+  full tradeoff). A user account is created once, rarely, so paying batch latency here is the easy
+  call — this app will make the opposite call for `TodoByAssignee` on the much hotter write path in
+  [page 06](/tutorial/06-denormalization).
+- **`@CreatedAt val createdAt: Instant = Instant.EPOCH`** — automatically stamped to `Instant.now()`
+  the moment `save()` runs, every time, overwriting whatever value the default (`Instant.EPOCH`,
+  never meant to reach the database) held. This is safe on `User` specifically because nothing else
+  in the schema depends on knowing the exact value that got written — it's a plain audit timestamp,
+  read but never used as a lookup key. Hold that thought; `Todo` below breaks that assumption.
+
+<SideBySide leftLabel="Entity" rightLabel="Generated DDL">
+<div>
+
+```kotlin
+@ScyllaTable("users")
+data class User(
+    @PartitionKey val userId: UUID,
+    @LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
+    val email: String,
+    val displayName: String,
+    @CreatedAt val createdAt: Instant = Instant.EPOCH,
+)
+```
+
+</div>
+<div>
+
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    user_id UUID,
+    email TEXT,
+    display_name TEXT,
+    created_at TIMESTAMP,
+    PRIMARY KEY (user_id)
+);
+
+CREATE TABLE IF NOT EXISTS users_by_email (
+    email TEXT,
+    user_id UUID,
+    PRIMARY KEY (email)
+);
+```
+
+</div>
+</SideBySide>
+
+No `WITH CLUSTERING ORDER BY` clause on `users` — it's only emitted when a table has a clustering
+key, and `User` doesn't have one. `users_by_email` carries exactly two columns: the indexed value
+itself and the primary table's partition key, needed to reconstruct the real row — nothing else,
+and no TTL, no clustering, ever, on a lookup table. `camelToSnake` is what turns `userId` into
+`user_id` and `displayName` into `display_name` — every Kotlin property name gets this treatment
+unless overridden with `@Column(name = "...")`.
+
+## `Todo`
+
+```kotlin title="model/Todo.kt"
+package com.example.todos.model
+
+import io.kandra.core.annotations.*
+import java.time.Instant
+import java.util.UUID
+
+@ScyllaTable("todos")
+data class Todo(
+    @PartitionKey val ownerId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC)
+    val createdAt: Instant,
+    val todoId: UUID,
+    val title: String,
+    val assigneeId: UUID?,
+    val done: Boolean = false,
+)
+```
+
+- **`@PartitionKey val ownerId: UUID`** — not "the ID column," and not chosen because it uniquely
+  identifies a todo (it doesn't, alone — see below). It's the value page 01 established every "my
+  todos" query already has in hand, so this is the column Cassandra hashes to decide which node(s) a
+  given todo lives on.
+- **`@ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant`** — the sort Cassandra
+  bakes into the partition's physical layout, so `findPage`/`findAll` scoped to one `ownerId` come
+  back newest-first for free, no query-time `ORDER BY`. `order = DESC` isn't a query-time choice
+  here the way it would be relationally — get it wrong in the entity and there's no fixing it without
+  re-modeling the table, per [`/foundations`](/foundations#clustering-keys-sort-order-within-a-partition).
+
+### Why `createdAt` does *not* also carry `@CreatedAt`
+
+This is the modeling question [page 01](/tutorial/01-modeling) deferred, and it's worth resolving
+precisely instead of hand-waving it. Nothing in `kandra-core`'s schema validator forbids putting
+`@CreatedAt` on a property that's also `@ClusteringKey` — there's no co-annotation check for that
+combination in `SchemaRegistry.buildSchema`, and functionally it would even work: `@CreatedAt` stamps
+`Instant.now()` into the entity right before the `INSERT` is built, and that stamped value is what
+ends up in the clustering-key column. So it compiles, and it inserts correctly. The reason `Todo`
+doesn't do it anyway is a real, source-verified gap, not a style preference:
+
+<Callout kind="gotcha" title="save() returns Unit — you'd have no way to learn what got written">
+`KandraRepository.save()`/`KandraSuspendRepository.save()` both return `Unit`. If `@CreatedAt`
+silently overwrote the `createdAt` you passed in with a fresh `Instant.now()` computed *inside*
+`save()`, there would be no way for the calling code to learn what value actually landed in the
+database — `save()` hands nothing back. For a plain audit column, that's fine; nobody needs to know
+the exact stamped value to use it later. For `Todo.createdAt`, it's disqualifying: this app looks up
+one specific todo with `findById(ownerId, createdAt)` in every route from
+[page 05](/tutorial/05-routes) onward — including the read-before-write step in
+[page 07](/tutorial/07-concurrency)'s own `PATCH /todos/{id}/done` handler — and every one of those
+calls needs the *exact* clustering-key value that was actually written. Relying on `@CreatedAt`'s
+save()-time stamp would mean the caller's own copy of `createdAt` (captured before `save()`) could,
+in principle, never match what Kandra silently substituted in, with no way to detect the mismatch
+until a lookup came back empty.
+</Callout>
+
+So `Todo` sets `createdAt` itself, once, explicitly, before calling `save()` — normally
+`Instant.now()` at the point a todo is created — and that exact value is threaded through every
+subsequent read, write, and route parameter for that row. `@CreatedAt` stays off `Todo` entirely.
+This is the resolution the rest of this tutorial builds on: **`Todo.createdAt` carries
+`@ClusteringKey(order = ClusteringOrder.DESC)` only, has no default value, and is always supplied by
+the caller** — not `@CreatedAt`, and not two separate timestamp properties.
+
+- **`val todoId: UUID`** — a stable, application-generated ID carried on every todo, useful for
+  clients (a permalink, an idempotency key, something to log) — but deliberately **not** a key or a
+  `@LookupIndex` column. Page 01's access-pattern list never asked for "find a todo by `todoId`
+  alone," so this entity doesn't build infrastructure for a query nobody needs yet. If that pattern
+  ever shows up for real, the fix is the same tool `User.email` already uses —
+  `@LookupIndex(tableSuffix = "by_id")` — not a redesign.
+- **`val assigneeId: UUID?`** — nullable: most todos aren't assigned to anyone else. This is the
+  column [page 06](/tutorial/06-denormalization) picks up directly — it's on the entity now because
+  the product needs it, even though nothing can query by it efficiently yet.
+- **`val done: Boolean = false`** — a plain column, no annotation. Flipped by
+  [page 07](/tutorial/07-concurrency)'s update route.
+
+<SideBySide leftLabel="Entity" rightLabel="Generated DDL">
+<div>
+
+```kotlin
+@ScyllaTable("todos")
+data class Todo(
+    @PartitionKey val ownerId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC)
+    val createdAt: Instant,
+    val todoId: UUID,
+    val title: String,
+    val assigneeId: UUID?,
+    val done: Boolean = false,
+)
+```
+
+</div>
+<div>
+
+```sql
+CREATE TABLE IF NOT EXISTS todos (
+    owner_id UUID,
+    created_at TIMESTAMP,
+    todo_id UUID,
+    title TEXT,
+    assignee_id UUID,
+    done BOOLEAN,
+    PRIMARY KEY (owner_id, created_at)
+)
+WITH CLUSTERING ORDER BY (created_at DESC);
+```
+
+</div>
+</SideBySide>
+
+`PRIMARY KEY (owner_id, created_at)` — a single-column partition key followed by the clustering key,
+no double-parenthesis wrapping (that only happens for a *composite* partition key, more than one
+`@PartitionKey` column — not this table's shape). `WITH CLUSTERING ORDER BY (created_at DESC)` is
+the one and only reason `findPage`/`findAll` against one `ownerId` come back newest-first without an
+`ORDER BY` anywhere in application code.
+
+## Making them JSON-serializable
+
+Routes starting on [page 05](/tutorial/05-routes) will `call.respond(todo)` directly, which needs
+`Todo`/`User` to be `kotlinx.serialization`-`@Serializable`. Neither `UUID` nor `java.time.Instant`
+has a built-in serializer in `kotlinx.serialization` — both need a small custom one:
+
+```kotlin title="model/Serializers.kt"
+package com.example.todos.model
+
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import java.time.Instant
+import java.util.UUID
+
+object UUIDSerializer : KSerializer<UUID> {
+    override val descriptor = PrimitiveSerialDescriptor("UUID", PrimitiveKind.STRING)
+    override fun serialize(encoder: Encoder, value: UUID) = encoder.encodeString(value.toString())
+    override fun deserialize(decoder: Decoder): UUID = UUID.fromString(decoder.decodeString())
+}
+
+object InstantSerializer : KSerializer<Instant> {
+    override val descriptor = PrimitiveSerialDescriptor("Instant", PrimitiveKind.STRING)
+    override fun serialize(encoder: Encoder, value: Instant) = encoder.encodeString(value.toString())
+    override fun deserialize(decoder: Decoder): Instant = Instant.parse(decoder.decodeString())
+}
+```
+
+```kotlin title="model/User.kt" {6,8,11}
+import kotlinx.serialization.Serializable
+
+@Serializable
+@ScyllaTable("users")
+data class User(
+    @Serializable(with = UUIDSerializer::class)
+    @PartitionKey val userId: UUID,
+    @LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
+    val email: String,
+    val displayName: String,
+    @Serializable(with = InstantSerializer::class)
+    @CreatedAt val createdAt: Instant = Instant.EPOCH,
+)
+```
+
+Same pattern on `Todo`'s `ownerId`, `createdAt`, `todoId`, and `assigneeId`. This is ordinary
+`kotlinx.serialization` housekeeping, not a Kandra concern — Kandra's own codec (`KandraCodec`)
+handles `UUID`/`Instant` natively for the database round trip regardless of what JSON serializer
+annotations are stacked on top; the two are independent.
+
+<Callout kind="note">
+Nothing in this page runs yet — there's no plugin installed, no session open. [Page 04](/tutorial/04-plugin-install)
+is where `install(Kandra) { register(User::class, Todo::class) }` turns this DDL from "what
+`DdlGenerator` would produce" into tables that actually exist against the local ScyllaDB from
+[page 02](/tutorial/02-project-setup).
+</Callout>

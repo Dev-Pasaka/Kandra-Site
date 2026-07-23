@@ -1,0 +1,59 @@
+export const metadata = {
+  title: "Philosophy",
+  description:
+    "The design decisions behind Kandra's atomicity, consistency, schema safety, denormalization, and testing model — and the real tradeoffs each one makes.",
+};
+
+# Philosophy
+
+[`/foundations`](/foundations) explains the Cassandra/ScyllaDB mental model. This section explains
+Kandra's own decisions on top of that model — the places where the library had to pick a default,
+draw a line, or refuse to do something an ORM built for a relational database would do without
+asking. Each page here exists because the decision wasn't obvious, and getting it wrong once, in
+Kandra's own development, is usually why the page exists at all.
+
+## [Atomicity](/philosophy/atomicity)
+
+`LOGGED BATCH` is the only cross-table atomicity primitive Cassandra has — there's no ambient
+transaction to wrap arbitrary calls in. `KandraBatchScope` exists to make that primitive opt-in and
+visible, and its methods are named `saveInBatch`/`deleteInBatch` instead of `save`/`delete` for a
+specific, load-bearing reason: Kotlin's overload resolution would have made a same-named batch
+method silently unreachable, not a compile error. This page explains the mechanism and the naming
+story in full.
+
+## [Consistency](/philosophy/consistency)
+
+Every read and write resolves a consistency level from three possible sources — a per-call
+parameter, a `@ReadConsistency`/`@WriteConsistency` annotation on the entity, or the global config
+default — in a specific, fixed priority order. This page verifies that order against the actual
+resolution code, not just the KDoc, and explains why Kandra's global read/write defaults are
+asymmetric, and why Lightweight Transactions aren't the default anywhere.
+
+## [Schema safety](/philosophy/schema-safety)
+
+Kandra runs all DDL and schema validation when the plugin installs — at application startup — not
+on the first request that happens to hit an unvalidated code path. `SchemaMode` controls exactly
+what runs (`AUTO_CREATE`, `AUTO_MIGRATE`, `VALIDATE`, `NONE`), and none of them do anything at
+request time. This page walks through what each mode actually executes.
+
+## [Denormalization](/philosophy/denormalization)
+
+`@LookupIndex` isn't a workaround for Cassandra's lack of joins — it's the primary tool for a
+"query-first" schema, and Kandra treats it as a first-class, generated, maintained artifact instead
+of something you hand-roll and hope stays in sync. This page covers the `BATCH` vs `EVENTUAL`
+consistency choice per lookup field, and what "eventual" actually means mechanically — including
+what happens when an eventual write fails.
+
+## [Testing](/philosophy/testing)
+
+`FakeKandraSession` and `KandraTestcontainers` are not interchangeable, and the fake is
+deliberately, permanently limited — not a temporary gap. This page explains what the fake can and
+can't verify, why making it smarter would mean re-implementing Cassandra's data-plane semantics in
+a test double, and where each tool actually belongs in a test suite.
+
+---
+
+None of these pages repeat [`/foundations`](/foundations)'s explanation of *why* Cassandra works the
+way it does — they assume you've read that, and focus on the specific choices Kandra made in
+response. For the choices in action, see [`/tutorial`](/tutorial); for the bugs these decisions
+prevented (or, in a few cases, didn't prevent the first time), see [`/battle-scars`](/battle-scars).

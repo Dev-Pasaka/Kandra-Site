@@ -1,0 +1,225 @@
+export const metadata = {
+  title: "04. Installing the plugin",
+  description:
+    "The full install(Kandra) { } block for the todo app, every config sub-block explained, and the real DI install-order gotcha between Koin and Kandra.",
+};
+
+# 04. Installing the plugin
+
+[Page 03](/tutorial/03-entities) produced two entity classes and the DDL they generate. Nothing has
+touched the database yet — that starts here. This page installs the `Kandra` Ktor plugin, which
+opens the session, runs that DDL against the local ScyllaDB from [page 02](/tutorial/02-project-setup),
+and wires up dependency injection.
+
+```kotlin title="Application.kt"
+package com.example.todos
+
+import com.example.todos.model.Todo
+import com.example.todos.model.User
+import io.kandra.core.KandraAuth
+import io.kandra.core.SchemaMode
+import io.kandra.ktor.Kandra
+import io.kandra.koin.kandraKoin
+import io.ktor.server.application.*
+import io.ktor.server.engine.*
+import io.ktor.server.netty.*
+import org.koin.ktor.plugin.Koin
+
+fun main() {
+    embeddedServer(Netty, port = 8080, module = Application::module).start(wait = true)
+}
+
+fun Application.module() {
+    install(Koin) {
+        // no app-level modules yet — kandraKoin() below adds the repository bindings
+    }
+
+    install(Kandra) {
+        contactPoints = "localhost:9042"
+        keyspace = "todos"
+        localDatacenter = "datacenter1"
+        autoCreateKeyspace = true
+        schemaMode = SchemaMode.AUTO_CREATE
+
+        register(User::class, Todo::class)
+
+        auth {
+            provider = KandraAuth.fromEnv()
+        }
+        pool {
+            requestTimeoutMillis = 10_000
+        }
+        retry {
+            maxAttempts = 3
+            backoffMillis = 100
+        }
+    }
+
+    kandraKoin()
+}
+```
+
+## `keyspace` / `autoCreateKeyspace` / `schemaMode`
+
+```kotlin
+keyspace = "todos"
+autoCreateKeyspace = true
+schemaMode = SchemaMode.AUTO_CREATE
+```
+
+`keyspace` has no default — a blank value throws `KandraSchemaException` immediately, the very first
+check the plugin runs, before any network call. `autoCreateKeyspace = true` tells Kandra to run
+`CREATE KEYSPACE IF NOT EXISTS todos WITH replication = {'class': 'SimpleStrategy',
+'replication_factor': 1}` (the default `ReplicationStrategy.SimpleStrategy(replicationFactor = 1)`)
+against a bootstrap session before attaching to it — right for local dev against the single-node
+Scylla from [page 02](/tutorial/02-project-setup), and wrong for most real deployments, where the
+keyspace and its replication factor are provisioned by ops ahead of time and the app role often
+shouldn't have `CREATE KEYSPACE` permission at all. `SchemaMode.AUTO_CREATE` is what actually runs
+the `CREATE TABLE IF NOT EXISTS` DDL from [page 03](/tutorial/03-entities) for every class passed to
+`register(...)`, at this `install(Kandra) { }` call — not lazily on first request.
+
+<Callout kind="note" title="Both of these flip for a real deploy pipeline">
+[`/philosophy/schema-safety`](/philosophy/schema-safety) covers the production shape of this:
+`schemaMode = SchemaMode.VALIDATE` (fails startup if the entity's columns don't match what's already
+in Scylla, rather than creating or altering anything) paired with schema managed by a separate
+pipeline. [Page 14](/tutorial/14-running-and-shipping) walks through switching this app to that
+shape before it ships anywhere real.
+</Callout>
+
+## `contactPoints` / `localDatacenter`
+
+```kotlin
+contactPoints = "localhost:9042"
+localDatacenter = "datacenter1"
+```
+
+`contactPoints` is a comma-separated `host:port` list — one entry here, pointing at the
+`docker-compose` Scylla from [page 02](/tutorial/02-project-setup) (port `9042` is CQL's native
+protocol port, the one the compose file maps to the host). `localDatacenter` has to match the DC
+name Scylla's default snitch assigns — `datacenter1` for a default single-node image, which is why
+[page 02](/tutorial/02-project-setup)'s `docker-compose.yml` doesn't need to configure this
+explicitly to line up.
+
+## `register(User::class, Todo::class)`
+
+Pushes both classes into `SchemaRegistry` — the same process-global registry `kandra-core`'s schema
+validation runs against. This is also what drives DDL generation order (registration order) and,
+via `kandraKoin()` below, which entities get repository bindings at all. Every entity this app adds
+in later pages (`TodoByAssignee` in page 06, `CompletionStats` in page 09) gets appended to this same
+call.
+
+## `auth { }`
+
+```kotlin
+auth {
+    provider = KandraAuth.fromEnv()
+}
+```
+
+`KandraAuth.fromEnv()` reads `SCYLLA_USERNAME`/`SCYLLA_PASSWORD` from the environment on every
+`getCredentials()` call — the recommended production default, since it means no credential ever
+lives in source or config files, and external credential rotation via env reload is picked up
+automatically if the deployment process supports it. This is also the *default* value of
+`AuthConfig.provider` — writing `auth { }` at all here is for visibility, not because leaving it out
+would change behavior.
+
+<Callout kind="gotcha" title="Already covered in page 02, worth repeating: this throws if unset, even locally">
+If `SCYLLA_USERNAME` genuinely isn't set in the environment (not blank — literally absent),
+`getCredentials()` throws `KandraAuthException` the moment `install(Kandra) { }` tries to open the
+session, before the app takes any traffic. The local Scylla from
+[page 02](/tutorial/02-project-setup) doesn't enforce authentication at all, so any non-empty values
+work — `export SCYLLA_USERNAME=cassandra SCYLLA_PASSWORD=cassandra` before running this app locally,
+every time.
+</Callout>
+
+## `pool { }`
+
+```kotlin
+pool {
+    requestTimeoutMillis = 10_000
+}
+```
+
+The driver's own default request timeout is 2 seconds — deliberately short for a database where a
+healthy query is usually single-digit milliseconds, so a stuck request fails fast by default.
+`10_000` here is generous for local development against a single-shard, resource-capped Scylla
+instance (from `--smp 1 --memory 750M` in [page 02](/tutorial/02-project-setup)), which can
+legitimately be slower than a real cluster under the same query. `maxRequestsPerConnection` (default
+`32768`) is the other half of this block worth knowing about even though this app doesn't override
+it: it caps how many concurrent in-flight requests one pooled connection will carry before the
+driver queues more behind it — the throughput ceiling per connection, not a timeout.
+
+## `retry { }`
+
+```kotlin
+retry {
+    maxAttempts = 3
+    backoffMillis = 100
+}
+```
+
+Retries, with linear backoff, on a fixed, narrow set of exception types:
+`WriteTimeoutException`, `ReadTimeoutException`, `NoNodeAvailableException` — transient,
+infrastructure-shaped failures where retrying the same request again is plausibly the right move.
+It deliberately does **not** retry on `KandraOptimisticLockException` (page 07's LWT conflict — that
+means someone else's write legitimately won, not that this write failed transiently; blindly
+retrying it would silently discard the caller's knowledge that a conflict happened) or
+`KandraValidationException` (retrying a request that fails validation just fails the same way three
+more times). Retry is for "the network or a node had a bad moment," not "make errors go away."
+
+## First mention: `debug { }` and `metrics { }`
+
+Both exist starting now (they're on `KandraConfig` regardless of whether this app's `install(Kandra)`
+block mentions them), but neither is configured yet — `debug { }`'s query/slow-query/batch logging
+and `metrics { }`'s per-query timer callback both get the full treatment, with this app's actual read
+and write paths as the worked example, in [page 11](/tutorial/11-observability). Nothing about
+waiting until then costs you anything: both default to off/no-op.
+
+## Wiring Koin: `install(Koin) { }` then `install(Kandra) { }` then `kandraKoin()`
+
+```kotlin
+install(Koin) { /* ... */ }
+install(Kandra) { /* ... */ }
+kandraKoin()
+```
+
+<Callout kind="gotcha" title="This is a real, source-verified ordering requirement, not a style preference">
+`Application.kandraKoin()` (from `kandra-koin`) does two things that only work if both installs have
+already run: it reads `Application.kandraSession`/`Application.kandra` — Ktor attributes
+`install(Kandra) { }` sets, so calling `kandraKoin()` before `install(Kandra)` reads attributes that
+don't exist yet — and it calls Koin's `getKoin()` to load its generated module, which throws if no
+Koin instance is attached to the application, so calling `kandraKoin()` before `install(Koin) { }`
+fails the same way. Verified directly from `kandra-koin`'s `KandraKoin.kt`: `val runtime = kandra`
+and `val session = kandraSession` are the first two lines of the function body, executed
+unconditionally before anything else. Relative order between `install(Koin)` and `install(Kandra)`
+doesn't matter — only that `kandraKoin()` itself runs last, after both.
+</Callout>
+
+`kandraKoin()` walks every class in `SchemaRegistry` (so it has to run after `register(...)` has
+executed, which happens inside `install(Kandra) { }`) and binds two named singletons per entity:
+`named("UserRepo")`/`named("UserSuspendRepo")`, `named("TodoRepo")`/`named("TodoSuspendRepo")`, and
+so on as more entities get registered in later pages. Those bindings share the plugin's own
+`BatchEngine` — same shutdown-drain guard, same in-flight counter as everything else Kandra does.
+
+<Callout kind="note" title="This tutorial's routes don't actually inject through Koin">
+`kandraKoin()`'s named bindings are genuinely useful if you're wiring a repository into a plain
+Kotlin class outside the routing DSL — a service layer, a background job — where
+`Application.kandra` isn't in scope the way it is inside a `Route` extension function. Inside route
+code, though, [page 05](/tutorial/05-routes) onward uses the plainer
+`application.kandra.suspendRepository<Todo>()` accessor directly, built **once** per route-registration
+function rather than per request — [`kandra-runtime`'s own documentation is explicit that repository
+instances aren't free](/foundations) (each one builds its own prepared-statement cache and, once
+[page 10](/tutorial/10-caching) turns it on, its own `@CacheResult` cache), so constructing one fresh
+inside every request handler would quietly throw both caches away on every single call. `kandraKoin()`
+is still wired up here because it costs nothing and the named bindings are there if this app grows a
+service layer later — just don't reach for `by inject(named("TodoSuspendRepo")))` inside a route
+handler when a single hoisted `val` does the same job more cheaply.
+</Callout>
+
+## Checkpoint
+
+Run the app (`./gradlew run`, with `SCYLLA_USERNAME`/`SCYLLA_PASSWORD` exported per the callout
+above). It should start cleanly, log `"Kandra: keyspace 'todos' ensured."`, and create `users` and
+`users_by_email` and `todos` in the `todos` keyspace — confirm with `docker exec -it <container>
+cqlsh -e "DESCRIBE KEYSPACE todos;"`. Nothing serves HTTP requests yet beyond whatever Ktor's default
+routing gives you for free; [page 05](/tutorial/05-routes) adds the first real routes.

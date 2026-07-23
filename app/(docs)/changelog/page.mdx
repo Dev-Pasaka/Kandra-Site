@@ -1,0 +1,308 @@
+export const metadata = {
+  title: "Changelog",
+  description:
+    "Kandra's real version history, newest first — every fix traced to its ISS-NNN root-cause writeup, every breaking change called out explicitly.",
+};
+
+# Changelog
+
+Current version: **0.4.5** (`gradle.properties`), matching the latest entry below. One file per
+version, newest first. Every fix here links to the `docs/issues/ISS-NNN-*.md` writeup with the
+actual root cause — this page summarizes, it doesn't replace those. See
+[`/battle-scars`](/battle-scars) for the narrative version of the bugs below.
+
+## 0.4.5
+
+<Callout kind="danger" title="Breaking change">
+The query DSL's `+` unary-plus predicate registration is gone.
+`repo.find { +UserTable.email.eq("x") }` becomes `repo.find { UserTable.email eq "x" }` —
+drop the leading `+`, everything else about the call is unchanged (same operator names, same
+infix-call shape).
+</Callout>
+
+`eq`/`gt`/`gte`/`lt`/`lte`/`isIn` are now `QueryContext` member extensions instead of
+`KandraColumnRef` methods, so the comparison itself performs the predicate registration — there's
+no intermediate `KandraPredicate` value left over for a caller to forget to prefix with `+`.
+
+This wasn't a style cleanup. The old `+`-prefixed form had a real, silent failure mode: forgetting
+`+` on one predicate among several **compiled cleanly** and silently dropped that predicate from
+the query, with no way to detect it at runtime — the discarded `KandraPredicate` never reached
+`QueryContext`. Two independent rounds of external code review flagged this as the DSL's biggest
+footgun before it was fixed. Full writeup:
+[GitHub issue #4](https://github.com/Dev-Pasaka/kandra/issues/4).
+
+**Verification:** confirmed against a real 3-node ScyllaDB cluster, including a dedicated
+multi-predicate test (`eq` on a partition key + `gt` on a clustering key in the same query)
+proving the silent-predicate-drop failure mode is now structurally impossible, not just less
+likely.
+
+**Also fixed:** `README.md`'s "LIMIT and ALLOW FILTERING" example called `allowFiltering()`, a
+method that has never existed on `QueryContext` — Kandra deliberately does not support `ALLOW
+FILTERING` (see [ISS-021](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-021-allow-filtering-error-message.md)).
+Replaced with the real `@SecondaryIndex`-based example, verified live against a real cluster.
+
+## 0.4.4
+
+Follow-up fixes discovered while re-verifying 0.4.3's fixes end-to-end against a real cluster, per
+the `docs/test-plan:1.1/` resume plan. Two of the 0.4.3 fixes (ISS-025 in particular) had scope
+gaps that surfaced as new regressions once re-tested beyond the original direct-repository unit
+tests; one further pre-existing bug (ISS-030) became reachable for the first time once ISS-029 was
+fixed. Each of the three fixes below was confirmed individually — build, permanent Testcontainers
+regression test, and a live run against a real 3-node ScyllaDB cluster — rather than as part of a
+complete, formally recorded plan execution (that report was still outstanding at release time).
+
+**Fixed:**
+
+- [ISS-028](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-028-cache-invalidation-key-mismatch.md) —
+  cache invalidation on `save`/`update`/`updateForce`/etc. used a partition-key-only key that
+  silently never matched `findById`'s real (full-key) cache key for any clustering-keyed
+  `@CacheResult` entity, so writes never actually invalidated the stale cached row.
+- [ISS-029](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-029-lookup-index-clustering-key-broken.md) —
+  `@LookupIndex` resolution (`find`/`findAll`/`findPage`/`exists`/`deleteBy` via a lookup
+  predicate) reconstructed only the primary table's partition key from the lookup row, never its
+  clustering key, so it broke entirely (or, for `findPage`, silently scattered across the whole
+  partition) for any entity combining `@LookupIndex` with a clustering key.
+- [ISS-030](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-030-soft-delete-removes-lookup-rows.md) —
+  `BatchEngine`'s soft-delete unconditionally deleted `@LookupIndex` rows, contradicting the
+  documented "soft delete does not remove lookup rows" behavior — a soft-deleted row still
+  "exists" until its TTL expires, so it should remain resolvable via its lookup index too.
+
+## 0.4.3
+
+All 5 Critical/High bugs found during the first real-cluster test plan execution
+(`docs/report:1.0/`) are fixed in this release, plus one closely-related bug discovered while
+fixing them. Every fix is verified against a real 3-node ScyllaDB cluster, not just unit tests.
+
+<Callout kind="danger" title="Breaking change">
+`KandraBatchScope`'s `save`/`delete`/`saveIfNotExists` are renamed to `saveInBatch`/
+`deleteInBatch`/`saveIfNotExistsInBatch`. This is `@ExperimentalKandraApi`, and the rename **is**
+the fix, not a cosmetic change — the old names could never have worked correctly under the
+documented calling convention. Kotlin always resolves a same-named repository *member* function
+over an extension function, even one added by the batch scope itself, so a batch-scoped `save()`
+compiled, looked correct, and silently never executed inside the batch. See
+[`/battle-scars/batch-scope-shadowing`](/battle-scars/batch-scope-shadowing) for the full story.
+</Callout>
+
+**Fixed:**
+
+- [ISS-022](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-022-codegen-collection-raw-types.md) —
+  `kandra-codegen` generated invalid Kotlin (raw generic types) for any `Set`/`Map` column,
+  failing compilation of the entire consuming module.
+- [ISS-023](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-023-cache-reflection-illegal-access.md) —
+  `KandraCache` crashed with `IllegalAccessException` on every real-Caffeine cache operation,
+  making `@CacheResult` unusable with a real cache dependency present.
+- [ISS-024](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-024-empty-collection-decode-throws.md) —
+  non-nullable `Set`/`Map` columns left at their natural `emptySet()`/`emptyMap()` default became
+  permanently unreadable the moment they were saved.
+- [ISS-025](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-025-clustering-key-where-clause-omitted.md) —
+  `findById`, `deleteById`, `append`, `remove`, `put`, `increment`, `decrement`, `update`
+  (`@Version`), `updateForce`, and the soft-delete rewrite all omitted clustering keys from their
+  WHERE clause — `deleteById` could delete an entire partition instead of one row, and the
+  mutation methods hard-crashed on any clustering-keyed entity.
+- [ISS-026](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-026-batch-scope-save-unreachable.md) —
+  `KandraBatchScope`'s `save`/`delete` were structurally unreachable through any documented
+  calling convention, so `batch { }`/`batchBlocking { }` silently provided zero cross-table
+  atomicity.
+- [ISS-027](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-027-batch-scope-save-if-not-exists-guard-unreachable.md) —
+  `KandraBatchScope`'s `saveIfNotExists` LWT guard had the identical unreachability bug and never
+  actually threw.
+
+**Also changed:**
+
+- `StatementBuilder.appendToCollection`/`removeFromCollection` now require the **full** primary
+  key (partition + clustering columns) in their internal `keyValues` list, not partition keys
+  alone. This only affects direct `StatementBuilder` callers (`@InternalKandraApi`) — the public
+  `KandraRepository`/`KandraSuspendRepository` API is unaffected, since `append`/`remove`/`put`
+  derive the full key from the entity automatically.
+- `findById`/`deleteById` now throw `KandraSchemaException` if fewer key values are supplied than
+  the entity's full primary key requires, instead of silently truncating to the partition key — on
+  a clustering-keyed entity, `findById(id)` (partition key only) now fails loudly instead of
+  silently returning an arbitrary row from the partition; use `findById(id, clusteringKeyValue)`.
+
+## 0.4.2
+
+Supersedes the `v0.4.1` tag, which built and published under the wrong version string
+(`gradle.properties` — the actual `project.version` source — hadn't been updated, only the unused
+`kandra` key in `gradle/libs.versions.toml` had). No functional changes from what would have been
+0.4.1.
+
+**Added — critical:**
+
+- **True async driver usage** — `executeSuspend`/`executeSuspendAll`/`prepareSuspend` extensions
+  on `CqlSession`; all suspend write paths in `BatchEngine` and all suspend read paths in
+  `QueryExecutor` (`findByIdSuspend`, `findAllSuspend`, `findPageSuspend`, `existsSuspend`,
+  `rawSuspend`, `rawQuerySuspend`) use true async via `executeAsync().await()` — no coroutine
+  dispatcher thread is ever blocked on a network round-trip
+  ([ISS-014](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-014-blocking-query-executor.md)).
+- **UNSET vs NULL** — `KandraUnset` sentinel; `encode()` returns `KandraUnset` for null nullable
+  fields → `stmt.unset(idx)` in `insertPrimary` (no tombstone); `saveWithNulls()` for intentional
+  tombstone writes.
+- **Optimistic locking** — `@Version` on `Long`/`Instant` fields; `save()` sets version to
+  `1L`/`Instant.now()`; `update()` uses LWT `IF version = ?`, throws `KandraOptimisticLockException`
+  on conflict; `updateForce()` bypasses the check.
+- **Tombstone awareness** — `@SoftDelete(ttlSeconds)` → `delete()` sets TTL instead of DELETE;
+  `@SoftDelete(markerProperty = "...")` adds an opt-in permanent marker column enabling
+  `findActive()`; `@ScyllaTable(gcGraceSeconds=N)` → DDL includes `WITH gc_grace_seconds = N`.
+- **Batch size guard** — `batchWarnThresholdKb`, `batchMaxChunkSize`, `batchAutoChunk` config;
+  `saveAll()` auto-chunks large batches.
+- **`@Sensitive` log masking** — `ColumnSchema.isSensitive`; `KandraEntityLogger.safeToString()`
+  masks sensitive fields with `***`.
+
+**Added — should-have:**
+
+- **Health check** — `GET /kandra/health` route; enabled via `KandraConfig.healthCheck = true`.
+- **Graceful shutdown** — `ShutdownConfig(drainTimeoutMs, graceful)`; `KandraRuntime.isShuttingDown`
+  + `inFlightCount`; `ApplicationStopping` event drains in-flight queries before close.
+- **Validation hook** — `KandraValidator<T>`, `KandraValidationError`, `KandraValidationException`;
+  `validate<User> {}` in plugin config; runs before every save/update.
+- **`SchemaMode.AUTO_MIGRATE`** — `CREATE TABLE IF NOT EXISTS` + diff against
+  `system_schema.columns` + `ALTER TABLE ADD` for new columns; logs WARN for unmapped Scylla
+  columns.
+- **Micrometer metrics** — `MetricsConfig` in `KandraConfig` (disabled by default).
+- **CQL injection guard** — `raw()` logs WARN when called with no params but CQL contains string
+  literals; `KandraRawQuery` builder for safe parameterised queries; `rawQuery()` on both repos.
+- **Schema migration runner** — `kandra-migrate` module: `KandraMigration`, `KandraMigrationRunner`
+  (versioned, checksum-validated, claim-locked), `MigrationHistory`.
+- **Query caching** — `@CacheResult(ttlSeconds, maxSize)` → Caffeine-backed `findById` cache,
+  invalidated on save/update/delete.
+
+**Added — publishing & ecosystem:**
+
+- `gradle/libs.versions.toml` version catalog wired into all module build files.
+- `.github/workflows/ci.yml` `docs` job runs `dokkaHtmlMultiModule` on tag push, deploys to GitHub
+  Pages.
+- **`kandra-jakarta`** module — `JakartaKandraValidator<T>` adapts `jakarta.validation.Validator`
+  into `KandraValidator<T>`.
+- **Real-cluster integration tests** — `kandra-test/src/test/.../KandraIntegrationTest.kt` and
+  re-enabled `kandra-ktor` plugin tests, run via `KandraTestcontainers` against real Cassandra.
+
+**Fixed** (found during a pre-real-database-testing audit):
+
+- [ISS-014](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-014-blocking-query-executor.md) —
+  `QueryExecutor` blocked the calling coroutine dispatcher on every suspend read.
+- [ISS-015](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-015-delete-by-id-bypasses-soft-delete.md) —
+  `KandraRepository.deleteById` bypassed `@SoftDelete`, unlike every other delete path.
+- [ISS-017](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-017-migration-checksum-not-body-based.md) —
+  migration checksum didn't actually hash the migration body.
+- [ISS-018](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-018-migration-no-locking.md) —
+  concurrent migration runners could double-apply a migration.
+- [ISS-019](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-019-collection-counter-consistency.md) —
+  collection/counter statements ignored configured consistency levels.
+- [ISS-021](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-021-allow-filtering-error-message.md) —
+  an error message referenced a non-existent `allowFiltering()` DSL method.
+
+**Changed:**
+
+- `StatementBuilder.appendToCollection`, `removeFromCollection`, `counterUpdate` gained an
+  optional `consistency: KandraConsistency?` parameter, threaded through
+  `KandraRepository`/`KandraSuspendRepository`'s `append`/`remove`/`put`/`increment`/`decrement`.
+
+## 0.3.0
+
+**Added — gap fixes:**
+
+- **Retry policy** — configurable linear backoff (`retry { maxAttempts = 3; backoffMillis = 100 }`);
+  retries on `WriteTimeoutException`, `ReadTimeoutException`, `NoNodeAvailableException` by
+  default; suspend variant uses `delay()` not `Thread.sleep()`.
+- **Idempotency tokens** — all statements now carry correct `setIdempotent()` flags: SELECT +
+  DELETE + LWT INSERT = idempotent; plain INSERT + collection mutations + counter updates =
+  non-idempotent.
+- **`IN` clause on partition keys** — `isIn(listOf(id1, id2, id3))` generates `WHERE pk IN ?`;
+  empty list short-circuits to empty result; non-PK `IN` without a secondary index throws
+  `KandraQueryException`.
+- **Nullable codec contract** — `decode()` checks `row.isNull()` before any typed getter;
+  non-nullable Kotlin type on a null column throws `KandraQueryException` with a clear message
+  instead of an NPE.
+- **Caller-controlled batch** (`KandraBatchScope`) — the original (pre-rename, later found
+  unreachable — see 0.4.3 above) `application.kandra.batch { userRepo.save(user); ... }`.
+- **`@SecondaryIndex` annotation** — `CREATE INDEX IF NOT EXISTS` DDL; queries on
+  `@SecondaryIndex` columns work without `ALLOW FILTERING`; WARN logged on every use.
+- **Prepared statement LRU cache** — replaces unbounded `ConcurrentHashMap`; configurable via
+  `preparedStatementCacheSize`.
+- **`USING TIMESTAMP`** — `save(entity, timestampMicros = ...)` for idempotent event replay.
+- **Query debug logging** — `debug { logQueries = true; logSlowQueriesMs = 500; logBatches = true }`.
+- **Test keyspace isolation** — `KandraTestcontainers.freshKeyspace(User::class)`.
+- **API stability markers** — `@InternalKandraApi` (ERROR-level opt-in) on `BatchEngine`,
+  `StatementBuilder`, `SchemaRegistry`, `DdlGenerator`; `@ExperimentalKandraApi`
+  (WARNING-level opt-in) on `KandraCodec` custom registration, `KandraEventListener`,
+  `KandraBatchScope`, `KandraAuth`.
+
+**Added — multi-datacenter support:**
+
+- New **`kandra-multidc`** module.
+- **Load balancing config** — `loadBalancing { tokenAware = true; dcAwareFailover = true;
+  allowedRemoteDcs = listOf("eu-west") }`.
+- **Consistency level per operation** — `KandraConsistency` enum in `kandra-core`;
+  `@ReadConsistency`/`@WriteConsistency` class annotations; resolution order: per-op > annotation
+  > `ConsistencyConfig` default.
+- **LWT serial consistency** — `saveIfNotExists(entity, serialConsistency = KandraConsistency.SERIAL)`.
+- **DC failover policy** — `failover { onLocalDcUnavailable = FailoverPolicy.RETRY_REMOTE_DC }`.
+- **Speculative execution** — `speculativeExecution { enabled = true; delayMillis = 100;
+  maxAttempts = 2 }`; only fires for idempotent statements.
+
+**Added — authentication & security:**
+
+- **`KandraAuthProvider` abstraction** — `KandraAuth.fromEnv()` (recommended default), `fromFile()`
+  (k8s secrets), `static()` (dev only), `custom { }` (Vault/AWS SM); replaces hardcoded
+  `username`/`password` in config.
+- **Credential rotation** — `auth { refreshIntervalSeconds = 3600 }`.
+- **SSL/TLS** — `ssl { enabled = true; trustStorePath = "..."; hostnameVerification = true }`;
+  mutual TLS support.
+- **Keyspace permission validation** — queries `system_auth.role_permissions` at startup; throws
+  `KandraAuthException` if `SELECT`/`MODIFY` missing; disable with `validatePermissions = false`.
+
+**Changed:**
+
+- `KandraEventListener` changed from `fun interface` to `interface` — existing single-method
+  implementations remain compatible.
+- `auth.provider` default changed from plaintext `username`/`password` to `KandraAuth.fromEnv()`.
+- `StatementBuilder` and `BatchEngine` now require `@OptIn(InternalKandraApi::class)`.
+
+## 0.2.0
+
+**Added:**
+
+- Composite partition keys (`@PartitionKey(index)`).
+- `@Ttl(seconds)` + per-save TTL override (`save(entity, ttlSeconds = 120)`).
+- Keyspace auto-creation with `SimpleStrategy`/`NetworkTopologyStrategy`.
+- Local datacenter config (required for DataStax Java driver 4.x).
+- Lightweight transactions — `saveIfNotExists()` with `[applied]` check.
+- Cursor pagination — `findPage(pageSize, pageToken)` using DataStax ByteBuffer paging state.
+- `EVENTUAL` write failure listener (`KandraEventListener`).
+- Schema validation mode (`SchemaMode` enum: `AUTO_CREATE`, `VALIDATE`, `NONE`).
+- `LIMIT` and `ALLOW FILTERING` in query context (with WARN log on `ALLOW FILTERING` — later
+  removed entirely as a DSL capability; see [`/why`](/why#why-does-this-need-allow-filtering-and-why-is-everyone-telling-me-not-to-use-it)
+  for why).
+- `deleteById()` and `deleteBy { }` on repositories.
+- Collection mutations (`append`, `remove`, `put`).
+- Counter table support (`@Counter`, `increment()`, `decrement()`).
+- Extensible codec + `BigDecimal` → CQL `DECIMAL` support.
+- `@CreatedAt`/`@UpdatedAt` auto-fill via data class `copy()` reflection.
+- `saveAll(entities, useBatch)` batch insert.
+- `exists { }` check via `SELECT pk LIMIT 1`.
+- Connection pool configuration (`PoolConfig`).
+- Bill of Materials (`kandra-bom`).
+
+## 0.1.0
+
+Initial release.
+
+**Added:**
+
+- `@ScyllaTable`, `@PartitionKey`, `@ClusteringKey`, `@LookupIndex`, `@Column`, `@Transient`
+  annotations.
+- `SchemaRegistry` with DDL generation.
+- `BATCH` and `EVENTUAL` lookup consistency modes.
+- `KandraRepository` (blocking) and `KandraSuspendRepository` (coroutine).
+- Type-safe query DSL (`KandraColumnRef`, `KandraPredicate`, `QueryContext`) — this is the
+  original `+`-prefixed DSL later replaced in 0.4.5; see that entry above for why.
+- Ktor `ApplicationPlugin` integration.
+- Kodein-DI auto-binding (`kandra-kodein`) and Koin auto-binding (`kandra-koin`).
+- KSP codegen generating type-safe `*Table` objects.
+- `FakeKandraSession` for unit tests.
+
+---
+
+For the reasoning behind individual fixes, see [`/battle-scars`](/battle-scars) and the linked
+`ISS-NNN` writeups above. For today's feature surface rather than its history, see
+[`/foundations`](/foundations), [`/modules`](/modules), and [`/reference`](/reference).

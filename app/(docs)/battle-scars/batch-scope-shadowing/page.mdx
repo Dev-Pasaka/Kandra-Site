@@ -1,0 +1,101 @@
+export const metadata = {
+  title: "The batch-scope shadowing saga",
+  description:
+    "ISS-026, ISS-027: KandraBatchScope's save/delete compiled, ran, and returned success without ever batching anything, because Kotlin always resolves a member function over an extension function of the same name.",
+};
+
+# The batch-scope shadowing saga
+
+This is the single most instructive Kotlin-specific bug in Kandra's history, because it's not a
+Cassandra problem at all — it's a language-semantics problem that happened to be discovered here,
+and it will bite anyone who tries the same design pattern in any Kotlin codebase.
+
+## What `KandraBatchScope` was trying to do
+
+Cassandra's only cross-table atomicity primitive is `LOGGED BATCH`. Kandra's answer is
+`KandraBatchScope` — a DSL block where repository calls inside it get *collected* into statements
+instead of executed immediately, then all fired as one atomic batch when the block exits:
+
+```kotlin
+application.kandra.batchBlocking {
+    todoRepo.save(todo)               // intended: collected, not executed yet
+    todosByAssigneeRepo.save(todoByAssignee)  // intended: collected too
+} // intended: both fire as one LOGGED BATCH here
+```
+
+`KandraBatchScope` declared `save`/`delete` as *member-extension* functions on
+`KandraRepository`/`KandraSuspendRepository` — extension functions scoped to the batch block via
+`with(repo) { save(entity) }` — so that inside a `batch { }`, calling `save` would resolve to the
+scope's statement-collecting version instead of the repository's own immediately-executing one.
+
+## ISS-026: it never worked, and nothing said so
+
+Kotlin's overload resolution rule is unconditional: **a member function of the receiver always wins
+over an extension function with the same name, even a closer-scoped member-extension declared
+inside the exact block you're standing in.** Every repository already has its own real `save`/
+`delete` member. That means `with(repo) { save(entity) }` — and the plugin's own `KandraRuntime`
+KDoc example, which called `repo.save(entity)` directly inside a batch block — *always* resolved to
+the repository's real, immediately-executing `save`, never `KandraBatchScope`'s intended one.
+
+For suspend repositories this failed to compile outright, because the signatures didn't line up
+cleanly enough to resolve silently. For blocking repositories it was worse: it compiled, it ran, it
+returned success — and it provided **zero atomicity**. This was only caught by reading
+`debug.logBatches` output line by line and noticing N independent `LOGGED BATCH` executions where
+there should have been one combined cross-table batch.
+
+<Callout kind="danger" title="This defeated the feature's entire purpose, silently">
+The whole point of `KandraBatchScope` is a correctness guarantee: either every write in the block
+lands, or none do. Before this fix, code that looked exactly like the intended usage — inside a
+`batch { }` block, calling `repo.save(entity)` — ran as N independent, non-atomic writes. If one of
+those writes failed partway through, the others had already committed. No exception, no warning,
+no compiler error told you the guarantee wasn't there. The only visible symptom was reading debug
+logs and counting batch executions.
+</Callout>
+
+### The fix
+
+Renamed `save`/`delete` to `saveInBatch`/`deleteInBatch` — names that don't collide with any real
+repository member, so there's no ambiguity for Kotlin to resolve incorrectly. If it compiles, it can
+only have resolved to the batch-collecting extension, because no member function by that name
+exists to shadow it:
+
+```kotlin
+application.kandra.batchBlocking {
+    todoRepo.saveInBatch(todo)
+    todosByAssigneeRepo.saveInBatch(todoByAssignee)
+} // now genuinely one LOGGED BATCH across both repositories
+```
+
+Verified live against a real 3-node cluster: both rows present after the block, confirmed by
+`debug.logBatches` showing a single combined batch execution — the API now *guarantees* atomicity
+by construction instead of happening to produce it when the caller got lucky.
+
+## ISS-027: the exact same bug, one call away
+
+Fixing ISS-026 surfaced an identical, independently-broken case in the same file. `KandraBatchScope`
+also declared a `saveIfNotExists` member-extension whose entire job is to throw
+`KandraQueryException`, because LWT (`IF NOT EXISTS`) can't share a `LOGGED BATCH` with regular
+statements — that's a real Cassandra constraint, and the guard exists to fail loudly instead of
+producing a batch that would be rejected or behave unexpectedly at the driver level.
+
+Same name as `KandraSuspendRepository`'s real `saveIfNotExists` member, so the same resolution rule
+applied: the guard could never fire. `repo.saveIfNotExists(entity)` inside a batch block silently
+executed a real, immediate LWT write instead of throwing — the protection the guard existed to
+provide was never active, with nothing telling you that.
+
+### The fix
+
+Renamed to `saveIfNotExistsInBatch`, for the identical reason as ISS-026's rename. Verified live:
+`saveIfNotExistsInBatch` inside `batch { }` now throws `KandraQueryException` as documented.
+
+<Callout kind="gotcha" title="The lesson, beyond Kandra">
+Kotlin always resolves a member function over an extension function, even a closer-scoped one, even
+when the extension is declared inside the exact scope you're calling from — this isn't a corner
+case, it's the rule, and it has no exception for "but my extension is more specific." Anywhere you
+try to intercept, override, or redirect a method by adding a same-named extension function on a
+type that already has a real member with that name, the member wins, silently, every time. The
+extension will still type-check, still compile, and in some shapes still run without error — it
+will just never be the code that executes. The only reliable fix is the one Kandra landed on: don't
+try to shadow the name. Pick a name that can't collide, and let "does this compile" be the proof
+that resolution went where you meant it to.
+</Callout>

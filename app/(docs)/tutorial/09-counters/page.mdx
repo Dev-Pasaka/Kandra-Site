@@ -1,0 +1,244 @@
+export const metadata = {
+  title: "09. Counters",
+  description:
+    "Adding 'how many todos has this user completed, ever' with a @Counter table — why it's not SELECT count(*), and why it's not a plain integer column with a normal UPDATE.",
+};
+
+# 09. Counters
+
+The product asks for one more number on the profile page: "how many todos has this user completed,
+ever." Not "how many are done right now" — that's a filter over `GET /todos/mine`. This is a
+lifetime counter that survives the todo itself being deleted, edited, or expiring out of the
+7-day trash window from [page 08](/tutorial/08-soft-delete-and-trash).
+
+<Callout kind="note">
+This checkpoint adds one new table (`completion_stats`), one new annotation (`@Counter`), and one
+new route (`GET /users/{id}/stats`). Everything from pages 01–08 keeps working unchanged.
+</Callout>
+
+## Why not `SELECT count(*)`
+
+The relational instinct is to just count the rows: `SELECT count(*) FROM todos WHERE owner_id = ?
+AND done = true`. Two things are wrong with that here, and neither is about Kandra specifically —
+they're about what `COUNT` actually costs in Cassandra/ScyllaDB.
+
+First, `done` isn't a key column on `Todo` — its partition key is `ownerId`, its clustering key is
+`createdAt`. A `WHERE owner_id = ? AND done = true` needs `done` to be queryable, which means
+`@SecondaryIndex` (a scatter-gather warning) at minimum, and Kandra's query DSL has no `count()`
+aggregate at all — see [`/foundations`](/foundations#allow-filtering-why-its-dangerous-and-why-kandra-refuses-it)
+for why that's deliberate.
+
+Second, and more fundamentally: even a `COUNT` scoped correctly to one partition (`WHERE owner_id =
+?`) isn't free the way a relational `COUNT` with an index is. Cassandra has no maintained row count
+for a partition — satisfying `COUNT` means reading every live row in that partition, every time the
+query runs. A user with ten completed todos, fine. A power user with ten thousand, and this "just
+a stat on a profile page" becomes a full-partition read on every profile view. It's not that
+`COUNT` doesn't work — it's that it silently gets more expensive as exactly the users who'd find
+this stat most meaningful (the heavy users) make it worse.
+
+## Why not a plain integer column with a normal `UPDATE`
+
+The second relational instinct, once `count(*)` is ruled out, is usually "fine, I'll maintain the
+count myself" — add a plain `completedCount: Long` column somewhere and bump it with
+`UPDATE stats SET completed_count = completed_count + 1 WHERE user_id = ?` every time a todo is
+marked done.
+
+This is the one place in this tutorial where the relational reflex isn't just inconvenient — it's
+an actual concurrency bug, and it's worth being precise about why. `completed_count + 1` in CQL,
+issued as a plain (non-counter) `UPDATE`, is a **read-modify-write on the coordinator**: read the
+current value, add one, write it back. Two requests completing two different todos for the same
+user at nearly the same time can both read `completed_count = 41`, both compute `42`, and both
+write `42` — one increment is silently lost, and nothing about either request failed. This isn't a
+Cassandra quirk or a Kandra gap; it's the same lost-update race any naive "read, add one, write"
+counter has under concurrent writers, in any database, without an explicit lock or atomic
+increment. A single-node relational database usually protects you from this by accident, via row
+locks under the isolation level it defaults to. Cassandra is leaderless and has no default row
+lock — nothing protects you by accident here, so the naive version really does lose updates in
+production.
+
+<Callout kind="danger" title="This is the concurrency bug, not a style preference">
+`UPDATE stats SET completed_count = completed_count + 1` is a plain write of a plain integer — no
+different from `INSERT`/`UPDATE` on any other column. It carries no read-then-write atomicity
+guarantee. Two concurrent increments race exactly like two concurrent `git push` to the same
+branch: whichever write lands last simply overwrites, it doesn't merge.
+</Callout>
+
+Cassandra's actual answer is a **counter column** — a genuinely distinct CQL type, not an `INT`/
+`BIGINT` you happen to increment. A counter's write path isn't read-modify-write on the
+coordinator; each replica applies the delta (`+1`, `-5`, whatever) as a commutative operation
+independently, and replicas converge to the correct total without needing to agree on an order
+first. Two concurrent `+1`s against the same counter both land — the type's whole reason to exist
+is making that safe without coordination. [`/foundations`](/foundations#counter-columns-are-a-genuinely-distinct-type)
+covers this in more depth; this page is where it gets used.
+
+## The entity
+
+```kotlin title="model/CompletionStats.kt"
+package com.example.todos.model
+
+import io.kandra.core.annotations.*
+import java.util.UUID
+
+@ScyllaTable("completion_stats")
+data class CompletionStats(
+    @PartitionKey val userId: UUID,
+    @Counter val completedCount: Long,
+)
+```
+
+`kandra-core`'s schema validator enforces the type's own rule at registration time, not just at
+query time: **if any non-key column on a class is `@Counter`, every non-key column must be** —
+mixing counter and non-counter columns on the same table throws `KandraSchemaException` when
+`register(CompletionStats::class)` runs, before the app even takes traffic. This mirrors CQL
+itself: a Cassandra `COUNTER` column can't share a table with an ordinary column at all. One entity,
+one job — a table that's only ever a bag of related counters for a given partition key.
+
+<SideBySide leftLabel="Entity" rightLabel="Generated DDL">
+<div>
+
+```kotlin
+@ScyllaTable("completion_stats")
+data class CompletionStats(
+    @PartitionKey val userId: UUID,
+    @Counter val completedCount: Long,
+)
+```
+
+</div>
+<div>
+
+```sql
+CREATE TABLE IF NOT EXISTS completion_stats (
+    user_id UUID,
+    completed_count COUNTER,
+    PRIMARY KEY (user_id)
+)
+```
+
+</div>
+</SideBySide>
+
+## What `@Counter` takes off the table — literally
+
+A counter table can't use `save()`. `KandraRepository`/`KandraSuspendRepository.save()` throws
+`KandraQueryException` immediately if `schema.isCounterTable` is true — same for
+`saveIfNotExists()` and `saveWithNulls()`. There's no `INSERT INTO completion_stats (...) VALUES
+(...)` you're allowed to write, because CQL itself has no `INSERT` for counter columns. The only
+way to move a counter is `increment()`/`decrement()`:
+
+```kotlin
+suspend fun increment(field: KProperty1<T, Long?>, partitionKeys: Map<String, Any>, by: Long = 1L)
+suspend fun decrement(field: KProperty1<T, Long?>, partitionKeys: Map<String, Any>, by: Long = 1L)
+```
+
+`partitionKeys` is a plain `Map<String, Any>` keyed by property name — not an entity instance, so
+bumping a counter never requires loading the row first:
+
+```kotlin
+val statsRepo = application.kandra.suspendRepository<CompletionStats>()
+
+statsRepo.increment(CompletionStats::completedCount, mapOf("userId" to ownerId))
+```
+
+## Wiring it into the "mark done" route
+
+The natural place to bump the counter is [page 07](/tutorial/07-concurrency)'s
+`PATCH /todos/{id}/done` handler — but only on the `false → true` transition, so re-marking an
+already-done todo (or a retried request) doesn't double-count:
+
+```kotlin title="routes/TodoRoutes.kt" {1-2,12-13}
+fun Route.todoRoutes() {
+    val todoRepo = application.kandra.suspendRepository<Todo>()          // hoisted once, per page 05 — see note below
+    val statsRepo = application.kandra.suspendRepository<CompletionStats>()
+
+    // ...existing routes from pages 05-08...
+
+    patch("/todos/{id}/done") {
+        val ownerId = call.request.headers["X-User-Id"]!!.let(UUID::fromString)
+        val createdAt = /* parse from request, per page 07 */ Instant.now()
+
+        val existing = todoRepo.findById(ownerId, createdAt) ?: return@patch call.respond(HttpStatusCode.NotFound)
+        val wasAlreadyDone = existing.done
+        val updated = existing.copy(done = true)
+        todoRepo.update(existing, updated)   // LWT IF version=?, per page 07
+
+        if (!wasAlreadyDone) {
+            statsRepo.increment(CompletionStats::completedCount, mapOf("userId" to ownerId))
+        }
+        call.respond(updated)
+    }
+}
+```
+
+<Callout kind="gotcha" title="Hoist the repository — don't call suspendRepository<T>() inside a route lambda">
+`application.kandra.suspendRepository<Todo>()` is cheap to call, but it's not free: called fresh on
+every request, it still resolves through the same registered `TableSchema`, but it means every
+repository-level concern that's meant to persist *across* requests — the prepared-statement cache
+and, from page 10 onward, the `@CacheResult` cache — has to be looked up fresh each time instead of
+reused. Construct each repository once, at route-registration time (as `todoRoutes()` does here,
+following page 05's pattern), and close over it from every route lambda inside that function. This
+matters more than it looks like it should: page 10's entire caching story depends on `findById`
+being called against the *same* repository instance across requests.
+</Callout>
+
+<Callout kind="gotcha" title="This increment is not atomic with the update above it">
+The `update()` call and the `increment()` call are two independent writes, not one. There's no way
+to make them atomic with `KandraBatchScope` even if you wanted to: `BatchEngine.collectSave` throws
+immediately on a counter table, because CQL itself forbids mixing counter mutations into the same
+`LOGGED BATCH` as ordinary statements — Cassandra requires counter updates to go through a
+dedicated counter batch, and Kandra doesn't expose one. If the process crashes between the two
+lines above, the todo is marked done but the lifetime counter under-counts by one. That's an
+accepted, bounded inconsistency for a "nice to have" lifetime stat — it is **not** an acceptable
+gap for anything that has to reconcile exactly (billing, inventory). Decide which kind of number
+you're building before you reach for `@Counter`.
+</Callout>
+
+`increment()`/`decrement()` also bypass `BatchEngine` entirely — no retry-on-timeout, no
+shutdown-rejection check, no metrics recording (see [page 11](/tutorial/11-observability)) for
+these two calls specifically. A dropped increment under a transient write timeout is silently lost,
+not retried. If your counter needs to be exact under network blips, that's a real gap to know about
+going in, not a bug to file later.
+
+## Reading the stat
+
+```kotlin title="routes/UserRoutes.kt"
+fun Route.userRoutes() {
+    val statsRepo = application.kandra.suspendRepository<CompletionStats>()
+
+    get("/users/{id}/stats") {
+        val userId = UUID.fromString(call.parameters["id"]!!)
+        val stats = statsRepo.findById(userId)
+            ?: CompletionStats(userId, 0L)   // no row yet = zero completions, not a 404
+        call.respond(mapOf("completedCount" to stats.completedCount))
+    }
+}
+```
+
+A user with zero completions has no row in `completion_stats` at all — nothing ever incremented
+it into existence — so `findById` returning `null` means "zero," not "error." Treating a missing
+counter row as an error is a common bug when this table is new: the row is created implicitly by
+the first `increment()`, there's no `save()` step that pre-populates it.
+
+## Plugin registration
+
+Register the new entity alongside the others:
+
+```kotlin title="Application.kt" {2}
+install(Kandra) {
+    register(User::class, Todo::class, TodoByAssignee::class, CompletionStats::class)
+    // ...
+}
+```
+
+`SchemaMode.AUTO_CREATE` (from [page 04](/tutorial/04-plugin-install)) creates `completion_stats`
+the same way it creates every other registered table — nothing special about a counter table at
+DDL-generation time beyond the `COUNTER` column type itself.
+
+<Callout kind="tip">
+Verify it end to end: `PATCH /todos/{id}/done` on a fresh todo, then `GET /users/{id}/stats` —
+`completedCount` should read `1`. Mark the same todo done again and re-check: it should still read
+`1`, because the `wasAlreadyDone` guard above skips the second increment.
+</Callout>
+
+Next: [`/tutorial/10-caching`](/tutorial/10-caching) — the user's own todo list is read far more
+often than it's written, and that's a different kind of optimization than this page's.

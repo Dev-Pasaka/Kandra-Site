@@ -1,0 +1,165 @@
+export const metadata = {
+  title: "Recipe: soft delete",
+  description:
+    "@SoftDelete and findActive() — the TTL-based timing model, the marker-column contract, and the gotchas two real Kandra bugs taught us about it.",
+};
+
+# Recipe: soft delete
+
+**Problem:** "delete" in your product means "hide it, let the user undo it, maybe purge it for real
+later" — a todo marked done, a message someone unsent, a listing taken down. A real Cassandra
+`DELETE` writes a tombstone that every read has to page past until `gc_grace_seconds` (ten days by
+default) elapses — a workload that does this constantly accumulates tombstones and degrades read
+latency on that table. `@SoftDelete` reframes "delete" as a TTL'd write instead.
+
+## The scenario
+
+A todo list where "done" items disappear from the active view but can be recovered for a while.
+
+```kotlin title="Todo.kt"
+import io.kandra.core.annotations.*
+import java.util.UUID
+
+@ScyllaTable("todos")
+@SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted") // 7 days
+data class Todo(
+    @PartitionKey val ownerId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: java.time.Instant,
+    val todoId: UUID,
+    val title: String,
+    val isDeleted: Boolean = false,
+)
+```
+
+`@SoftDelete(ttlSeconds, markerProperty)` is a class-level annotation. `markerProperty` names a
+`Boolean` property on the entity — required if you want `findActive()` to work at all (more below).
+
+## What `delete()` actually does — TTL write, not DELETE
+
+Call `todoRepo.delete(todo)` on a `@SoftDelete` entity and `BatchEngine` does not issue a CQL
+`DELETE`. It issues two `UPDATE`s:
+
+```sql
+-- 1. All non-key, non-marker columns, TTL'd
+UPDATE todos USING TTL 604800 SET title = ? WHERE owner_id = ? AND created_at = ?
+
+-- 2. The marker column, no TTL
+UPDATE todos SET is_deleted = ? WHERE owner_id = ? AND created_at = ?
+```
+
+<Callout kind="note" title="Why the marker column has no TTL">
+The marker has to *outlive* the TTL'd columns so there's still something to distinguish "this row
+is soft-deleted" from "this row is live" after the other columns' values expire. If the marker also
+expired, you'd be back to the original `ISS-007` problem: ScyllaDB has no CQL predicate for "the TTL
+on this column has run out" that works before the TTL actually runs out, and immediately after a
+soft-delete the row's data is still fully present either way — there'd be no way to tell a
+just-deleted row from a live one at all. The marker column is the only thing making `findActive()`
+possible.
+</Callout>
+
+The row's primary key itself is never touched — no tombstone is written by a `@SoftDelete`'s
+`delete()`. What eventually disappears is the *value* of the non-key columns, when ScyllaDB expires
+them; the row's key (and the `true` marker) persists until `gc_grace_seconds` after that.
+
+## `findActive()`: a real query, with a real cost
+
+```kotlin
+suspend fun findActive(): List<T>
+```
+
+```sql
+SELECT * FROM todos WHERE is_deleted = ? ALLOW FILTERING
+```
+
+<Callout kind="danger" title="findActive() is a whole-table scan — it is not partition-scoped">
+This is the single most important thing to know about `findActive()`, and it's easy to miss because
+nothing about the method signature warns you: it takes **no predicate at all**. It always runs
+`WHERE <marker> = false ALLOW FILTERING` against the **entire table** — every partition, every
+node, scatter-gather. Kandra logs a `WARN` every time it runs, naming the cost, but the query still
+executes. For `Todo` above, `findActive()` does not mean "this owner's active todos" — it means
+*every* owner's active todos, cluster-wide. If what you actually want is "my active rows" on a
+table partitioned by owner, `findActive()` is very likely the wrong tool.
+
+The right tool for "my non-deleted rows" on a partitioned, time-series-style table is the ordinary
+partition-scoped `findPage`/`findAll` you'd use anyway, plus a client-side filter on the marker:
+
+```kotlin
+val page = todoRepo.findPage(pageSize = 20) { TodoTable.ownerId eq ownerId }
+val active = page.items.filterNot { it.isDeleted }
+```
+
+The tradeoff: a page can come back with fewer live items than `pageSize` (possibly zero) after
+filtering, since the filter happens after the fetch, not in the query. If you need a consistent
+page size, keep fetching pages until you have enough live items or run out — this is exactly what
+[`/recipes/social-feed-capstone`](/recipes/social-feed-capstone#the-soft-delete-in-a-feed-problem)
+had to do for a per-author feed, and it's the honest, working pattern, not a workaround.
+</Callout>
+
+`findActive()` is the right call when the whole table really is what you mean — a small,
+non-partitioned-for-scale reference table where "all active rows" is a legitimate, bounded query.
+It stops being appropriate the moment the table is meaningfully partitioned by owner/tenant/user,
+which is most Cassandra tables.
+
+## `deleteById` used to bypass soft delete entirely
+
+<Callout kind="gotcha" title="ISS-015: one delete path skipped the TTL rewrite completely">
+Historically, `KandraRepository.deleteById(vararg keyValues)` (the blocking repository's key-only
+delete) built its own raw `LOGGED BATCH` of a hard `deleteById` plus lookup-table deletes and
+executed it directly — it never checked `schema.isSoftDelete`. Every *other* delete path on the same
+table (`delete(entity)`, the suspend repository's `deleteById`) correctly routed through
+`BatchEngine`'s soft-delete-aware logic. The result: for a `@SoftDelete` entity, calling
+`repo.deleteById(id)` permanently tombstoned the row — a silent, path-dependent divergence where two
+methods on the same repository, both named "delete," did fundamentally different things to the same
+table. It also skipped cache invalidation.
+
+**Fixed**: `deleteById` now looks the entity up first (which it already did, to find lookup rows to
+clean up) and, when found, delegates to the same `batchEngine.delete(schema, entity)` path every
+other delete method uses. If the entity doesn't exist, it falls back to a harmless hard-delete-by-key
+no-op. If you're on an older Kandra version, verify which delete path you're actually calling before
+trusting `@SoftDelete` to apply uniformly across a repository's methods.
+</Callout>
+
+## Lookup rows survive a soft delete — on purpose
+
+If the entity also has a `@LookupIndex` field, soft-deleting it does **not** remove the lookup row:
+
+```kotlin title="BatchEngine.kt — softDeleteSuspend"
+// Lookup rows are deliberately left alone (see ISS-030) -- a soft-deleted row still "exists"
+// until its TTL expires, so it must remain resolvable via its @LookupIndex too, exactly like
+// a direct findById/findActive would still see it. Hard delete is the only path that should
+// ever remove lookup rows.
+```
+
+<Callout kind="tip" title="This is correct, but it surprises people coming from hard-delete intuition">
+A soft-deleted row is still, semantically, "there" until its TTL actually runs out — its non-key
+data hasn't expired yet, `findById` still returns it. Removing its lookup row immediately would make
+it resolvable by primary key but not by the field the lookup indexes on, which is an inconsistent
+state worse than leaving both paths agreeing. If you need "soft-deleted rows shouldn't be
+findable-by-lookup either," filter on the marker column after resolving through the lookup, the same
+way you'd filter a partition-scoped page.
+</Callout>
+
+## Storage tradeoffs: what you're actually trading
+
+| | Hard `delete()` | `@SoftDelete` |
+|---|---|---|
+| Tombstone written immediately | Yes — every key column, right away | No — TTL'd `UPDATE`, not a `DELETE` |
+| Data physically gone | After `gc_grace_seconds` (default 10 days) | After `ttlSeconds`, then the marker/key persists until `gc_grace_seconds` after *that* |
+| Undo window | None | Exactly `ttlSeconds`, and undo means writing the row back before it expires |
+| Read cost while "deleted" | N/A — row's gone | Row still occupies storage (marker + expiring columns) until TTL, still counted in partition size |
+| Right for | Rare, deliberate deletes; queue/session-store cleanup you actually want gone fast | Undo flows, "trash" semantics, anything a user expects to recover |
+
+<Callout kind="gotcha" title="deleteAll() still warns about tombstones — soft delete doesn't change that call">
+`@SoftDelete` only changes what `delete()`/`deleteById()`/`deleteBy()` do for a *single* entity.
+`deleteAll(entities)` on a soft-deleted entity still routes each entity through the same TTL
+rewrite — no direct tombstones — but if you're bulk-hard-deleting a *different*, non-`@SoftDelete`
+table with `deleteAll()`, Kandra logs an explicit `WARN` once the row count exceeds
+`tombstoneWarnThreshold` (default 1000), naming `gc_grace_seconds` in the log line itself. That
+tripwire and `@SoftDelete` solve the same underlying problem from two different angles — pick
+`@SoftDelete` at modeling time for tables you know will be delete-heavy, and let the `deleteAll()`
+warning catch the ones you didn't plan for.
+</Callout>
+
+See [`/foundations`](/foundations#tombstones-what-delete-actually-does) for the tombstone mechanics
+this recipe builds on, and [`/tutorial/08-soft-delete-and-trash`](/tutorial/08-soft-delete-and-trash)
+for the fully worked tutorial version with an actual undo endpoint.

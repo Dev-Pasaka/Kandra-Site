@@ -1,0 +1,234 @@
+export const metadata = {
+  title: "13. Migrations",
+  description:
+    "A real schema change — todos need a priority field — via KandraMigration and KandraMigrationRunner, and why its checksum-plus-LWT-claim design exists.",
+};
+
+# 13. Migrations
+
+The app has shipped and has real users. Now a real requirement lands: todos need a `priority`
+field, so the client can sort/highlight urgent ones. This is the first schema change this tutorial
+makes to a table that already has production data in it — everything through page 12 was additive
+at development time, before there was anything to migrate.
+
+## Why not just add the field and let `schemaMode` handle it
+
+[Page 04](/tutorial/04-plugin-install) picked `SchemaMode.AUTO_CREATE` — `CREATE TABLE IF NOT
+EXISTS` for every registered entity at install, and nothing else. It's still the right mode for
+this app, and it's worth being precise about why adding `priority` to `Todo` doesn't need to change
+it: `AUTO_CREATE` never inspects an existing table's columns, only whether the table itself exists.
+Adding a new property to `Todo` and redeploying under `AUTO_CREATE` does not add the column to
+`todos` — it just re-runs a `CREATE TABLE IF NOT EXISTS` that's already satisfied and does nothing.
+
+`SchemaMode.AUTO_MIGRATE` *would* pick the new column up automatically — it diffs each entity's
+columns against `system_schema.columns` and issues `ALTER TABLE todos ADD priority INT` for
+anything missing. That sounds like exactly what's needed here, and for a lot of real schema
+changes, it is. But it's worth reading exactly what `AUTO_MIGRATE` does before reaching for it on a
+table serving production traffic during a rolling deploy: **every instance that starts up runs this
+diff-and-`ALTER` independently, with no coordination between instances, and the `ALTER TABLE ADD`
+it issues has no `IF NOT EXISTS` guard.** Verified directly from `Kandra.kt`:
+
+```kotlin
+fun alterTableAddColumn(schema: TableSchema, column: ColumnSchema): String =
+    "ALTER TABLE ${schema.tableName} ADD ${column.cqlName} ${kotlinTypeToCql(column.type)};"
+```
+
+A rolling deploy that brings up three new instances within the same few seconds means up to three
+independent `ALTER TABLE todos ADD priority INT` statements can fire concurrently, racing each
+other with no lock between them. It usually "works" — one wins, the others fail loudly with a CQL
+error the instance may not handle gracefully at startup — but "usually works, no explicit
+coordination" is exactly the kind of thing that's fine until a deploy timing coincidence makes it
+not fine, in production, unattended. `kandra-migrate` exists specifically to replace "usually
+works" with an actual guarantee here.
+
+<Callout kind="note">
+This isn't an argument against `AUTO_MIGRATE` categorically — it's a genuinely convenient default
+for early development, single-instance deployments, or additive changes you're comfortable
+racing. It's an argument for a dedicated migration tool once a schema change needs to survive a
+multi-instance rolling deploy without a coin-flip.
+</Callout>
+
+## Writing the migration
+
+```kotlin title="migrations/V1_AddTodoPriority.kt"
+package com.example.todos.migrations
+
+import com.datastax.oss.driver.api.core.CqlSession
+import io.kandra.migrate.KandraMigration
+
+object V1_AddTodoPriority : KandraMigration(version = 1, name = "add priority to todos") {
+    override fun up(session: CqlSession) {
+        session.execute("ALTER TABLE todos ADD priority INT")
+    }
+}
+```
+
+```kotlin
+abstract class KandraMigration(val version: Int, val name: String) {
+    abstract fun up(session: CqlSession)
+}
+```
+
+Migrations are Kotlin `object`s, not classes you instantiate — `up(session)` takes the raw driver
+`CqlSession` directly (plain `session.execute(...)`, not a `KandraRepository` call: migrations are
+schema DDL, below the entity layer). `version` doubles as the migration table's partition key, so
+it must be unique across every migration this app ever defines, and migrations apply in ascending
+`version` order regardless of what order you pass them to the runner.
+
+## Why `priority` has to be nullable in the entity
+
+```kotlin title="model/Todo.kt" {8}
+@ScyllaTable("todos")
+@CacheResult(ttlSeconds = 30, maxSize = 5_000)
+@SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted")
+data class Todo(
+    @PartitionKey val ownerId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
+    val todoId: UUID,
+    val priority: Int? = null,
+    val title: String,
+    val assigneeId: UUID?,
+    val done: Boolean = false,
+    @Version val version: Long = 1L,
+    @UpdatedAt val updatedAt: Instant = Instant.EPOCH,
+    val isDeleted: Boolean = false,
+)
+```
+
+The relational instinct here is `ALTER TABLE ADD COLUMN priority INT DEFAULT 0` — most relational
+databases backfill the default into every existing row (or resolve it lazily) as part of the same
+statement, so the new column reads as `0`, never `NULL`, even for rows that predate the migration.
+`ALTER TABLE ... ADD` in CQL has no such default/backfill semantics — verified from `KandraCodec`'s
+decode path — every row written before this migration ran has a genuinely `NULL` `priority`
+column, forever, until something explicitly rewrites that row. If `priority` were declared
+non-nullable (`val priority: Int = 0`) on the entity, the very next `findById`/`findPage` read of
+*any todo created before this migration* would throw `KandraQueryException` — Kandra's codec
+throws on a `NULL` column mapped to a non-nullable Kotlin property, by design (see
+[page 03](/tutorial/03-entities)). Making `priority` nullable and treating `null` as "no priority
+set" isn't a workaround here — it's the accurate model of what the column actually contains after
+an additive schema change in a database with no per-column default-backfill.
+
+## The checksum: catching an edited migration, not just a renamed one
+
+```kotlin
+internal fun checksum(): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    digest.update("${version}:${name}:${this::class.qualifiedName}".toByteArray())
+    val resourceName = "/" + this::class.java.name.replace('.', '/') + ".class"
+    this::class.java.getResourceAsStream(resourceName)?.use { digest.update(it.readBytes()) }
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+```
+
+<Callout kind="note" title="This used to be weaker — verified against current source, not the module's own SKILL.md">
+An earlier version of `checksum()` hashed only `"${version}:${name}:${qualifiedClassName}"` —
+enough to catch a renumbered or renamed migration, but nothing about the CQL inside `up()` itself.
+Editing the body of an already-applied migration's `up()` without touching its version, name, or
+class name produced an identical checksum, silently defeating the class's own documented promise
+("Kandra validates checksums on startup and throws if a previously-applied migration's body has
+changed") — filed and fixed as
+[`ISS-017`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-017-migration-checksum-not-body-based.md).
+The fix adds the migration class's own compiled `.class` bytecode into the same digest, so editing
+`up()`'s CQL — or any lambda/anonymous class the migration captures as a member — now changes the
+checksum too. It's an approximation (a no-op reformat the Kotlin compiler happens to encode
+identically wouldn't trip it), not a source-text diff, but it catches every *behavioral* edit,
+which the old version could never catch under any circumstance.
+</Callout>
+
+Try to change `V1_AddTodoPriority`'s CQL after it's been applied anywhere — say, to
+`ADD priority TINYINT` instead of `INT` — and the next `run()` call against an environment that
+already has version 1 recorded throws:
+
+```
+KandraMigrationException: Migration v1 ('add priority to todos') checksum mismatch — the migration
+was modified after being applied. Expected: a3f9..., got: 7c21.... Never modify a migration after
+it has been applied.
+```
+
+The fix is never to edit `V1`: write a new migration (`V2_ChangeTodoPriorityType`, or whatever the
+real fix is) that runs after it.
+
+## The locking: why two runner instances racing on deploy can't double-apply it
+
+```kotlin
+private fun claim(migration: KandraMigration): Boolean {
+    val prepared = session.prepare(
+        "INSERT INTO kandra_migrations (version, name, applied_at, checksum) VALUES (?, ?, ?, ?) IF NOT EXISTS"
+    )
+    val rs = session.execute(prepared.bind(migration.version, migration.name, Instant.now(), migration.checksum()))
+    return rs.wasApplied()
+}
+```
+
+This is the other half of the same underlying problem `AUTO_MIGRATE` doesn't solve: two `KandraMigrationRunner`
+instances — two app processes starting concurrently during a rolling deploy — both read
+`kandra_migrations`, both see version 1 as "not yet applied," and without a lock, both would call
+`up()`. `up()` here is `ALTER TABLE todos ADD priority INT` with no `IF NOT EXISTS` — the second
+call fails, loudly, mid-deploy, for a migration that isn't even wrong.
+[`ISS-018`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-018-migration-no-locking.md)
+is exactly this scenario, found in Kandra's own pre-Testcontainers audit. The fix, live in current
+`KandraMigrationRunner` source: before calling `up()`, the runner issues a claim —
+`INSERT ... IF NOT EXISTS` on the migration's `version` row, an LWT the same way `saveIfNotExists`
+is (see [`/foundations`](/foundations#lightweight-transactions-lwt-real-and-not-free)). Only the
+runner instance whose `INSERT` actually applies proceeds to call `up()`. The loser logs and moves
+on:
+
+```
+Migration v1 ('add priority to todos') claimed by another instance concurrently — skipping.
+```
+
+If `up()` throws after a runner wins the claim, the runner deletes the claim row before rethrowing
+as `KandraMigrationException` — so the migration is retryable on the next deploy, not permanently
+stuck "claimed" by a run that never finished.
+
+## Running it
+
+```kotlin title="Application.kt"
+import com.datastax.oss.driver.api.core.CqlSession
+import io.kandra.migrate.KandraMigrationRunner
+import com.example.todos.migrations.V1_AddTodoPriority
+
+fun Application.configureMigrations(session: CqlSession) {
+    // Runs BEFORE install(Kandra) — the migration owns todos' schema for this change,
+    // Kandra's own AUTO_CREATE doesn't touch existing tables' columns either way.
+    KandraMigrationRunner(session).run(V1_AddTodoPriority)
+}
+
+fun Application.module() {
+    val bootstrapSession = CqlSession.builder()
+        .addContactPoint(java.net.InetSocketAddress("localhost", 9042))
+        .withLocalDatacenter("datacenter1")
+        .withKeyspace("todos")
+        .build()
+
+    configureMigrations(bootstrapSession)
+    bootstrapSession.close()
+
+    install(Kandra) {
+        contactPoints = "localhost:9042"
+        keyspace = "todos"
+        localDatacenter = "datacenter1"
+        schemaMode = SchemaMode.AUTO_CREATE   // still fine here — AUTO_CREATE never diffs/ALTERs existing tables
+        register(User::class, Todo::class, TodoByAssignee::class, CompletionStats::class)
+        // ...
+    }
+    kandraKoin()
+}
+```
+
+The migration runner needs its own `CqlSession` — `install(Kandra)` hasn't opened one yet at the
+point migrations need to run, so a short-lived bootstrap session (plain DataStax driver, same
+contact points/keyspace) is built, used, and closed before `install(Kandra)` opens the session the
+rest of the app actually uses. [Page 14](/tutorial/14-running-and-shipping) covers the fuller
+production picture — including when `schemaMode = SchemaMode.NONE` (letting migrations own *all*
+schema changes, not just this one field) is the more disciplined choice for a mature deployment.
+
+<Callout kind="tip">
+Verify it end to end: start the app once against a keyspace from before this page, confirm the log
+lines `Applying migration v1: add priority to todos` → `Migration v1 applied successfully.`, then
+`GET /todos/mine` for a todo created before the migration and confirm `priority` comes back `null`,
+not an error.
+</Callout>
+
+Next: [`/tutorial/14-running-and-shipping`](/tutorial/14-running-and-shipping) — from a laptop
+`docker-compose` cluster to something closer to how this actually runs in production.

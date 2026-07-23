@@ -1,0 +1,210 @@
+import { PartitionRingDiagram } from "@/components/diagrams/partition-ring-diagram";
+import { ClusteringKeyDiagram } from "@/components/diagrams/clustering-key-diagram";
+import { TombstoneTimeline } from "@/components/diagrams/tombstone-timeline";
+
+export const metadata = {
+  title: "Foundations",
+  description:
+    "The Cassandra/ScyllaDB mental model for developers coming from a relational background — partitions, clustering keys, consistency, LWT, and why there's no ALLOW FILTERING in Kandra.",
+};
+
+# Foundations
+
+This page assumes you've built applications on a relational database and have never touched a
+wide-column, partition-oriented store. It assumes nothing about Cassandra or ScyllaDB beyond that.
+Everything else on this site leans on what's explained here — if a later page's guidance feels
+arbitrary, it's worth coming back to this one.
+
+## What a partition key actually is, physically
+
+In a relational database, "primary key" means "the column (or columns) that uniquely identify a
+row," and where that row physically lives on disk is the database's problem, not yours. In
+Cassandra, where a row lives is exactly what the partition key controls, and it's not an
+implementation detail — it's the single most important modeling decision you make.
+
+Every write, Cassandra hashes the partition key's value through a consistent-hashing function to
+get a *token* — a number on a fixed ring — and the node (or nodes, see below) that owns the range
+of the ring containing that token is where the data physically lives.
+
+<PartitionRingDiagram />
+
+That has a direct, practical consequence: **a query can only be served efficiently if it can
+supply the partition key.** Give Cassandra a partition key and it goes straight to the node(s) that
+own that data — a fast, single-partition read. Ask it to find rows by some *other* column, and
+there's no index telling it which node has the answer — it would have to ask every node to check
+its own data, a scatter-gather query across the whole cluster. That's expensive at any real scale,
+and it's the reason "how do I query by X" is the first design question for every table, not an
+afterthought.
+
+(In production, a partition isn't owned by one node — it's replicated to `N` nodes, where `N` is
+the keyspace's replication factor, and consistency levels, covered below, control how many of those
+replicas have to agree before a read or write is considered successful. The diagram above shows
+ownership; replication is layered on top of it.)
+
+**What this means for Kandra code:** `@PartitionKey` isn't "the ID column" — there is no single
+"the primary key" concept the way a relational reader expects. It's "the value Cassandra hashes to
+decide which node(s) this row lives on," and you choose it by asking "what value will every query
+against this table supply?" first, and "what uniquely identifies a row" second (see
+[`@ClusteringKey`](#clustering-keys-sort-order-within-a-partition), next). Query patterns that can't
+supply the partition key need `@SecondaryIndex` (an explicit, logged scatter-gather) or a
+denormalized `@LookupIndex` table — Kandra never lets you reach for a full scan silently.
+
+## Clustering keys: sort order within a partition
+
+A partition isn't necessarily one row. It's a set of rows that share a partition key, physically
+stored together, sorted by one or more *clustering key* columns. This is the mechanism behind
+every "give me the latest N events for this user" query — and it's a clustering-key pattern, not an
+`ORDER BY ... LIMIT N` pattern layered on top of an unordered table.
+
+<ClusteringKeyDiagram />
+
+The sort order is baked in at schema-design time (`@ClusteringKey(order = ClusteringOrder.DESC)`),
+not chosen at query time. That's the opposite of the relational instinct, where `ORDER BY` is
+something you add to a query whenever you feel like it, against any column, and the database
+figures out how. In Cassandra, if you didn't design the clustering key for the sort order you
+need, you don't get to ask for it later without a full in-partition scan and an in-memory sort.
+
+**What this means for Kandra code:** get the clustering key's order right in the entity definition
+and `findPage()`/`findAll()` against that partition come back pre-sorted, free. Get it wrong and
+there's no query-time fix — you're re-modeling the table. This is also why Kandra's tutorial does
+data modeling ([`/tutorial/01-modeling`](/tutorial/01-modeling)) *before* writing a single entity
+class: the clustering key has to be derived from the access pattern, not guessed at while typing
+the `data class`.
+
+## Why there are no joins, no foreign keys
+
+This is a deliberate tradeoff, not a missing feature. A relational join works by reading rows from
+multiple tables and combining them — feasible when a single node (or a coordinated set of nodes
+with a shared view) can plan and execute the query. Cassandra is built to scale horizontally across
+many nodes with no single coordinator holding the whole picture, and no leader — every node is a
+peer. A join across two arbitrarily-partitioned tables would mean pulling data from potentially
+every node in the cluster to satisfy one query, which defeats the entire point of partition-scoped
+design.
+
+The tradeoff Cassandra makes instead: normalize for update-simplicity like a relational database
+does, and joins get expensive; or **denormalize** — store the data you need for a given query
+already shaped for that query, even if that means duplicating it across tables — and every read
+stays a fast, single-partition lookup. Cassandra's answer is unambiguous: denormalize. This is the
+normal, correct way to model data here, not a workaround, not "giving up on normalization." A
+Cassandra schema with five denormalized views of the same underlying data, each shaped for one
+access pattern, is a *well-designed* schema, not a compromise.
+
+**What this means for Kandra code:** `@LookupIndex` and hand-rolled denormalized tables aren't
+escape hatches for when the "real" model doesn't fit — they're the primary tool. See
+[`/philosophy/denormalization`](/philosophy/denormalization) and, for the fully worked example,
+[`/tutorial/06-denormalization`](/tutorial/06-denormalization).
+
+## Tombstones: what DELETE actually does
+
+A relational `DELETE` removes the row. Cassandra can't do that safely in a leaderless, replicated
+system — if one replica deleted a row immediately and another replica was offline at the time, the
+offline replica would come back, see it's missing the row, and helpfully replicate it back
+everywhere via anti-entropy repair, resurrecting a deletion. Cassandra's answer is a *tombstone*: a
+marker written in place of the data, saying "this was deleted at time T," which every replica has
+to see and agree on before the row is truly gone.
+
+<TombstoneTimeline />
+
+That marker doesn't disappear immediately — it has to survive at least `gc_grace_seconds` (ten
+days, by default) so that a replica that was briefly offline has time to come back and receive it
+before compaction physically removes the data. Until then, every read that touches that partition
+has to read past the tombstone. A workload that deletes heavily accumulates tombstones faster than
+compaction clears them, and read latency on that table degrades — quietly, until it's a production
+incident.
+
+**What this means for Kandra code:** a `DELETE`-heavy access pattern (a queue, a session store, an
+undo/trash feature) is a real design smell here in a way it isn't relationally.
+[`@SoftDelete`](/recipes/soft-delete) uses a TTL write instead of a real delete for exactly this
+reason, and `deleteAll()` logs a `WARN` naming the tombstone count and `gc_grace_seconds` when a
+delete would generate more than `tombstoneWarnThreshold` (default 1000) tombstones — a deliberate
+tripwire, not a silent footgun.
+
+## Consistency levels, in plain terms
+
+Every read and write in Cassandra specifies a *consistency level*: how many of the replicas that
+own a partition have to respond before the operation is considered successful. This is the actual
+trade you're making between latency, availability, and how fresh/consistent the data you read is —
+there's no free "strong consistency by default" the way a single-node relational database gives
+you implicitly.
+
+| Level | What it means | Typical use |
+|---|---|---|
+| `ONE` | One replica (any DC) responds | Fastest, weakest — rarely the right global default |
+| `LOCAL_ONE` | One replica in the local DC responds | Kandra's default read level |
+| `LOCAL_QUORUM` | Majority of replicas *in the local DC* respond | The practical default for most reads and writes — DC-local consistency without cross-DC latency |
+| `QUORUM` | Majority of replicas *across all DCs* respond | Stronger, cross-DC latency cost |
+| `EACH_QUORUM` | Majority in *every* DC | Strongest multi-DC guarantee, highest cost |
+| `ALL` | Every replica responds | Strongest single read/write, worst availability (any replica down fails the operation) |
+| `LOCAL_SERIAL` / `SERIAL` | Paxos-based, for LWT | See Lightweight Transactions, below |
+
+`LOCAL_QUORUM` is usually the right default for a single-DC deployment, or when you want
+consistency scoped to your local datacenter without paying cross-DC round-trip latency on every
+request — it's a real, practical default, not an arbitrary one. Kandra's global default is
+`read = LOCAL_ONE`, `write = LOCAL_QUORUM`, overridable globally, per-class
+(`@ReadConsistency`/`@WriteConsistency`), or per-call. See
+[`/philosophy/consistency`](/philosophy/consistency) for the resolution order and why the read/write
+defaults are asymmetric.
+
+**What this means for Kandra code:** consistency isn't a setting you configure once and forget —
+it's a per-table, sometimes per-call decision, and Kandra keeps it visible at every level instead
+of burying it behind a single global toggle.
+
+## Lightweight Transactions (LWT): real, and not free
+
+Cassandra can give you compare-and-set semantics — `INSERT ... IF NOT EXISTS`,
+`UPDATE ... IF version = ?` — through Lightweight Transactions, built on Paxos consensus among
+replicas. This is a real transaction in the sense that matters: it won't let two concurrent
+`IF NOT EXISTS` inserts both succeed. But it costs meaningfully more than a plain write, because it
+requires an extra round of inter-replica consensus a plain write skips entirely. A relational
+developer's reflex — "wrap it in a transaction, that's just what correctness costs" — doesn't
+transfer, because plain Cassandra writes don't have that cost, and LWT is the exception you pay for
+specifically.
+
+**What this means for Kandra code:** LWT-backed features — [`@Version`](/philosophy/consistency)
+for optimistic locking, `saveIfNotExists` — are opt-in and visible in the entity definition, never
+a default you're paying for without knowing it.
+
+## Counter columns are a genuinely distinct type
+
+A Cassandra counter column isn't an integer you `UPDATE ... SET n = n + 1` — that read-modify-write
+pattern isn't safe under concurrent writes in a distributed system without coordination, and
+Cassandra doesn't silently make it safe for you the way a single-node database's row locks would.
+Counters are their own CQL type with their own write path (`increment`/`decrement`, applied as a
+commutative operation each replica can apply independently and still converge), and a counter
+column can't appear in a normal `INSERT` or share a table with non-counter columns.
+
+**What this means for Kandra code:** `@Counter` tables can't use `save()` — only
+`increment()`/`decrement()`. This isn't a Kandra restriction layered on top of Cassandra; it's
+Cassandra's own type system, surfaced faithfully. See [`/recipes/counters`](/recipes/counters).
+
+## `ALLOW FILTERING`: why it's dangerous, and why Kandra refuses it
+
+`ALLOW FILTERING` is CQL's way of saying "yes, I know this query can't be served by an index or
+partition key — run it anyway." What that actually means at execution time is a scatter-gather
+scan: every node in the cluster reads through its own data looking for matches, and the coordinator
+merges the results. It will complete. It will also get linearly slower as the cluster and dataset
+grow, and it will consume resources on every node for one query — the opposite of what a
+partition-scoped design buys you.
+
+Most ORMs will build this query for you if you write the equivalent of `WHERE non_indexed_col = ?`
+and just add the flag. Kandra's query DSL has no method that produces `ALLOW FILTERING` — it's not
+disabled by a setting, it doesn't exist in the API surface. A query against a column that isn't a
+partition key, clustering key, or `@SecondaryIndex` fails when the query is built, with a message
+pointing you at `@SecondaryIndex` (an explicit, logged scatter-gather you chose) instead of letting
+you discover the cost in production.
+
+**What this means for Kandra code:** if you hit `KandraQueryException` telling you a query needs a
+`@SecondaryIndex`, that's not friction to route around — it's the framework asking "did you mean
+for this to scatter-gather the whole cluster?" before you find out the hard way. See
+[`/why`](/why#why-does-this-need-allow-filtering-and-why-is-everyone-telling-me-not-to-use-it) for
+the fuller argument and [`ISS-021`](/battle-scars) for how the error message itself was hardened.
+
+---
+
+That's the whole model: partitions decide locality, clustering keys decide order within a
+partition, there's no join because there's no single node with the whole picture, tombstones are
+the price of safe deletion in a leaderless system, consistency levels are a real dial you turn
+per-operation, LWT and counters are distinct, costed primitives, and `ALLOW FILTERING` is a
+scatter-gather scan wearing a WHERE clause. Everything past this page assumes you have this model —
+[`/getting-started`](/getting-started) puts it to work in five minutes, and
+[`/tutorial`](/tutorial) builds a full app on top of it, one deliberate decision at a time.

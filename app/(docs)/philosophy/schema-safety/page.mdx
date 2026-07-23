@@ -1,0 +1,126 @@
+export const metadata = {
+  title: "Schema safety",
+  description:
+    "Why Kandra runs all schema DDL and validation when the plugin installs, not on the first request that hits it — and exactly what each SchemaMode does.",
+};
+
+# Schema safety
+
+<Callout kind="danger" title="The core claim">
+Every piece of schema work Kandra does — creating tables, altering them, validating them against
+what's registered — happens once, synchronously, while `install(Kandra) { ... }` is running. None of
+it happens lazily on the first request that touches a given entity. If your schema is wrong, the
+application doesn't start; it doesn't limp along and fail the first time someone hits `/users`.
+</Callout>
+
+## Why startup, not first-request
+
+A query's viability — does this table exist, does it have the columns the entity expects, does a
+given query shape need `@SecondaryIndex` — depends on schema state that's cheap to check once and
+expensive to discover by accident. A framework that defers this work until the first request that
+happens to exercise a given code path trades a predictable, boot-time failure for an unpredictable,
+production-time one: the code compiled, the deploy succeeded, the health check passed, and then the
+first customer to hit an endpoint that touches an un-migrated table gets a 500.
+
+Kandra's plugin install runs the schema step inline, before the application finishes booting and
+before Ktor starts serving traffic:
+
+```kotlin title="kandra-ktor/.../Kandra.kt (abridged, actual install sequence)"
+val Kandra: ApplicationPlugin<KandraConfig> =
+    createApplicationPlugin(name = "Kandra", createConfiguration = ::KandraConfig) {
+        val config = pluginConfig
+        val session = /* connect, optionally auto-create keyspace */
+
+        if (config.validatePermissions && config.schemaMode != SchemaMode.NONE) {
+            validatePermissions(session, config.keyspace, config.schemaMode)
+        }
+
+        config.entities.forEach { SchemaRegistry.register(it) }
+
+        when (config.schemaMode) {
+            SchemaMode.AUTO_CREATE -> /* CREATE TABLE IF NOT EXISTS, every registered entity */
+            SchemaMode.AUTO_MIGRATE -> /* CREATE TABLE IF NOT EXISTS, then diff + ALTER TABLE ADD */
+            SchemaMode.VALIDATE -> /* diff only — throws KandraSchemaException on a missing column */
+            SchemaMode.NONE -> /* no DDL at all */
+        }
+        // ... build the runtime, register routes, only after the block above returns
+    }
+```
+
+If `SchemaMode.VALIDATE` finds a column the entity expects and the table doesn't have, the plugin
+install throws `KandraSchemaException` — which means `install(Kandra) { ... }` never returns, which
+means the application never finishes starting. That's the entire mechanism: schema correctness is
+checked exactly once, at a point where failing loudly is cheap (a failed deploy, caught in CI or a
+rollout health check) instead of expensive (a 500 in production, on whichever request happens to be
+unlucky enough to hit the gap first).
+
+## `SchemaMode`, mode by mode
+
+```kotlin title="kandra-ktor/.../KandraConfig.kt"
+enum class SchemaMode {
+    AUTO_CREATE,   // CREATE TABLE IF NOT EXISTS for all registered entities (default)
+    AUTO_MIGRATE,  // CREATE TABLE IF NOT EXISTS + ALTER TABLE ADD for new entity columns
+    VALIDATE,      // Validate existing tables match the entity schema; throw on missing columns
+    NONE,          // Skip all DDL — you manage schema yourself
+}
+```
+
+- **`AUTO_CREATE`** (the default) issues `CREATE TABLE IF NOT EXISTS` for every registered entity —
+  and every `@LookupIndex` table it declares. Idempotent, safe to run on every startup, right for a
+  quickstart or a dev environment. It never touches an existing table's columns, so it won't pick up
+  a new field you added to an entity that's already deployed.
+- **`AUTO_MIGRATE`** does the same `CREATE TABLE IF NOT EXISTS`, then diffs the entity's columns
+  against `system_schema.columns` for that table and runs `ALTER TABLE ... ADD` for anything the
+  entity has that Scylla doesn't. It also compares CQL types for columns both sides agree exist —
+  a mismatch logs `ERROR` (not a thrown exception) naming both types, because a live type mismatch
+  will cause codec errors on every read/write to that column and the log line is the only signal
+  you get before those start. Columns present in Scylla but absent from the entity are logged
+  `WARN`, not touched — Kandra never runs `DROP COLUMN` on your behalf, under any mode.
+- **`VALIDATE`** runs the same diff as `AUTO_MIGRATE`'s column check, but takes no action — a missing
+  column throws `KandraSchemaException` immediately, naming the column and table, with the message
+  pointing you at `AUTO_MIGRATE` or a manual migration. This is the mode you want in a production
+  deploy pipeline: schema drift fails the deploy, it doesn't get "fixed" by the app quietly altering
+  a table you didn't review.
+- **`NONE`** skips all DDL — schema is entirely your responsibility, managed outside Kandra
+  (hand-written CQL, [`kandra-migrate`](/modules/kandra-migrate), or an external migration tool).
+
+<Callout kind="gotcha" title="AUTO_MIGRATE will never drop a column for you">
+Neither `AUTO_MIGRATE` nor any other mode issues `ALTER TABLE ... DROP`. A column that exists in
+Scylla but isn't mapped on the entity is left alone and logged as a `WARN` — the data is still there,
+still stored, just unreachable through Kandra until you either re-add the mapping or drop the column
+yourself with a reviewed migration. This is deliberate: an automatic `DROP COLUMN` triggered by
+deleting a field from a Kotlin class is exactly the kind of "the framework did something destructive
+because I edited unrelated code" surprise this page is about avoiding.
+</Callout>
+
+<Callout kind="tip" title="AUTO_CREATE is a quickstart default, not a production one">
+`AUTO_CREATE` running on every startup is convenient for local development and the five-minute
+quickstart ([`/getting-started`](/getting-started)) — but it means schema changes ride along with
+whatever code happens to deploy, with no review step. A production pipeline is better served by
+`VALIDATE` (schema drift fails the deploy loudly) paired with an explicit migration step run
+separately — see [`/recipes/migrations`](/recipes/migrations) and
+[`/modules/kandra-migrate`](/modules/kandra-migrate).
+</Callout>
+
+## Permission validation runs first, for the same reason
+
+Before any DDL runs, `install(Kandra)` checks (when `validatePermissions = true`, the default, and
+`schemaMode != NONE`) that the connecting role actually has `SELECT` and `MODIFY` on the keyspace,
+and warns if it's missing `ALTER` when a schema mode that needs it is configured. This is the same
+fail-fast principle applied one layer earlier: a role missing `MODIFY` will fail every write anyway —
+better to find that out as a thrown `KandraAuthException` naming the exact missing grant during
+`install(Kandra) { ... }` than as an opaque driver exception on whichever write request happens to
+run first.
+
+## What this means day to day
+
+- A schema problem is a deploy-time failure, not a page-someone-at-2am failure — as long as the
+  deploy pipeline actually runs the app and observes the exit code, which is why `VALIDATE` in CI
+  before a real rollout is worth the extra step.
+- `schemaMode = SchemaMode.AUTO_CREATE` in `install(Kandra) { ... }` is fine for
+  [`/getting-started`](/getting-started) and local dev; move to `VALIDATE` (or `AUTO_MIGRATE` with a
+  reviewed migration step) before production. See
+  [`/tutorial/13-migrations`](/tutorial/13-migrations) for the full progression.
+- A logged `WARN`/`ERROR` from `AUTO_MIGRATE` about an orphaned or type-mismatched column is not
+  noise — it's naming a real state where Kandra can't safely act automatically and is telling you
+  what to do about it by hand.

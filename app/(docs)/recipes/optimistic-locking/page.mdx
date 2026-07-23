@@ -1,0 +1,146 @@
+export const metadata = {
+  title: "Recipe: optimistic locking",
+  description:
+    "@Version and the LWT-backed update() path — a real concurrent-edit scenario, the cost of the compare-and-set, and when updateForce() is the right call instead.",
+};
+
+# Recipe: optimistic locking
+
+**Problem:** two requests read the same row, both edit different fields, both call `update()`. On a
+relational database with row locks or `SERIALIZABLE` isolation, this is handled for you. On
+Cassandra, a plain `UPDATE` has no concept of "based on what I last read" — it just overwrites,
+whoever's write lands last on each replica wins, and the earlier writer's edit is silently gone.
+`@Version` gives you compare-and-set: "apply this update only if the row is still at the version I
+read," backed by a real Lightweight Transaction (LWT).
+
+## The scenario: two concurrent edits to the same row
+
+A wallet balance record two support agents both pull up and edit at the same moment — agent A
+corrects a currency code, agent B corrects a display name, neither aware of the other.
+
+```kotlin title="Wallet.kt"
+import io.kandra.core.annotations.*
+import java.math.BigDecimal
+import java.util.UUID
+
+@ScyllaTable("wallets")
+data class Wallet(
+    @PartitionKey val walletId: UUID,
+    val displayName: String,
+    val currencyCode: String,
+    val balance: BigDecimal,
+    @Version val version: Long = 1L,
+)
+```
+
+`@Version` must be `Long` or `Instant` — nothing else. `Long` starts at `1` on insert and increments
+by exactly `1` per successful `update()`; `Instant` is set to `Instant.now()` on both insert and
+every successful update.
+
+```kotlin
+// Both agents fetch the same row — version = 4
+val wallet = walletRepo.findById(walletId)!!
+
+// Agent A
+walletRepo.update(wallet, wallet.copy(currencyCode = "KES"))
+// Succeeds. Row is now version = 5.
+
+// Agent B — still holding the version = 4 copy they fetched before A's write landed
+walletRepo.update(wallet, wallet.copy(displayName = "Jane's Wallet"))
+// Throws KandraOptimisticLockException — the row is no longer at version 4.
+```
+
+Agent B's `update()` doesn't overwrite agent A's currency fix and silently lose it. It fails loudly,
+with the exact row identity and the version it expected:
+
+```kotlin
+class KandraOptimisticLockException(
+    message: String,
+    val entityClass: KClass<*>,
+    val partitionKeyValue: Any,
+)
+```
+
+The caller's job at that point is to re-fetch the current row, re-apply agent B's intended change on
+top of it, and retry — the same "read, apply, compare-and-set, retry on conflict" loop optimistic
+concurrency always requires, just enforced by Cassandra's Paxos consensus instead of a relational
+row lock.
+
+## What `update()` actually does when `@Version` is present
+
+`BatchEngine.update()`/`updateSuspend()` detects the version column and takes a completely different
+path than the versionless case — no `LOGGED BATCH`, a single conditional `UPDATE`:
+
+```sql
+UPDATE wallets
+SET display_name = ?, currency_code = ?, balance = ?, version = ?
+WHERE wallet_id = ?
+IF version = ?
+```
+
+```kotlin title="BatchEngine.kt"
+val rs = executeWithRetry(stmt)
+val applied = rs.one()?.getBoolean("[applied]") ?: false
+if (!applied) throwOptimisticLockException(schema, old, oldVersion)
+```
+
+That `IF version = ?` is a real Lightweight Transaction — `setSerialConsistencyLevel(LOCAL_SERIAL)`
+on the bound statement, Paxos consensus among replicas, not a client-side check-then-write with a
+race condition of its own. `[applied]` is the driver's own signal for whether the conditional
+matched; if it didn't, the exception fires immediately, in the same call, not on a subsequent read.
+
+<Callout kind="danger" title="LWT is real, and it is not free">
+This is the core tradeoff from
+[`/foundations`](/foundations#lightweight-transactions-lwt-real-and-not-free): every `@Version`-
+backed `update()` pays for a full round of Paxos consensus among the replicas that own this
+partition — meaningfully more latency than a plain write, every single time, whether or not there
+was ever a conflict. A relational instinct — "wrap it in a transaction, that's just what correctness
+costs" — doesn't transfer, because a plain Cassandra write has no such cost, and `@Version` is the
+specific, deliberate exception you're opting into by adding the annotation. Don't add `@Version` to
+every entity by reflex; add it to the ones that actually have concurrent-edit risk.
+</Callout>
+
+## `updateForce()`: the blind-overwrite escape hatch
+
+Sometimes you genuinely want last-write-wins — a background job correcting data that nothing else
+is concurrently editing, or a caller that has already resolved the conflict itself and wants to
+commit unconditionally. `updateForce()` skips the `IF version = ?` check entirely:
+
+```kotlin
+walletRepo.updateForce(wallet.copy(balance = correctedBalance))
+```
+
+This still bumps `version` (so a *later*, version-aware caller sees a consistent counter) and still
+runs the entity's lookup-table diff, but it never throws `KandraOptimisticLockException` and never
+pays the LWT round — it's a plain `UPDATE`, batched with any `BATCH`-consistency lookup writes, at
+plain-write cost.
+
+| | `update(old, new)` | `updateForce(entity)` |
+|---|---|---|
+| Requires `@Version` on the entity | Effectively, to get any protection | No — works with or without one |
+| Conflict detection | Yes — LWT compare-and-set | None — always overwrites |
+| Cost | Higher — Paxos round every call | Plain write cost |
+| Throws on concurrent edit | `KandraOptimisticLockException` | Never |
+| Right for | Anything two callers might edit concurrently without coordination | Single-writer paths, corrections, background jobs where "last write wins" is the actual desired semantics |
+
+<Callout kind="gotcha" title="save() sets the initial version but never checks it">
+`save()` on a `@Version`-annotated entity injects the starting version (`1L` or `Instant.now()`) —
+it does not perform any compare-and-set, because there's nothing to compare against yet on an
+insert. The LWT check only exists on the `update(old, new)` path. If your access pattern is
+"upsert, then immediately edit," make sure the edit goes through `update()`, not a second `save()`
+call — a second `save()` just re-inserts, overwriting the version (and everything else)
+unconditionally, exactly like `updateForce()` would.
+</Callout>
+
+## When to reach for `@Version` at all
+
+Add it when the access pattern genuinely has concurrent-edit risk on the *same row* — user profile
+edits from multiple devices, admin tools where two operators might touch the same record, anything
+with a "someone else changed this since you loaded the page" UX requirement. Don't add it as a
+default habit: most Cassandra writes are single-writer-per-partition by construction (a user only
+edits their own row), and paying LWT cost on every write for a conflict that structurally can't
+happen is pure overhead with no corresponding safety gained.
+
+See [`/philosophy/consistency`](/philosophy/consistency) for the deeper argument on why Kandra makes
+the cheap path (`save()`) the default and the expensive path (`@Version`, `saveIfNotExists`) opt-in,
+and [`/tutorial/07-concurrency`](/tutorial/07-concurrency) for the fully worked tutorial version.

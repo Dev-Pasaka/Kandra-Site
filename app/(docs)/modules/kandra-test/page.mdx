@@ -1,0 +1,230 @@
+import { dokkaClassUrl, dokkaModuleUrl } from "@/lib/dokka";
+
+export const metadata = {
+  title: "kandra-test",
+  description:
+    "FakeKandraSession for fast structural unit tests, and KandraTestcontainers for real Testcontainers-backed integration tests — including a real, current limitation of the fake session worth knowing before you pick one.",
+};
+
+# kandra-test
+
+`kandra-test` is Kandra's test-support module, `io.kandra.test.*`, offering two genuinely different
+testing styles for code that uses `KandraRepository`/`KandraSuspendRepository`:
+
+| Style | Entry point | Backing | Speed | What it actually exercises |
+|---|---|---|---|---|
+| Fake-session unit test | `KandraTestUtils.inMemory(...)` | `FakeKandraSession` (in-process, no network) | instant | Only hand-built `BatchStatement`/`SimpleStatement` execution and capture — see the limitation below. |
+| Testcontainers integration test | `KandraTestcontainers.freshKeyspace(...)` | real `cassandra:4.1` container | slow (container start + real CQL) | The full, real `KandraRepository`/`KandraSuspendRepository` API against real DDL/DML |
+
+Read the limitation section below before picking a style — the fake-session path is not a drop-in
+replacement for the container path today; it's narrower than its own class-level KDoc claims.
+
+## Why this exists as a separate module
+
+`kandra-test` depends on `kandra-core` and `kandra-runtime` (`implementation`) plus, notably,
+`compileOnly(libs.testcontainers.cassandra)` — Testcontainers is not forced onto every consumer's
+runtime classpath just because they add `kandra-test` for `FakeKandraSession`; only a consumer who
+actually calls `KandraTestcontainers` needs to also bring Testcontainers themselves at test time. As
+a test-only module in the first place, keeping it separate from `kandra-core`/`kandra-runtime`
+means production code never accidentally pulls in JUnit, Testcontainers, or a fake driver
+implementation — `kandra-test` is meant to be a `testImplementation`, never an `implementation`,
+dependency.
+
+## `FakeKandraSession`
+
+```kotlin
+class FakeKandraSession : CqlSession
+```
+
+An in-process implementation of the DataStax driver's `CqlSession` interface — no network, no
+ScyllaDB process.
+
+```kotlin
+class FakeKandraSessionCaptureTest {
+    private val fakeSession = FakeKandraSession()
+
+    @AfterEach
+    fun tearDown() { fakeSession.reset() }
+
+    @Test
+    fun `execute captures batch statements for inspection`() {
+        // SimpleStatement doesn't need prepare()/bind(), so it works fine under the fake.
+        val batch = BatchStatement.newInstance(DefaultBatchType.LOGGED)
+            .add(SimpleStatement.newInstance("INSERT INTO users (id, name) VALUES (?, ?)", "u1", "Ada"))
+            .add(SimpleStatement.newInstance("INSERT INTO user_email_lookup (email, id) VALUES (?, ?)", "ada@x.com", "u1"))
+
+        val result = fakeSession.execute(batch)
+
+        assertEquals(1, fakeSession.capturedBatches().size)
+        assertEquals(2, fakeSession.capturedBatches().single().size)
+        assertEquals(true, result.wasApplied())   // always true — cannot simulate LWT failure here
+    }
+}
+```
+
+| Member | Behavior |
+|---|---|
+| `capturedBatches(): List<BatchStatement>` | Snapshot of every `BatchStatement` passed through the **synchronous** `execute(Statement<*>)` overload. |
+| `reset()` | Clears the captured-batches list — the only stateful thing to reset between assertions. |
+| `tableContents(tableName): List<Map<String, Any?>>` | **Always returns `emptyList()`**, literally, regardless of `tableName` or anything previously executed. Despite the name, it is not backed by anything captured. |
+| `execute(statement)` | Appends `BatchStatement`s to the captured list; **always returns `FakeResultSet.empty()`** regardless of the statement — an empty result set with `wasApplied() == true`. |
+| `executeAsync(statement)` | Always resolves to an empty `FakeAsyncResultSet`. **Does not** append to `capturedBatches()`, even for a `BatchStatement` — only the synchronous overload captures. |
+| `prepare(query)` | Returns `FakePreparedStatement(query)`. Calling `.bind(...)` on the result **always throws** `UnsupportedOperationException`. |
+
+<Callout kind="danger" title="Known limitation: repository calls throw under FakeKandraSession, today">
+Every statement-building path in `kandra-runtime` — `insertPrimary`, `insertPrimaryWithNulls`,
+`insertLookup`, `deleteLookup`, `deleteById`, `selectById`, `selectByLookup`, the versioned
+`UPDATE ... IF version = ?` builder, `counterUpdate`, `rawQuery`, `findPage` — calls
+`session.prepare(cql)` and then `prepared.bind(...)`. Under `FakeKandraSession`, `prepare(cql)`
+succeeds, but the very next call, `.bind(...)`, unconditionally throws
+`UnsupportedOperationException("FakePreparedStatement.bind() not supported in FakeKandraSession.")`.
+That means `repo.save(entity)`, `repo.delete(entity)`, `repo.update(old, new)`, `repo.findById(...)`,
+`repo.saveAll(...)`, `repo.raw(...)` — effectively the entire `KandraRepository`/
+`KandraSuspendRepository` surface — throw when called through a runtime built by
+`KandraTestUtils.inMemory(...)`. This directly contradicts `FakeKandraSession`'s own KDoc ("wire a
+full repository stack without Testcontainers"). As things stand, `FakeKandraSession` is only useful
+for asserting on **statements you build and execute yourself** — a `SimpleStatement` doesn't need
+`prepare()`/`bind()`, only a `PreparedStatement` does — not for exercising Kandra's own repository
+code paths end to end. This is a real, currently-shipping gap, not a hypothetical edge case; see
+[`/battle-scars/testing-lwt-and-fakes`](/battle-scars/testing-lwt-and-fakes) for the full story and
+why `FakeResultSet.wasApplied()` being hardcoded `true` also means there is no way to simulate a
+failed LWT (`saveIfNotExists() == false`, an optimistic-lock conflict) through this session at all —
+use Testcontainers for that.
+</Callout>
+
+## `KandraTestUtils.inMemory(...)` / `io.kandra.test.KandraRuntime`
+
+```kotlin
+object KandraTestUtils {
+    fun inMemory(vararg classes: KClass<*>): KandraRuntime
+}
+
+class KandraRuntime internal constructor(val session: CqlSession) : AutoCloseable {
+    fun <T : Any> repository(klass: KClass<T>): KandraRepository<T>
+    fun <T : Any> suspendRepository(klass: KClass<T>): KandraSuspendRepository<T>
+    override fun close()   // cancels pending eventual-write coroutines; does NOT close session or clear SchemaRegistry
+}
+```
+
+```kotlin
+@Test
+fun `repository calls currently throw through the fake session`() {
+    val runtime = KandraTestUtils.inMemory(User::class)
+    val repo = runtime.repository(User::class)
+
+    org.junit.jupiter.api.assertThrows<UnsupportedOperationException> {
+        repo.save(User(id = "u1", name = "Ada"))
+    }
+
+    runtime.close()
+    SchemaRegistry.clear()   // schema registration is process-global — reset between tests
+}
+```
+
+`inMemory(...)` calls `SchemaRegistry.register(it)` for each class (additive, process-global —
+never cleared automatically) and returns a `KandraRuntime` wrapping a fresh `FakeKandraSession`.
+
+<Callout kind="gotcha" title="Two different KandraRuntime classes, two different calling conventions">
+`io.kandra.test.KandraRuntime` (this class) is a **different class** from the production
+`io.kandra.runtime.KandraRuntime` used by `KandraTestcontainers` below — same simple name, different
+package, different constructor shape, different repository-lookup calling convention.
+`io.kandra.test.KandraRuntime.repository(User::class)` takes an explicit `KClass` argument;
+`KandraRuntimeHandle.repository<User>()` (below) is reified, no argument. Mixing up the call style
+between the two test styles is an easy copy-paste mistake when switching between them.
+</Callout>
+
+## `KandraTestcontainers`
+
+```kotlin
+object KandraTestcontainers {
+    val container: CassandraContainer<*>
+    fun freshKeyspace(vararg classes: KClass<*>): KandraRuntimeHandle
+}
+
+class KandraRuntimeHandle(
+    val runtime: io.kandra.runtime.KandraRuntime,   // the real production runtime, not a test double
+    val keyspace: String,
+) {
+    inline fun <reified T : Any> repository(): KandraRepository<T>
+    inline fun <reified T : Any> suspendRepository(): KandraSuspendRepository<T>
+    fun close()
+}
+```
+
+`container` is `by lazy { CassandraContainer("cassandra:4.1").withExposedPorts(9042).also { it.start() } }`
+— Kotlin's default `by lazy` mode is `SYNCHRONIZED`, so this is a thread-safe singleton shared across
+every test class in the same JVM. `.start()` runs inside the lazy initializer itself, so the very
+first access from *any* test class blocks synchronously while Testcontainers pulls/starts the
+container — can take tens of seconds on a cold Docker cache. There is no shutdown code anywhere in
+this file; the container runs until the JVM exits and Testcontainers' Ryuk reaper cleans it up.
+
+`freshKeyspace(vararg classes)`:
+
+1. Generates `keyspace = "kandra_test_${UUID.randomUUID()...}"` — fresh per call, so concurrent test
+   classes never collide.
+2. Opens a throwaway bootstrap session, runs `CREATE KEYSPACE IF NOT EXISTS ...
+   SimpleStrategy, replication_factor = 1`, closes it.
+3. Opens a second, real session with `.withKeyspace(keyspace)` — the session everything else uses.
+4. For each class: `SchemaRegistry.register(klass)` (same process-global registry as the fake-session
+   path), then executes every statement from `DdlGenerator.allStatements(schema)` — real
+   `CREATE TABLE` (and `@LookupIndex` lookup tables) against the container.
+5. Builds `StatementBuilder`, a fresh `CoroutineScope`, `BatchEngine`, and the **production**
+   `io.kandra.runtime.KandraRuntime` — the same class Ktor wires up in real apps, not a test double.
+
+```kotlin
+class UserRepositoryIntegrationTest {
+    private val db = KandraTestcontainers.freshKeyspace(User::class)
+    private val userRepo = db.repository<User>()             // reified — no ::class argument
+    private val userSuspendRepo = db.suspendRepository<User>()
+
+    @AfterEach
+    fun tearDown() {
+        db.close()   // drops db.keyspace and closes db's own session; the shared container stays up
+    }
+
+    @Test
+    fun `save then findById round-trips through real ScyllaDB-compatible CQL`() {
+        val user = User(id = "u1", name = "Ada", email = "ada@example.com")
+        userRepo.save(user)
+        assertEquals(user, userRepo.findById(user.id))
+    }
+}
+```
+
+<Callout kind="gotcha" title="close() swallows teardown errors; the container image is Cassandra, not ScyllaDB">
+`KandraRuntimeHandle.close()` wraps both `DROP KEYSPACE IF EXISTS $keyspace` and `session.close()` in
+`runCatching` — a failed teardown neither fails your test nor logs anything from this code. It also
+does **not** call `SchemaRegistry.clear()` and does **not** stop the shared `container`, which stays
+running for the rest of the JVM's life; only your per-call keyspace is isolated and dropped. Separately:
+the container image is real Apache **Cassandra `4.1`**, not an actual ScyllaDB image — Kandra targets
+ScyllaDB in production, but this module's integration tests run against Cassandra-protocol
+compatibility, not the real target database. If a difference between Cassandra and ScyllaDB's exact
+query-planner behavior matters to what you're testing, this container won't surface it.
+</Callout>
+
+## Gotchas worth double-checking in review
+
+- `SchemaRegistry` is process-global and **neither** test style clears it automatically — call
+  `SchemaRegistry.clear()` yourself in `@AfterEach` if a test depends on a clean registry (e.g.
+  asserting a schema-validation failure that only fires on first registration).
+- `FakeKandraSession.tableContents(...)` always returns `emptyList()` — never use it to assert on
+  saved data; there is nothing behind it.
+- `FakeResultSet.wasApplied()` is hardcoded `true`, with no seam to flip it — you cannot simulate a
+  failed LWT (`saveIfNotExists() == false`, an optimistic-lock conflict) through `FakeKandraSession`.
+  Testcontainers is the only way to exercise those paths.
+- The first integration test to touch `KandraTestcontainers.container` in a JVM run is noticeably
+  slower than the rest — it's paying for the container start that every subsequent `freshKeyspace()`
+  call reuses.
+
+## Full API reference
+
+[`kandra-test` on Dokka →]({dokkaModuleUrl("kandra-test")}) ·
+[`FakeKandraSession` →]({dokkaClassUrl("kandra-test", "io.kandra.test", "FakeKandraSession")}) ·
+[`KandraTestcontainers` →]({dokkaClassUrl("kandra-test", "io.kandra.test", "KandraTestcontainers")})
+
+## Where this shows up elsewhere on this site
+
+- [`/battle-scars/testing-lwt-and-fakes`](/battle-scars/testing-lwt-and-fakes) — the full story
+  behind `FakeKandraSession`'s current limitations, including ISS-020.
+- [`/philosophy/testing`](/philosophy/testing) — when to reach for the fake vs. Testcontainers.
+- [`/tutorial/12-testing`](/tutorial/12-testing) — both styles in a working test suite.

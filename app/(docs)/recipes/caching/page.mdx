@@ -1,0 +1,145 @@
+export const metadata = {
+  title: "Recipe: caching",
+  description:
+    "@CacheResult, Caffeine's compileOnly-vs-runtime split, invalidation semantics, and ISS-028 — the cache-key mismatch that made update() look like it worked while serving stale rows forever.",
+};
+
+# Recipe: caching
+
+**Problem:** a `findById` hot path — a product lookup, a config row, anything read far more often
+than it's written — is paying a full ScyllaDB round trip on every request when the data barely
+changes. `@CacheResult` is a read-through Caffeine cache in front of `findById`, invalidated on
+write. It's simple. It also had a real, subtle bug that made writes appear to invalidate the cache
+while silently not doing so for a whole class of entities — read the gotcha below before you rely on
+this for anything where stale data is a correctness problem, not just an inconvenience.
+
+## The scenario
+
+A product catalog lookup, read on nearly every page view, written rarely.
+
+```kotlin title="Product.kt"
+import io.kandra.core.annotations.*
+import java.math.BigDecimal
+import java.util.UUID
+
+@ScyllaTable("products")
+@CacheResult(ttlSeconds = 60, maxSize = 10_000)
+data class Product(
+    @PartitionKey val productId: UUID,
+    val name: String,
+    val priceUsd: BigDecimal,
+)
+```
+
+```kotlin
+productRepo.findById(id)   // first call: cache miss, hits ScyllaDB, populates the cache
+productRepo.findById(id)   // subsequent calls within 60s: served from cache, no query
+productRepo.save(updated)  // save/update/delete invalidate the cached entry
+```
+
+`@CacheResult(ttlSeconds = 60, maxSize = 1000)` are the annotation's actual defaults if you omit both
+— set them explicitly for anything where the right TTL/size isn't obvious from context.
+
+## Caffeine is `compileOnly` — caching degrades to a no-op without it
+
+<Callout kind="note" title="You have to add Caffeine yourself">
+`kandra-runtime` declares Caffeine as `compileOnly` — it's on Kandra's own compile classpath (so
+`KandraCache` can call it directly in source) but **not** transitively pulled into your app's
+runtime classpath. If you annotate an entity `@CacheResult` and never add
+`com.github.ben-manes.caffeine:caffeine` to your own dependencies, Kandra doesn't fail — `KandraCache`
+falls back to a no-op cache, and logs a `WARN`: `"@CacheResult is configured but Caffeine is not on
+the classpath — caching disabled. Add 'com.github.ben-manes.caffeine:caffeine' to your
+dependencies."` Every `findById` call still works correctly — it just always misses, silently paying
+full ScyllaDB round-trip cost on a code path you believed was cached, unless you're watching the
+startup logs for that specific warning.
+</Callout>
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("com.github.ben-manes.caffeine:caffeine:3.1.8")
+}
+```
+
+Add that once, in your own app, and `@CacheResult` starts actually caching. `KandraCache` builds the
+Caffeine instance entirely through reflection (`Class.forName("com.github.benmanes.caffeine.cache.Caffeine")`)
+rather than a compile-time reference — that's the mechanism that makes the graceful fallback
+possible at all when Caffeine is absent.
+
+<Callout kind="gotcha" title="ISS-023: the reflection path used to crash every real cache call, not fall back">
+This wasn't always a clean fallback. `KandraCache.resolveMethod` originally resolved
+`getIfPresent`/`put`/`invalidate` against the cache instance's own concrete runtime class
+(`target.javaClass.getMethod(...)`) — but Caffeine's actual cache implementations are
+package-private; only the public `Cache` interface is public. The `Method` object it found was
+technically public but its *declaring class* wasn't, so every `invoke()` threw
+`IllegalAccessException` the instant a real Caffeine dependency was on the classpath — the exact
+scenario `@CacheResult` exists for. Fixed by resolving the method against Caffeine's public `Cache`
+interface instead of the concrete class, so the access check passes without needing
+`setAccessible(true)`. If you're not on a version with this fix, every write to a cached entity
+crashes as soon as Caffeine is actually present — worth confirming you're past `ISS-023` before
+trusting this feature in production.
+</Callout>
+
+## Invalidation: what it keys on, and the bug that broke it
+
+Every write method — `save`, `saveIfNotExists`, `saveAll`, `update`, `updateForce`, `saveWithNulls`,
+`delete`, `deleteAll` — calls `cache.invalidate(cacheKeyOf(entity))` after the write succeeds.
+`findById`'s cache key, and the invalidation key, need to describe the exact same row the exact same
+way for this to work at all.
+
+<Callout kind="danger" title="ISS-028: invalidation silently missed every clustering-keyed cached entity">
+This is the load-bearing gotcha for this whole page — read it even if you skip everything else here.
+
+`findById`'s real cache key is derived from its actual `idValues` arguments: a bare single value
+when the entity's full primary key is exactly one column, otherwise an ordered `List` of every value
+passed in (partition key **and** clustering key, in full — required since `ISS-025`). But every
+write method's invalidation call used a *different* helper, `partitionKeyOf(entity)`, which collected
+**only** `schema.partitionKeys` and always returned a bare single value, regardless of whether the
+entity had clustering keys at all.
+
+For any entity with a clustering key — a time-series table, anything with a composite primary key —
+those two shapes never matched. `findById(userId, bucketedAt)`'s real cache key was the `List
+[userId, bucketedAt]`; `update()`'s invalidation call produced the bare `userId`. The invalidation
+call didn't error, didn't warn — it just invalidated a cache key that was never the one `findById`
+was actually using, so the real, stale entry sat in the cache untouched. **`update()` appeared to
+succeed. `findById` kept serving the pre-update row until the TTL expired on its own** — silently,
+with no exception anywhere in the call chain to catch.
+
+This bug did *not* exist before `ISS-025` shipped: when `findById(id)` (partition-key-only, one
+argument) was still the "normal," if silently-wrong-row, way to call it on a clustering-keyed entity,
+its cache key was *also* a bare single value — matching `partitionKeyOf`'s shape by coincidence.
+Tightening `findById`'s key contract to require the full key (the `ISS-025` fix) changed the cache
+key's real shape too, but the invalidation helper was a separate piece of code that nobody updated to
+match — a scope gap in that fix, not an independent new mistake.
+
+**Fixed** by replacing `partitionKeyOf` with `cacheKeyOf`, which reuses the same `keyValuesOf` helper
+`append`/`remove`/`put` already relied on, and applies `findById`'s exact shape convention: bare
+single value for a one-column key, ordered `List` otherwise. Verified live against a real cluster:
+save a clustering-keyed `@CacheResult` entity, `findById` (full key) to populate the cache, `update()`
+a field, `findById` (same full key) again — now returns the fresh row, not the stale cached one.
+</Callout>
+
+**What this means for you today:** if you're on a version at or after this fix (`0.4.4`), `@CacheResult`
+on a clustering-keyed entity invalidates correctly. If you're auditing an older deployment or writing
+your own cache-adjacent code that keys off partition key alone, this is exactly the shape of bug to
+check for — a cache key derivation that quietly drifts from the read path's key derivation is
+invisible until you specifically write a test that updates a clustering-keyed cached row and reads it
+back.
+
+## When `@CacheResult` is (and isn't) the right tool
+
+- **Good fit**: `findById` on data that's read far more than written, where a bounded staleness
+  window (`ttlSeconds`) is acceptable — reference data, catalog rows, config that changes rarely.
+- **Not a fit for other query shapes**: `@CacheResult` only caches `findById`. `find`/`findAll`/
+  `findPage` with a predicate block are never cached — a hot `findAll` query needs its own
+  application-level caching if you want one.
+- **Not a substitute for `@LookupIndex` consistency choices**: caching a row doesn't change how a
+  `@LookupIndex` write for that same entity propagates — see
+  [`/recipes/lookup-tables`](/recipes/lookup-tables) for that separate, independent tradeoff.
+- **Verify Caffeine is actually present** before depending on this for load reduction, not just
+  correctness — the silent no-op fallback means a missing dependency degrades performance without
+  ever surfacing as a bug in normal testing (every read still returns the right *data*, just always
+  from ScyllaDB).
+
+See [`/battle-scars/cache-invalidation`](/battle-scars/cache-invalidation) for the fuller writeup of
+`ISS-023`/`ISS-028` together, and [`/tutorial/10-caching`](/tutorial/10-caching) for the tutorial's
+worked version of this pattern.

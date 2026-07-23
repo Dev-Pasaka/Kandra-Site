@@ -1,36 +1,61 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Kandra docs
 
-## Getting Started
+The documentation site for [Kandra](https://github.com/Dev-Pasaka/kandra), a Kotlin-first ORM for
+ScyllaDB/Cassandra shipped as a Ktor plugin. Next.js (App Router) + MDX, statically exported —
+no backend, no required paid services.
 
-First, run the development server:
+This is a separate codebase from Kandra itself. It consumes Kandra's source and docs as raw
+material for content but ships independently.
+
+## Stack
+
+- Next.js 16 (App Router, Turbopack, static export)
+- MDX (`@next/mdx`) for content, with a small custom component set (`Callout`, `Tabs`,
+  `SideBySide`, `VersionNote`) available in every page without an explicit import
+- Tailwind CSS v4, hand-rolled design tokens (no UI kit) — see `app/globals.css`
+- Shiki (via `rehype-pretty-code`) for syntax highlighting, dual light/dark theme
+- Pagefind for fully static full-text search (built post-`next build`, no external service)
+- Radix UI primitives for the search palette, mobile nav, and tabs
+
+## Development
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Search (Cmd/Ctrl+K) only works after a full build — `pagefind` indexes the exported `out/`
+directory, which doesn't exist in dev mode. The search palette shows an explicit "not available in
+dev mode" message rather than failing silently.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Build
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm run build
+```
 
-## Learn More
+Runs `next build` (static export to `out/`) followed by `pagefind` indexing as a `postbuild` step.
 
-To learn more about Next.js, take a look at the following resources:
+## Content
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Every route lives at `app/(docs)/<route>/page.mdx`, mirroring the URL 1:1 (the `(docs)` segment is
+a route group and doesn't appear in the URL). Non-content routes (the homepage, the reference
+index) may be `page.tsx` where a custom layout is needed.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Version pins and external links (Kandra's current documented version, the Dokka base URL, this
+repo's own URL for "Edit this page" links) live in one place: `lib/site-config.ts`.
 
-## Deploy on Vercel
+## Checks
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+npm run check-stale-api      # sweeps content for known-stale API patterns (pre-rename DSL/batch scope)
+npm run check-kandra-version # warns if the pinned Kandra version lags the latest upstream tag
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Both run in CI (`.github/workflows/`); `check-kandra-version` runs on a weekly schedule since it
+depends on upstream state, not just this repo's own changes.
+
+## Deployment
+
+`.github/workflows/deploy.yml` builds and deploys to GitHub Pages on every push to `main`. The site
+has no backend — it deploys equally well to Vercel, Netlify, or any static host.

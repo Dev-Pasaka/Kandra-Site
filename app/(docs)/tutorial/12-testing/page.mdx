@@ -1,0 +1,259 @@
+export const metadata = {
+  title: "12. Testing",
+  description:
+    "FakeKandraSession vs KandraTestcontainers — genuinely different tools for genuinely different jobs, including ISS-020's honest limits on what the fake can and can't exercise.",
+};
+
+# 12. Testing
+
+`kandra-test` gives you two ways to test code that uses Kandra, and they are not interchangeable —
+one is fast and structural, the other is slower and real. Picking the wrong one for a given
+assertion either wastes a container spin-up on a check that didn't need it, or — worse — gives you
+a green test that never actually exercised the behavior you think it did.
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    testImplementation("ke.co.coinx.kandra:kandra-test:0.4.5")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+}
+```
+
+## `FakeKandraSession` — what it's actually for today
+
+`FakeKandraSession`'s own doc comment describes it as the way to "wire a full repository stack
+without Testcontainers" and assert on *structural* behavior — did a batch collect the right
+statements, is the shape right. Read literally, that sounds like exactly what you'd want for
+verifying [page 06](/tutorial/06-denormalization)'s `KandraBatchScope` call actually produces two
+`INSERT`s, or [page 07](/tutorial/07-concurrency)'s `update()` actually issues an
+`IF version = ?` clause.
+
+<Callout kind="gotcha" title="It doesn't currently do that — verified from source, not assumed">
+`FakeKandraSession.execute()` always returns an empty result set. Every statement-building path in
+`kandra-runtime` — `insertPrimary`, the versioned `UPDATE ... IF version = ?` builder, `counterUpdate`,
+`selectById`, all of it — calls `session.prepare(cql)` and then `.bind(...)` to produce the
+`BoundStatement` it actually executes. `FakePreparedStatement.bind(...)` **unconditionally
+throws** `UnsupportedOperationException`, regardless of how many arguments are passed. That's not
+limited to `repo.save()`/`repo.findById()` — `KandraBatchScope.saveInBatch()`'s internal
+`collectSave()` builds its statements through the exact same `StatementBuilder.insertPrimary(...)`
+call, so it hits the same `bind()` and throws too. There is currently no way to call
+`repo.save(entity)`, `repo.update(old, new)`, or `todoRepo.saveInBatch(todo)` inside a
+`runtime.batch { }` block against a `FakeKandraSession` and have it succeed — every one of them
+throws `UnsupportedOperationException: FakePreparedStatement.bind() not supported in
+FakeKandraSession.` This is tracked, deliberately, as
+[`ISS-020`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-020-fake-session-lwt-semantics.md)
+— a documented limitation, not a bug someone forgot to fix.
+</Callout>
+
+There's also no seam to make an LWT appear to fail: `FakeResultSet.wasApplied()` is hardcoded
+`true` with no override point. Even if `bind()` didn't throw, there is currently no way to make
+`FakeKandraSession` simulate `saveIfNotExists() == false` or a `KandraOptimisticLockException`
+conflict — the two things page 07's whole optimistic-locking story depends on. ISS-020's own
+takeaway, stated plainly in the issue: *"don't read '43 unit tests passing' as evidence that
+LWT/optimistic-locking/collection mutation paths work — they are exercised for the first time by
+the Testcontainers suite."*
+
+So what's the fake actually good for? Capturing a `BatchStatement` you build and execute yourself —
+`SimpleStatement`s don't need `prepare()`/`bind()`, so they work fine:
+
+```kotlin
+import io.kandra.test.FakeKandraSession
+import com.datastax.oss.driver.api.core.cql.BatchStatement
+import com.datastax.oss.driver.api.core.cql.DefaultBatchType
+import com.datastax.oss.driver.api.core.cql.SimpleStatement
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.assertThrows
+
+class TodoBatchCaptureTest {
+
+    private val fakeSession = FakeKandraSession()
+
+    @AfterEach
+    fun tearDown() = fakeSession.reset()
+
+    @Test
+    fun `hand-built batch statements are captured for structural assertions`() {
+        val batch = BatchStatement.newInstance(DefaultBatchType.LOGGED)
+            .add(SimpleStatement.newInstance(
+                "INSERT INTO todos (owner_id, created_at, title) VALUES (?, ?, ?)",
+                UUID.randomUUID(), Instant.now(), "Ship the release"
+            ))
+            .add(SimpleStatement.newInstance(
+                "INSERT INTO todos_by_assignee (assignee_id, created_at, todo_id) VALUES (?, ?, ?)",
+                UUID.randomUUID(), Instant.now(), UUID.randomUUID()
+            ))
+
+        fakeSession.execute(batch)
+
+        assertEquals(1, fakeSession.capturedBatches().size)
+        assertEquals(2, fakeSession.capturedBatches().single().size)
+    }
+
+    @Test
+    fun `saveInBatch throws under FakeKandraSession — regression guard for ISS-020`() {
+        val runtime = io.kandra.test.KandraTestUtils.inMemory(Todo::class)
+        val todoRepo = runtime.repository(Todo::class)
+
+        assertThrows<UnsupportedOperationException> {
+            todoRepo.save(Todo(UUID.randomUUID(), Instant.now(), UUID.randomUUID(), "x", null))
+        }
+
+        runtime.close()
+        io.kandra.core.SchemaRegistry.clear()
+    }
+}
+```
+
+The second test isn't decoration — it's a live assertion that this limitation still holds on
+whatever Kandra version the build is pinned to. If a future Kandra release makes `FakeKandraSession`
+smarter, this test starts failing and tells you the limitation section above needs rewriting.
+
+## `KandraTestcontainers` — where LWT, atomicity, and soft-delete timing actually get exercised
+
+`KandraTestcontainers.freshKeyspace(...)` spins up a real `cassandra:4.1` container (shared across
+the JVM run, one fresh keyspace per call) and hands you the **production** `KandraRuntime` — the
+same class Ktor installs, not a test double. Everything below is a real round trip against real CQL
+semantics: real `IF version = ?` LWT evaluation, real `LOGGED BATCH` atomicity, real TTL writes.
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    testImplementation("org.testcontainers:cassandra:1.20.4")
+    testImplementation("org.testcontainers:junit-jupiter:1.20.4")
+}
+```
+
+### Test 1 — the optimistic-lock conflict from page 07
+
+```kotlin
+import io.kandra.test.KandraTestcontainers
+import io.kandra.core.exception.KandraOptimisticLockException
+import kotlinx.coroutines.test.runTest
+import org.junit.jupiter.api.*
+import org.junit.jupiter.api.Assertions.*
+import java.time.Instant
+import java.util.UUID
+
+class TodoOptimisticLockIntegrationTest {
+
+    private val db = KandraTestcontainers.freshKeyspace(User::class, Todo::class)
+    private val todoRepo = db.suspendRepository<Todo>()
+
+    @AfterEach
+    fun tearDown() = db.close()
+
+    @Test
+    fun `updating from a stale snapshot throws KandraOptimisticLockException`() = runTest {
+        val ownerId = UUID.randomUUID()
+        val createdAt = Instant.now()
+        val todo = Todo(ownerId, createdAt, UUID.randomUUID(), "Ship the release", null)
+        todoRepo.save(todo)
+
+        // Two "concurrent" readers both load the same version-1 snapshot.
+        val readerA = todoRepo.findById(ownerId, createdAt)!!
+        val readerB = todoRepo.findById(ownerId, createdAt)!!
+
+        todoRepo.update(readerA, readerA.copy(title = "Ship the release (edited by A)"))  // wins, version -> 2
+
+        // B still holds version 1 — its update loses the race.
+        assertThrows<KandraOptimisticLockException> {
+            todoRepo.update(readerB, readerB.copy(title = "Ship the release (edited by B)"))
+        }
+    }
+}
+```
+
+This is precisely the scenario `FakeKandraSession` cannot produce — `wasApplied()` is hardcoded
+`true` under the fake, so this exact assertion would never see a failure to catch. Against the real
+container, the second `update()` issues `UPDATE ... IF version = 1` for real, ScyllaDB/Cassandra
+evaluates it against the real (now `version = 2`) row, and `[applied]` genuinely comes back `false`.
+
+### Test 2 — soft-delete timing from page 08
+
+```kotlin
+class TodoSoftDeleteIntegrationTest {
+
+    private val db = KandraTestcontainers.freshKeyspace(User::class, Todo::class)
+    private val todoRepo = db.suspendRepository<Todo>()
+
+    @AfterEach
+    fun tearDown() = db.close()
+
+    @Test
+    fun `delete rewrites the row with a TTL marker instead of a real DELETE`() = runTest {
+        val ownerId = UUID.randomUUID()
+        val createdAt = Instant.now()
+        val todo = Todo(ownerId, createdAt, UUID.randomUUID(), "Renew passport", null)
+        todoRepo.save(todo)
+
+        todoRepo.delete(todo)   // @SoftDelete: UPDATE ... USING TTL 604800, not DELETE
+
+        // A real DELETE would make this null immediately. It doesn't, here.
+        val afterDelete = todoRepo.findById(ownerId, createdAt)
+        assertNotNull(afterDelete)
+        assertTrue(afterDelete!!.isDeleted)
+        assertEquals("Renew passport", afterDelete.title)   // whole row rewritten with a fresh TTL, not just a marker column
+    }
+}
+```
+
+This is the assertion `FakeKandraSession` categorically cannot make either — it has no notion of a
+row existing after a write, since `execute()` always returns an empty result set regardless of what
+was "saved." Only a real backing store can show you that the row is still there, still readable,
+still carrying its real data, right after `delete()` — which is exactly the property `@SoftDelete`
+depends on.
+
+### Test 3 — denormalized-write atomicity from page 06
+
+```kotlin
+import io.kandra.core.ExperimentalKandraApi
+
+class DenormalizedWriteAtomicityIntegrationTest {
+
+    private val db = KandraTestcontainers.freshKeyspace(User::class, Todo::class, TodoByAssignee::class)
+    private val todoRepo = db.suspendRepository<Todo>()
+    private val byAssigneeRepo = db.suspendRepository<TodoByAssignee>()
+
+    @AfterEach
+    fun tearDown() = db.close()
+
+    @OptIn(ExperimentalKandraApi::class)
+    @Test
+    fun `assigning a todo writes both tables atomically via KandraBatchScope`() = runTest {
+        val ownerId = UUID.randomUUID()
+        val assigneeId = UUID.randomUUID()
+        val createdAt = Instant.now()
+        val todoId = UUID.randomUUID()
+
+        db.runtime.batch {
+            todoRepo.saveInBatch(Todo(ownerId, createdAt, todoId, "Review PR", assigneeId))
+            byAssigneeRepo.saveInBatch(TodoByAssignee(assigneeId, createdAt, todoId, ownerId, "Review PR"))
+        }
+
+        assertEquals(todoId, todoRepo.findById(ownerId, createdAt)?.todoId)
+        assertEquals(todoId, byAssigneeRepo.findById(assigneeId, createdAt)?.todoId)
+    }
+}
+```
+
+Both writes landing (or, if you kill the container mid-batch in a more elaborate failure-injection
+test, both **not** landing) is the actual atomicity guarantee `LOGGED BATCH` provides — and it's
+only observable against something that actually executes CQL. `FakeKandraSession` would need
+`bind()` to not throw just to get this far, which — per ISS-020, above — it currently doesn't.
+
+## The dividing line, stated plainly
+
+| Question | Tool |
+|---|---|
+| "Did my code call `saveInBatch` on the two repos I expected, in the right order?" (hand-built statements only) | `FakeKandraSession` |
+| "Does marking a todo done twice concurrently actually conflict?" | `KandraTestcontainers` |
+| "Does soft-deleting a todo leave it readable until the TTL, not gone immediately?" | `KandraTestcontainers` |
+| "Does the denormalized write from page 06 really land both rows atomically?" | `KandraTestcontainers` |
+| "Is this CQL string what I think it is?" | Either — `FakeKandraSession` is faster if you're not exercising real Kandra repository calls |
+
+Anything touching LWT, real row state after a write, or cross-table atomicity: reach for
+`KandraTestcontainers`. It's slower — the shared container's first access in a test run blocks on a
+cold pull/start — but it's the only one of the two that's telling you the truth.
+
+Next: [`/tutorial/13-migrations`](/tutorial/13-migrations) — the app ships, and now a real schema
+change has to go out without taking the keyspace down or double-applying under a rolling deploy.

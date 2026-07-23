@@ -1,0 +1,101 @@
+export const metadata = {
+  title: "Codegen & collection types",
+  description:
+    "ISS-016, ISS-022, ISS-024: collections broke Kandra's KSP-generated code outright, then broke decoding empty ones, and one alarm about collection codec lookup turned out not to be a bug at all.",
+};
+
+# Codegen & collection types
+
+`List`/`Set`/`Map` columns caused more real trouble in Kandra than any other single type category —
+two genuine bugs, a year apart, plus one investigation that concluded there was no bug. Grouped here
+because all three are about the same underlying tension: Kotlin's generics get erased at the JVM
+boundary, and every layer that touches a collection column — codegen, encoding, decoding — has to
+independently get that right, or it doesn't matter that the other layers did.
+
+## ISS-022: codegen generated Kotlin that couldn't compile
+
+`kandra-codegen`'s `KandraProcessor` resolves each entity property's type to generate a typed
+`*Table.kt` companion (the `UserTable.email eq "x"` style DSL). Its type-name resolution called
+`prop.type.resolve().declaration.qualifiedName?.asString()` — which reads only the raw declaration's
+qualified name and discards every generic type argument.
+
+For any `Set<T>`/`Map<K, V>` column, that produced `KandraColumnRef<kotlin.collections.Set>` or
+`KandraColumnRef<kotlin.collections.Map>` — a **raw generic type**. Unlike Java, Kotlin has no raw-type
+escape hatch. The generated file itself failed to compile, which took down the entire consuming
+module's build.
+
+<Callout kind="danger" title="Not a narrow edge case">
+This affected any `@ScyllaTable` entity with a collection column — one of the most ordinary shapes an
+entity can take. Found during real-cluster test plan execution, not caught by any prior test, because
+nothing in the test suite exercised the generated code's own compile step against a collection-typed
+entity until then.
+</Callout>
+
+### The fix
+
+`resolveTypeName` now recurses into `KSType.arguments`, rendering nested generics correctly —
+`kotlin.collections.Map<kotlin.String, kotlin.String>`, not the bare raw name — and falls back to
+`kotlin.Any` per unresolvable position instead of failing the whole build. Verified by adding
+`Set<String>`/`Map<String, String>` test entities that compile through real KSP codegen wired into
+the test module, with the generated output inspected directly to confirm full type arguments survive.
+
+## ISS-024: a non-nullable empty collection was permanently unreadable
+
+`KandraCodec.decode`'s NULL check ran before any type-specific dispatch — `row.isNull(name)` threw
+`KandraQueryException` for any non-nullable Kotlin type backed by a NULL column. That's correct for a
+non-nullable `String` or `Int`. It's wrong for collections, because Cassandra cannot represent an
+empty (non-frozen) `List`/`Set`/`Map` any other way *than* NULL at the storage layer — inserting
+`emptySet()`/`emptyMap()` simply stores no value, which is correct, expected CQL behavior. The
+DataStax driver's own `Row.getSet`/`getMap`/`getList` accessors are specifically designed to return an
+empty collection, never null, for exactly this reason. Kandra's codec threw before ever reaching them.
+
+```kotlin
+data class Post(
+    @PartitionKey val id: UUID,
+    val tags: Set<String> = emptySet(), // idiomatic Kotlin — non-nullable, empty default
+)
+```
+
+<Callout kind="danger">
+This is the idiomatic, natural way to declare an optional collection in Kotlin. Any freshly-created
+row that hadn't had an `append()`/`put()` call yet — which, for a brand-new entity, is most of them —
+was permanently unreadable through `findById`/`find`/`findAll`/`findPage`. Not a rare-data-shape bug;
+it hit the default case.
+</Callout>
+
+### The fix
+
+`decode` now resolves the column's classifier *before* the NULL check and exempts `List`/`Set`/`Map`
+from it entirely, regardless of the Kotlin property's declared nullability, falling through to the
+existing collection-decode branches — which already call the driver's null-safe accessors correctly.
+Verified live: save-then-immediate-`findById` of an entity with untouched `emptySet()`/`emptyMap()`
+defaults against a real 3-node cluster reads back as `[]`/`{}`, not an exception.
+
+## ISS-016: the alarm that wasn't a bug
+
+Raised, not found: during the same audit that produced ISS-022, `StatementBuilder.setEncoded` was
+flagged as a suspect — it binds values with `set(idx, value, value::class.java as Class<Any>)`, and
+for a collection value, `value::class.java` resolves to a concrete implementation class (e.g.
+`ArrayList`) with no generic element-type information at all. That's a well-known pitfall for the
+DataStax driver's codec registry, which normally needs a `GenericType` carrying element types to
+resolve a collection codec — and `FakeKandraSession` never exercises the real codec registry, so this
+path had never actually been run against it.
+
+Tracing it against `java-driver-core:4.17.0` source resolved it: `SettableByIndex.set` calls
+`CodecRegistry.codecFor(DataType cqlType, Class<V> javaType)`, and when a *concrete* `cqlType` is
+already known — which it is here, because the statement is prepared against a real table's column
+definitions, e.g. `list<text>` — the registry derives the element codec from the **CQL** element type,
+not the Java generic, falling back to it precisely when Java-side generics erasure has destroyed the
+type information. The driver was built to handle exactly this case. No change was needed.
+
+<Callout kind="tip" title="The lesson, beyond Kandra">
+Two of these three are the same failure mode from opposite directions: codegen threw away generic
+type information it needed to keep (ISS-022), and the codec's Java-side type dispatch threw away
+generic information it didn't actually need, because the CQL schema supplied it back (ISS-016).
+"Generics are erased at runtime" is true, but it's not automatically fatal — the question that
+matters is whether *something else in the pipeline* — a schema, a config, a prepared statement —
+still carries the type information the erased generic lost. Assuming erasure is always fatal gets
+you an unnecessary rewrite (or worse, an unnecessary workaround) as often as assuming it's never a
+problem gets you ISS-022. Trace the actual runtime call path — as ISS-016 did against real driver
+source — before deciding which one you're looking at.
+</Callout>

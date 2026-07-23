@@ -1,0 +1,138 @@
+export const metadata = {
+  title: "07. Concurrency: optimistic locking",
+  description:
+    "Two edits to the same todo racing each other, @Version's LWT-based compare-and-set, KandraOptimisticLockException in the route layer, and why User doesn't get a @Version column.",
+};
+
+# 07. Concurrency: optimistic locking
+
+A todo can legitimately be edited by two different people — its owner and its assignee, both looking
+at the same row, both able to change it. [Page 05](/tutorial/05-routes) already flagged the gap this
+creates: `update(old, new)` with no `@Version` column is a blind full-row overwrite, no concurrency
+check of any kind. This page closes it.
+
+## The race, concretely
+
+Two clients both load the same todo — version 1, title "Ship the release" — at nearly the same
+moment. Client A edits the title to "Ship the release (final)" and saves. Client B, still holding
+its own copy of the *original* row, edits the title to "Ship the release — blocked on review" and
+saves a moment later. With a blind overwrite, B's write simply replaces A's — not merges, not
+conflicts, just silently wins because it happened to execute second. A's edit is gone, and neither
+client, nor anyone else, ever finds out.
+
+<Callout kind="danger" title="This is exactly the shape of race the relational instinct hides by accident">
+A relational database under a serializable-ish default isolation level often protects you from this
+without you doing anything — a row lock held across the update, or an interleaving the engine
+detects and rejects. Cassandra is leaderless; there is no ambient lock. Two plain `UPDATE`s to the
+same row race exactly like the lost-update problem [page 09](/tutorial/09-counters) walks through
+for counters, just on an arbitrary column instead of a number — whichever write's coordinator
+finishes last simply overwrites, unconditionally.
+</Callout>
+
+## `@Version` and `@UpdatedAt`
+
+```kotlin title="model/Todo.kt" {8,9}
+@ScyllaTable("todos")
+data class Todo(
+    @PartitionKey val ownerId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
+    val todoId: UUID,
+    val title: String,
+    val assigneeId: UUID?,
+    val done: Boolean = false,
+    @Version val version: Long = 1L,
+    @UpdatedAt val updatedAt: Instant = Instant.EPOCH,
+)
+```
+
+- **`@Version val version: Long = 1L`** — `save()` sets the initial value (`1L`, since this is a
+  `Long` column — `kandra-core` also allows `Instant` for this annotation, but a counter is the more
+  legible choice here). Only **`update(old, new)`** enforces the check; `updateForce()` bypasses it
+  entirely, on purpose, for the rare case where you genuinely want "last write wins" (not used
+  anywhere in this app).
+- **`@UpdatedAt val updatedAt: Instant = Instant.EPOCH`** — stamped to `Instant.now()` on every
+  `save()` **and** `update()`/`updateForce()` call, unconditionally. Unlike `Todo.createdAt`
+  ([page 03](/tutorial/03-entities)), nothing in this app needs to know the exact value ahead of
+  time — it's a plain audit column, read but never used as a lookup key — so there's no reason to
+  set it by hand the way `createdAt` has to be.
+
+## What `update(old, new)` actually does once `@Version` exists
+
+```kotlin
+todoRepo.update(existing, existing.copy(title = "Ship the release (final)"))
+```
+
+With `@Version` present, this stops being a blind overwrite and becomes:
+
+```sql
+UPDATE todos SET title = ?, updated_at = ?, version = ?
+WHERE owner_id = ? AND created_at = ?
+IF version = ?
+```
+
+— a genuine compare-and-set, backed by Paxos consensus among replicas (`LOCAL_SERIAL`, hardcoded for
+this check, not affected by the app's own `RetryConfig`/consistency settings). `old`'s current
+version is read via reflection, the new version is computed (`+1` for a `Long` column), and the
+`IF version = ?` clause is bound to the version `old` was loaded with — not whatever's actually in
+the database right now. If some other write already bumped the version since `old` was loaded, the
+`[applied]` column in the response comes back `false`, and `update()` throws
+`KandraOptimisticLockException(message, entityClass, partitionKey)` — it does **not** silently
+retry, merge, or overwrite. The route layer decides what "conflict, try again" means to a client.
+
+## Handling it in the route
+
+```kotlin title="routes/TodoRoutes.kt" {1,7-13}
+import io.kandra.core.exception.KandraOptimisticLockException
+
+patch("/todos/{id}/done") {
+    val ownerId = call.ownerIdOrRespondBadRequest() ?: return@patch
+    val createdAt = Instant.parse(call.parameters["id"]!!)
+
+    val existing = todoRepo.findById(ownerId, createdAt)
+        ?: return@patch call.respond(HttpStatusCode.NotFound)
+
+    try {
+        todoRepo.update(existing, existing.copy(done = true))
+        call.respond(existing.copy(done = true))
+    } catch (e: KandraOptimisticLockException) {
+        call.respond(HttpStatusCode.Conflict, "Todo was modified concurrently — reload and retry")
+    }
+}
+```
+
+`409 Conflict` is the honest HTTP status here: the request was well-formed and the resource exists,
+but the state it was based on is stale. There's no good automatic recovery at this layer — retrying
+the exact same request would race the same way against whatever won the first conflict — so the
+response tells the client to re-fetch the current state and decide what to do, rather than Kandra
+(or this route) silently picking a winner. `findById(ownerId, createdAt)` right before this call is
+what supplies `old` — the same read-before-write step [page 10](/tutorial/10-caching) later points
+out is exactly what benefits from `@CacheResult`.
+
+<Callout kind="tip" title="This same protection now covers title edits too, with no new code">
+Nothing about `update(old, new)`'s LWT check is specific to the `done` field — it's a whole-row
+compare-and-set gated on `version`, so any field this app later lets a client edit (title, via a
+`PATCH /todos/{id}` route, if this tutorial built one) gets the identical protection the moment
+`@Version` exists on the entity. The race described at the top of this page — two clients editing
+`title` concurrently — is caught by exactly the code above; `done` was just the field this tutorial
+already had a route for.
+</Callout>
+
+## Why `Todo` gets `@Version` and `User` doesn't
+
+This is a deliberate, per-entity decision, not a default applied everywhere — per
+[`/foundations`](/foundations#lightweight-transactions-lwt-real-and-not-free), LWT is real
+compare-and-set, and it costs a genuine extra round of inter-replica consensus a plain write skips
+entirely. Reaching for it on every entity "to be safe" means paying that cost on every write to
+every table, most of which never see a real conflict.
+
+`Todo` earns it: two *different* people (owner and assignee) can legitimately hold the same row open
+at once, and a lost update there is a real, user-visible correctness bug — someone's edit silently
+vanishing. `User` doesn't: nothing in this app lets two different actors edit the same user record
+concurrently — a user edits their own profile, from their own session, and even a same-user
+double-submit (two tabs) losing to "last click wins" is a far lower-stakes failure than one
+collaborator's todo edit silently erasing another's. Add `@Version` to `User` if a real requirement
+shows up that needs it (an admin editing a user record the user is simultaneously editing, say) —
+don't add it by reflex to every table because `Todo` needed it.
+
+Next: [page 08](/tutorial/08-soft-delete-and-trash) — `DELETE /todos/{id}` right now is permanent.
+The product wants a week to change your mind.

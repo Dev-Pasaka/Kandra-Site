@@ -1,0 +1,266 @@
+export const metadata = {
+  title: "11. Observability",
+  description:
+    "kotlin-logging throughout the app, Kandra's debug/metrics/health/shutdown config in depth — including the real gap where logQueries silently doesn't cover read paths.",
+};
+
+# 11. Observability
+
+Everything up to this page has been about correctness — the right key, the right atomicity
+boundary, the right cache invalidation. This page is about being able to see what the app is
+actually doing once it's running: which queries are slow, whether the cache invalidation from
+[page 10](/tutorial/10-caching) is really matching keys in production, and whether a deploy drained
+in-flight requests cleanly or dropped them.
+
+## Logging in the app itself: kotlin-logging, not `println`
+
+Kandra's own modules log with [kotlin-logging](https://github.com/oshai/kotlin-logging)
+(`io.github.oshai.kotlinlogging`), a thin idiomatic-Kotlin wrapper over SLF4J — structured,
+leveled, lazy-evaluated messages, not string concatenation eagerly built on every call regardless
+of whether the level is enabled. Use the same thing in the app's own route handlers, for the same
+reason Kandra uses it internally: a `println` has no level, can't be filtered per-environment, and
+can't be routed to structured log aggregation the way an SLF4J-backed call can.
+
+```kotlin title="routes/TodoRoutes.kt"
+import io.github.oshai.kotlinlogging.KotlinLogging
+
+private val logger = KotlinLogging.logger {}
+
+patch("/todos/{id}/done") {
+    // ...
+    logger.info { "Todo marked done: ownerId=$ownerId createdAt=$createdAt" }
+    // ...
+    catch (e: KandraOptimisticLockException) {
+        logger.warn { "Optimistic lock conflict marking todo done: ownerId=$ownerId createdAt=$createdAt" }
+        call.respond(HttpStatusCode.Conflict)
+    }
+}
+```
+
+The `logger.info { "..." }` lambda form is deliberate, not stylistic — the string isn't built at
+all unless the `INFO` level is actually enabled for this logger, which matters once a hot route is
+logging on every request. This is the same pattern Kandra's own `BatchEngine`/`StatementBuilder`
+use internally (`logger.warn { "Slow query detected: ${elapsed}ms..." }`) — match it in your own
+code and log statements compose the same way across app code and library code in your aggregated
+logs.
+
+## `debug { }` — what each flag actually shows you, and where it doesn't reach
+
+```kotlin title="Application.kt"
+install(Kandra) {
+    // ...
+    debug {
+        logQueries = true
+        logSlowQueriesMs = 500
+        logBatches = true
+    }
+}
+```
+
+### `logQueries` — the CQL template, never the bound values
+
+```kotlin
+var logQueries: Boolean = false   // logs the CQL template at DEBUG — never bound parameter values
+```
+
+With this on, `StatementBuilder.prepare()` logs the exact CQL template being prepared, at `DEBUG`:
+
+```
+Kandra CQL: INSERT INTO todos (owner_id, created_at, todo_id, title, ...) VALUES (?, ?, ?, ?, ...) USING TTL ? AND TIMESTAMP ?
+```
+
+<Callout kind="note" title="Bound values are never logged — verified from source, not documented policy">
+`StatementBuilder.prepare(cql: String)` logs the raw CQL string handed to it — the `?` placeholders,
+never the values later bound into them via `bind(...)`. There is no code path in `kandra-runtime`
+that logs bound parameter values, even with `logQueries = true`. This is deliberate: a todo's
+`title`, a user's `email`, anything a caller might bind into a query, can be PII, and a query log is
+one of the most common places PII leaks into log aggregation by accident. Treat this the same way
+in your own `logger.info { }` calls in route handlers — log the shape of what happened ("todo
+created for ownerId=$ownerId"), not the field values that came from user input, unless you've
+deliberately decided that value needs to be in your logs and handled its retention accordingly.
+</Callout>
+
+**The gap worth knowing about**: `logQueries` only reliably shows you CQL for writes that route
+through `BatchEngine` — `save`, `saveIfNotExists`, `saveWithNulls`, `update`, `updateForce`,
+`delete`, `deleteAll`, `saveAll`. `KandraRepository`/`KandraSuspendRepository` build their own
+*separate* `StatementBuilder` internally for every other method — `findById`, `find`, `findAll`,
+`findPage`, `exists`, `raw`, `rawQuery`, blocking `deleteById`, and `append`/`remove`/`put`/
+`increment`/`decrement` — constructed with `StatementBuilder(session)`, i.e. a **default,
+unconfigured** `DebugConfig()`, not whatever `debug { }` block you wrote in `install(Kandra) { }`.
+
+<Callout kind="gotcha" title="This app's read path is exactly what logQueries won't show you">
+`GET /todos/mine` ([page 05](/tutorial/05-routes)) is `findPage` — one of the methods that
+uses the repository's own default-config `StatementBuilder`. Turning on `logQueries = true` in
+`install(Kandra) { }` will faithfully log the `INSERT`/`UPDATE` CQL for todo creation and the
+done-toggle, but it will log **nothing** for the "list my todos" read, or for the read-before-write
+`findById` call inside the done-toggle handler itself — verified directly from
+`KandraRepository.kt`/`KandraSuspendRepository.kt`, not inferred. If you're debugging "why is this
+read slow" by grepping for `Kandra CQL:` in your logs, this app's own read path won't show up there
+at all. `logSlowQueriesMs`, below, doesn't have this gap — it's checked inside `BatchEngine`, which
+*is* the shared, plugin-configured instance for every write, and separately timed per-call inside
+each repository's own read methods too. Reach for that, not `logQueries`, if a read is what you're
+chasing.
+</Callout>
+
+### `logSlowQueriesMs` — a WARN-level tripwire, not a log of everything
+
+```kotlin
+var logSlowQueriesMs: Long = 0L   // 0 = disabled; WARN when a query exceeds this
+```
+
+Checked once per executed statement, after it completes: if elapsed time exceeds the threshold,
+`logger.warn { "Slow query detected: ${elapsed}ms (threshold ${logSlowQueriesMs}ms)" }`. Set to
+`500` here — a reasonable production default for a system whose plain reads/writes should be
+single-digit-to-low-double-digit milliseconds against a healthy cluster; 500ms is "something is
+actually wrong," not "this query happened to be a little slow." Locally, against a single-node
+`docker-compose` ScyllaDB with no real load, you'll rarely trip this at 500ms — if you want it to
+mean something in local dev too, drop it to something like `50`–`100` so an accidentally-unindexed
+query or an oversized `findPage` result stands out immediately instead of only in production.
+
+### `logBatches` — full batch contents at DEBUG, for `save`/`saveAll` only
+
+```kotlin
+var logBatches: Boolean = false   // DEBUG-logs batch statement count and contents
+```
+
+```
+Executing LOGGED BATCH with 2 statements for todos
+```
+
+<Callout kind="gotcha" title="This does not cover page 06's KandraBatchScope batches">
+`logBatches` is checked inside `BatchEngine`'s own `save`/`saveSuspend`/`saveAll`/`saveAllSuspend`
+methods — the batch a single `todoRepo.save(todo)` call builds internally (the primary `INSERT`
+plus any `BATCH`-consistency `@LookupIndex` inserts). It is **not** checked anywhere in
+`KandraBatchScope.kt` — [page 06](/tutorial/06-denormalization)'s
+`application.kandra.batch { todoRepo.saveInBatch(todo); todoByAssigneeRepo.saveInBatch(...) }` is
+collected and committed by a different code path that doesn't reference `debugConfig.logBatches` at
+all, verified directly from source. If you need to see exactly what statements a
+`KandraBatchScope` block assembled — the actual scenario this page's task description imagines
+`logBatches` helping with — turn on `logQueries = true` instead: `collectSave`/`collectDelete`
+still go through `StatementBuilder.prepare()` for each statement, so you'll see each CQL template
+logged individually as the batch is assembled, just not a single "batch of N statements" summary
+line the way `save()`'s own batching gets.
+</Callout>
+
+`update()`, `updateForce()`, `delete()`, `deleteAll()`, and `saveWithNulls()` also don't check
+`logBatches` even though several of them build batches internally — it's specifically a `save`/
+`saveAll` instrumentation point, not a general "log every batch Kandra builds" switch. Don't read
+"`logBatches = true` and no log line" as "no batch happened" for those methods.
+
+## `metrics { }` — a callback, not a backend
+
+```kotlin title="Application.kt"
+metrics {
+    enabled = true
+    recorder = KandraMetrics { table, operation, durationMs ->
+        meterRegistry.timer("kandra.query", "table", table, "operation", operation)
+            .record(durationMs, TimeUnit.MILLISECONDS)
+    }
+}
+```
+
+Kandra does not ship a metrics backend, and doesn't hard-wire one. `KandraMetrics` is a plain
+`fun interface`:
+
+```kotlin
+fun interface KandraMetrics {
+    fun record(tableName: String, operation: String, durationMs: Long)
+}
+```
+
+`recorder` is invoked from inside `BatchEngine`, after every query it executes successfully (same
+call site as the `logSlowQueriesMs` check above — both fire from the same "query just finished"
+point), with `operation` one of `"save"`, `"update"`, `"delete"`, `"saveAll"`, `"deleteAll"`,
+`"batch"`. Nothing about that interface knows Micrometer, Prometheus, StatsD, or anything else
+exists — wiring it into a real metrics backend is entirely the app's job, one lambda:
+
+```kotlin title="Application.kt"
+val meterRegistry = SimpleMeterRegistry()   // or your real registry — Prometheus, Datadog, etc.
+
+install(Kandra) {
+    // ...
+    metrics {
+        enabled = true
+        recorder = KandraMetrics { table, operation, durationMs ->
+            meterRegistry.timer("kandra.query", "table", table, "operation", operation)
+                .record(durationMs, TimeUnit.MILLISECONDS)
+        }
+    }
+}
+```
+
+<Callout kind="note">
+`enabled = true` with no `recorder` set doesn't throw — it logs a `WARN` at install time
+("`metrics.enabled=true but no recorder was configured`") and quietly records nothing. Easy to
+misconfigure and not notice in a review, since the app runs fine either way.
+</Callout>
+
+With that wired, `kandra.query` is a real timer series, tagged by `table` and `operation` — enough
+to build:
+
+- **p99 (and p50/p95) query latency per table, per operation** — is `todos` `save` getting slower
+  week over week as the table grows? Is `completion_stats` `batch` (the increment path bypasses
+  this metric entirely, see [page 09](/tutorial/09-counters) — only `BatchEngine`-routed operations
+  emit metrics) staying flat?
+- **A regressing query pattern, caught before it's a page.** A dashboard panel per `(table,
+  operation)` pair, alerting on p99 crossing a threshold, catches "the `todos_by_assignee` denormalized
+  write from page 06 got slower after last week's deploy" days before a user notices, instead of
+  after.
+- **Correlating slow-query `WARN` log lines (from `logSlowQueriesMs`) with the metric that
+  regressed** — the log tells you *which* query was slow on a given request; the metric tells you
+  it's a trend, not a one-off.
+
+## Health and graceful shutdown
+
+### `GET /kandra/health` is auto-registered — you don't write this route
+
+```kotlin
+healthCheck = true   // default; registers GET /kandra/health at plugin install
+```
+
+<VersionNote>Verified from `kandra-ktor`'s `Kandra.kt`: step 9 of the plugin install sequence
+registers this route via `application.routing { ... }` whenever `healthCheck` is true (the
+default) — nothing in application code needs to add it.</VersionNote>
+
+```
+GET /kandra/health
+→ 200 OK  {"status":"UP"}     (runtime.isHealthy() succeeded — SELECT release_version FROM system.local)
+→ 503     {"status":"DOWN"}   (any exception querying the session; logged at WARN, not in the response body)
+```
+
+Point your load balancer's / orchestrator's health probe at this path directly — there's nothing
+for this app to add. The response body deliberately doesn't include the failure reason (check logs
+for that), so don't build alerting logic that parses the body for a specific error string.
+
+### `shutdown { }` — what "graceful" actually buys you
+
+```kotlin
+shutdown { graceful = true; drainTimeoutMs = 5_000 }
+```
+
+On `ApplicationStopping` (Ktor's shutdown hook, fired when the process receives a shutdown signal —
+a rolling deploy replacing this instance, for example): if `graceful = true`, Kandra immediately
+sets `isShuttingDown = true` (every new `batch`/`batchBlocking` call from this point throws), then
+blocks the shutdown thread in a poll loop until `inFlightCount` reaches zero or `drainTimeoutMs`
+elapses, whichever comes first. Only after that does `ApplicationStopped` fire and close the
+session.
+
+In concrete operational terms: without this, a rolling deploy that sends `SIGTERM` mid-request can
+tear down the `CqlSession` while a `todoRepo.save(todo)` from page 06's batch scope is still
+in-flight — the request either fails outright or (worse) the primary `todos` write commits but the
+process dies before the `todos_by_assignee` write in the same batch is even attempted, since the
+whole point of `LOGGED BATCH` is atomicity **within** the statement, not protection from the
+process disappearing before the statement is sent at all. With `graceful = true` and a
+`drainTimeoutMs` generous enough for your slowest real request, in-flight requests get to finish
+their Kandra calls before the session closes — the deploy waits up to 5 seconds here, not zero.
+
+<Callout kind="tip">
+Set `drainTimeoutMs` to comfortably exceed your `pool.requestTimeoutMillis` ([page 04](/tutorial/04-plugin-install)'s
+`10_000`) plus retry backoff — if the drain window is shorter than a single request's worst-case
+Kandra timeout, the drain can hit its deadline (logging a `WARN` with the remaining in-flight
+count) while a request is still legitimately in progress, not stuck.
+</Callout>
+
+Next: [`/tutorial/12-testing`](/tutorial/12-testing) — now that there's real behavior to protect
+(cache invalidation, batch atomicity, optimistic locking), it's time to write tests that actually
+exercise it.

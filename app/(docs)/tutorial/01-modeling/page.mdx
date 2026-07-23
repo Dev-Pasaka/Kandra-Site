@@ -1,0 +1,158 @@
+export const metadata = {
+  title: "01. Modeling, before any code",
+  description:
+    "Data modeling for a multi-user todo list before writing a single entity — deriving Todo's partition and clustering keys from real access patterns, not from its relational shape.",
+};
+
+# 01. Modeling, before any code
+
+No Kotlin in this page. No `data class`, no annotations, no `install(Kandra) { }`. That's not a
+warm-up — it's the lesson. [`/foundations`](/foundations) already told you a partition key decides
+where a row physically lives, not just what uniquely identifies it. This page is where that stops
+being an abstract claim and starts being the thing that decides what code page 03 is even allowed to
+write.
+
+<Callout kind="danger" title="The ordering is the point">
+Query-first modeling — access patterns before schema, schema before code — isn't a Cassandra
+quirk or a Kandra opinion. It's a direct consequence of there being no join and no ad-hoc
+`WHERE` clause: a table's shape has to already match the query it serves, because nothing at query
+time can reshape the data for you. Design the entity first and you're gambling that its "natural"
+relational shape happens to match a query pattern you haven't written down yet. It usually doesn't.
+</Callout>
+
+## The actors
+
+The app has two kinds of thing worth naming before anything else: **users** and **todos**. A todo
+belongs to the user who created it (its *owner*) and may optionally be handed to a different user to
+actually do (its *assignee*). Two users, potentially, on the same todo — that pairing is where all
+the interesting modeling in this tutorial comes from.
+
+## The access patterns — write these down before the entities
+
+This is the actual deliverable of this page: a plain list of "what does the app need to ask the
+database," in the words a product person would use, before a single Kotlin type exists.
+
+1. **"Show me my todos"** — a user opens the app and sees the todos they created, newest first.
+2. **"Show me todos assigned to me"** — a user sees the todos handed to them by someone else,
+   regardless of who owns them.
+3. **"Mark this todo done"** — flip one todo's status, for the owner (or, later, the assignee).
+4. **"How many todos have I completed, ever?"** — a lifetime stat, independent of whether any
+   individual todo still exists.
+5. (Later, pages 07–08) **"Don't let two edits silently overwrite each other"** and **"let me
+   recover a todo I just deleted."** These shape *how* a row is written and deleted, not what table
+   it lives in — they don't change the modeling done here, so they're out of scope for this page.
+
+Five short sentences. Every table this tutorial builds exists to serve one or more of them, and
+nothing else. If you can't point at one of these sentences (or a later one like it) to justify a
+table, don't build the table.
+
+## Pattern 1: "show me my todos" — deriving `Todo`'s keys
+
+The relational instinct here is well-worn: a `todos` table with an auto-increment `id` primary key,
+an `owner_id` foreign key column, and `SELECT * FROM todos WHERE owner_id = ? ORDER BY created_at
+DESC` at read time. The primary key identifies a row; the `WHERE`/`ORDER BY` at the bottom does the
+actual work of answering "my todos, newest first" — and you can bolt that clause onto the query
+whenever you feel like it, against any indexed column, because the relational engine has a real
+query planner behind it.
+
+Cassandra has no query planner in that sense. There's no `ORDER BY` you get to add later against an
+arbitrary column, and there's no `WHERE owner_id = ?` that's cheap unless `owner_id` is *already*
+the thing Cassandra uses to place the row. So the question isn't "what uniquely identifies a todo"
+— it's **"what value will pattern 1's query always have in hand, and what order does it need the
+results in?"**
+
+- The value every "my todos" query supplies: the owner's user ID. That's the **partition key** —
+  `ownerId`. Every one of a user's todos lands in the same partition, on the same node(s), reachable
+  in one shot without touching any other user's data.
+- The order the query needs: newest first, for free, without a separate sort step. That's a
+  **clustering key** — `createdAt`, with `order = DESC` — which sorts rows *within* the partition at
+  the storage layer, not at query time. Ask for a user's partition and the rows come back
+  pre-sorted, because that's how they're physically laid out on disk.
+
+So: `Todo` is partitioned by `ownerId`, clustered by `createdAt DESC`. That single decision, made
+from one sentence of product requirement, is what page 03 turns into `@PartitionKey`/`@ClusteringKey`
+— not "because `ownerId` felt like the identifying column."
+
+<Callout kind="tip" title="This also answers 'what identifies one todo,' just not the way you'd expect">
+There is no single "the primary key" column here the way a relational reader expects — the pair
+`(ownerId, createdAt)` together is what identifies one row. A todo's own random ID, if it has one,
+is not automatically the thing you look a todo up by. Page 05 runs into this directly when it has to
+decide what `PATCH /todos/{id}/done` actually needs in its URL to find the right row.
+</Callout>
+
+## Pattern 3: "mark this todo done" needs the same key
+
+Flipping `done` on one todo means Cassandra needs to locate that exact row — which, given the design
+above, means knowing its `ownerId` and its `createdAt`. No new table, no new key: this pattern rides
+on the same partition/clustering design pattern 1 already established. Worth naming explicitly now,
+because it's easy to assume "update by ID" needs its own index the way it would relationally — it
+doesn't, as long as the caller already knows (or can be handed) the clustering key value. Page 05
+covers exactly how that value gets from a list response into an update request.
+
+## Pattern 2: "show me todos assigned to me" — the pattern `Todo`'s design can't serve
+
+Here's where the relational instinct actively misleads. The relational move is obvious: add an
+`assignee_id` column to the same `todos` table, then `SELECT * FROM todos WHERE assignee_id = ?`.
+One table, one extra `WHERE` clause, done in five minutes.
+
+Try that against the `Todo` design above and it doesn't just get slow — Kandra's query DSL refuses
+to build it at all. `assigneeId` is neither `Todo`'s partition key nor its clustering key. A query
+against it would have to check every partition on every node for a matching row: a scatter-gather
+scan across the whole cluster, the exact `ALLOW FILTERING` shape [`/foundations`](/foundations#allow-filtering-why-its-dangerous-and-why-kandra-refuses-it)
+already told you Kandra has no DSL method to produce. This isn't a missing feature to work around —
+it's the same physical fact as pattern 1, pointed at a column that isn't the partition key: Cassandra
+doesn't know which node has "todos assigned to user X" without either scanning everything or having
+a table that's *already* organized by assignee.
+
+**Don't solve this yet.** Naming it here, precisely, is the job of this page — the actual fix
+(a second, denormalized table, kept in sync with an atomic batch write) is substantial enough to earn
+its own page. Flag it and move on:
+
+<Callout kind="gotcha" title="Flagged, not fixed">
+`Todo`, partitioned by `ownerId`, has no efficient way to answer "todos assigned to me." That's not
+a bug in the design above — a table can't be shaped for every access pattern at once, and this one
+wasn't shaped for this pattern on purpose, because pattern 1 (the more common read) needed
+`ownerId` as the partition key. [Page 06](/tutorial/06-denormalization) is entirely about the fix:
+a second table, `TodosByAssignee`, partitioned by `assigneeId` instead.
+</Callout>
+
+## Pattern 4: "lifetime completion count" — flagged for page 09
+
+Same move: a number that has to survive the todo itself being deleted, and has to stay correct when
+two "mark done" requests for the same user land at nearly the same instant, is its own kind of
+problem — a plain integer column with a normal `UPDATE` loses updates under concurrent writers, for
+reasons that have nothing to do with Cassandra specifically and everything to do with what a
+non-atomic read-modify-write does under concurrency. [Page 09](/tutorial/09-counters) covers the
+actual mechanism (a `@Counter` table). Naming it here is enough for now — it's on the list because
+it came from a real product sentence, not because a counter demo needed an excuse to exist.
+
+## Users: a much simpler case
+
+`User` doesn't have `Todo`'s "two different access shapes" problem. The app only ever needs a user
+two ways: by their ID (to attach to a todo, to show a profile) and by their email (to log in — even
+though this tutorial doesn't build real authentication, per [page 05](/tutorial/05-routes), "find
+the user record for this email" is still a real access pattern any login flow needs). So:
+
+- **Partition key: `userId`.** One user, one partition, no clustering key needed — there's no
+  "many rows per user" shape here the way `Todo` has many rows per owner.
+- **Find-by-email** doesn't fit the partition key, so it needs the same treatment pattern 2 above
+  needed, at smaller scale: a denormalized index. `@LookupIndex` is Kandra's answer for exactly
+  this "single extra value I need to look one row up by" shape — a maintained `users_by_email`
+  table, one row per email, kept in sync automatically. Page 03 shows exactly how.
+
+## What this page actually produced
+
+No code, on purpose — but a complete, source-derived answer to "what are the keys and why":
+
+| Entity | Partition key | Clustering key | Derived from |
+|---|---|---|---|
+| `Todo` | `ownerId` | `createdAt DESC` | Pattern 1 ("my todos, newest first") |
+| `User` | `userId` | — | Every pattern needs a user by ID; email lookup is a separate `@LookupIndex`, not a key |
+
+And one deliberately unfinished thread: pattern 2 ("todos assigned to me") has no table yet. That's
+not an oversight carried forward by accident — it's the modeling decision this page is making
+explicitly, to be picked up with the tool built for it, on
+[page 06](/tutorial/06-denormalization).
+
+Next: [page 02](/tutorial/02-project-setup) turns this into an actual Gradle project — still no
+entities yet, just the scaffold everything else sits on top of.

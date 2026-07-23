@@ -1,0 +1,84 @@
+export const metadata = {
+  title: "Cache invalidation",
+  description:
+    "ISS-023, ISS-028: KandraCache crashed on every real Caffeine call via reflection, then, once fixed, silently stopped invalidating cached entries for clustering-keyed entities.",
+};
+
+# Cache invalidation
+
+Two separate bugs in `KandraCache`, found months apart, both invisible to unit tests for the same
+underlying reason: neither one could happen against a fake. One needed a real Caffeine cache on the
+classpath. The other needed the real key-shape consequences of a fix made elsewhere in the codebase.
+
+## ISS-023: `@CacheResult` crashed on every real call
+
+`KandraCache.resolveMethod` resolved `getIfPresent`/`put`/`invalidate` via reflection —
+`target.javaClass.getMethod(...)` — where `target` is the object `Caffeine.newBuilder()...build()`
+actually returns. Caffeine's concrete cache implementations are package-private; only the
+`Cache`/`LocalManualCache` *interfaces* are public. Resolving against `target.javaClass` still finds
+the method — it's declared public on an interface the concrete class implements — but invoking it
+throws `IllegalAccessException`, because the method's *resolved declaring class* isn't itself
+public, and `resolveMethod` never called `setAccessible(true)`.
+
+<Callout kind="danger" title="This crashed on the exact scenario the feature exists for">
+Every write to every `@CacheResult` entity crashed with `IllegalAccessException` the moment a real
+Caffeine dependency was on the classpath — which is the only time `@CacheResult` matters at all. A
+test suite that never pulls in real Caffeine, or that mocks the cache, would never see this. It was
+found during real-cluster test plan execution, not by any unit test.
+</Callout>
+
+### The fix
+
+`resolveMethod` now resolves against Caffeine's *public* `Cache` interface —
+`Class.forName("com.github.benmanes.caffeine.cache.Cache")` — instead of the instance's concrete
+runtime class. The resulting `Method`'s declaring class is public, so `invoke()` no longer trips the
+access check, and no `setAccessible(true)` workaround is needed. Verified live: a save/`findById`
+round-trip against a real Caffeine-backed `@CacheResult` entity on a real 3-node cluster, second read
+served from cache, no exception.
+
+## ISS-028: fixed cache, wrong key
+
+Found later, while re-verifying the [clustering-key fix](/battle-scars/clustering-keys-and-lookup-tables)
+(ISS-025). `save`/`update`/`updateForce`/`delete` and friends all invalidated the `@CacheResult` cache
+using `partitionKeyOf(entity)` — a helper that collects only `schema.partitionKeys`, producing a bare
+single value for any entity (just `userId`, say, for a `User`).
+
+But `findById`'s real cache key is derived from the actual arguments it was called with: a bare
+single value only when the entity's whole primary key is exactly one column, otherwise an ordered
+`List` of every value supplied. Once ISS-025 made `findById` require the *full* key — partition plus
+clustering — for a clustering-keyed entity, its real cache key became a multi-element `List`. A
+`List` never equals the bare single value `partitionKeyOf` was still producing.
+
+<Callout kind="gotcha" title="A correctness bug hiding behind a coincidence">
+This wasn't a live bug before ISS-025 shipped. Before that fix, `findById(id)` — partition-key-only,
+one argument — was the "normal" (if silently wrong-row) way to call it on a clustering-keyed entity,
+and its cache key was *also* a bare single value at the time, matching `partitionKeyOf`'s shape by
+coincidence, not by design. Tightening `findById`'s key contract changed the cache key's real shape
+too. The invalidation helper was never updated to match, because nothing about the invalidation code
+itself had changed — the bug was a scope gap in the earlier fix, not a new mistake made independently.
+</Callout>
+
+Every invalidation call for a clustering-keyed cached entity silently missed the real cache entry.
+`update()` and friends appeared to succeed — the underlying row really was updated — while
+`findById` kept serving the pre-update, stale cached row until the TTL expired on its own.
+
+### The fix
+
+Replaced `partitionKeyOf` with `cacheKeyOf`, which reuses the existing `keyValuesOf` helper — already
+used by `append`/`remove`/`put` to derive the full key — and applies the exact same shape convention
+`findById` itself uses: a bare single value when the full key is one column, otherwise the ordered
+`List`. One function, one shape rule, used everywhere a cache key is computed — instead of two
+functions that happened to agree until the underlying contract changed.
+
+Verified live: saved a clustering-keyed `@CacheResult` entity, `findById` (full key) to populate the
+cache, waited past a second, updated a field, `findById` (same full key) again — now returns the
+fresh value, not the stale cached one.
+
+<Callout kind="note">
+This is the same root cause as the ISS-029/ISS-030 sequence on the
+[clustering keys page](/battle-scars/clustering-keys-and-lookup-tables): a contract's shape changed
+in one place, and a derived value computed from the old shape somewhere else quietly went stale.
+Four separate bugs, one lesson, worth internalizing once rather than re-deriving four times: whenever
+you tighten what a "key" means, audit everything that computes a key-shaped value from the same
+inputs — caches, indexes, anything memoized — because none of them are told the shape changed.
+</Callout>

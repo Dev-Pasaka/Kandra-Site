@@ -1,0 +1,81 @@
+import { dokkaModuleUrl } from "@/lib/dokka";
+import { KANDRA_VERSION, DOKKA_PUBLISHED_VERSION } from "@/lib/site-config";
+
+export const metadata = {
+  title: "Modules",
+  description:
+    "One reference page per Kandra module — what it is, why it's separate, every public annotation/class/function, and where its behavior was the subject of a real bug.",
+};
+
+# Modules
+
+Kandra ships as ten independently-versioned Gradle artifacts plus a BOM that pins them together, not
+one monolithic library. Every module below exists because some consumer genuinely doesn't need what
+it provides — a schema-validation tool doesn't need the DataStax driver; a Koin app doesn't need
+Kodein's classes on its classpath; a production deploy doesn't need Testcontainers. Each module page
+covers what the module is, why it's separate rather than folded into something else, every public
+annotation/class/function relevant to a consumer with a real, compiling example, and the gotchas its
+own source comments and issue history flag.
+
+<Callout kind="note" title="Version gap between this site and Dokka">
+This site's prose and code examples are verified against Kandra **v{KANDRA_VERSION}** (current
+source). The "Full API reference" link on every module page points at the published Dokka site,
+which currently serves **v{DOKKA_PUBLISHED_VERSION}** — one release behind. If a Dokka signature
+looks different from what a module page here describes, trust this site's description of *why* a
+thing works the way it does, and treat the Dokka page as the exact-signature source for whatever the
+gap doesn't cover yet. See [`/reference`](/reference) for more on how the two fit together.
+</Callout>
+
+## The modules
+
+| Module | What it is | Depends on |
+|---|---|---|
+| [`kandra-bom`](/modules/kandra-bom) | Gradle version-alignment BOM — no source, just constraints. | — |
+| [`kandra-core`](/modules/kandra-core) | Annotations, schema model, DDL generator, exceptions. Pure `kotlin.reflect`, no driver, no network. | — |
+| [`kandra-runtime`](/modules/kandra-runtime) | Repositories, `BatchEngine`, the query DSL, codec, caching — turns a schema into real driver calls. | `kandra-core`, DataStax driver |
+| [`kandra-codegen`](/modules/kandra-codegen) | The KSP processor generating type-safe `*Table` objects from `@ScyllaTable` entities. | `kandra-core` (build-time only) |
+| [`kandra-ktor`](/modules/kandra-ktor) | The `Kandra` Ktor `ApplicationPlugin` — `install(Kandra) { }`, schema DDL at startup, graceful shutdown. | `kandra-core`, `kandra-runtime`, Ktor |
+| [`kandra-koin`](/modules/kandra-koin) | Auto-binds a repository pair per entity into a Koin container. | `kandra-ktor`, Koin |
+| [`kandra-kodein`](/modules/kandra-kodein) | Auto-binds into Kodein-DI, plus a standalone binder for use outside the Ktor plugin entirely. | `kandra-ktor`, Kodein-DI |
+| [`kandra-migrate`](/modules/kandra-migrate) | Versioned, checksummed, LWT-claim-locked CQL migrations, for when `AUTO_MIGRATE` isn't enough. | `kandra-core` only (no `kandra-runtime`) |
+| [`kandra-multidc`](/modules/kandra-multidc) | One startup-logging helper, `KandraMultiDc.describe()`. The real multi-DC config lives in `kandra-ktor` regardless. | `kandra-core`, `kandra-runtime`, `kandra-ktor` (`api`) |
+| [`kandra-jakarta`](/modules/kandra-jakarta) | Adapts a `jakarta.validation.Validator` into a `KandraValidator`. | `kandra-core`, `kandra-ktor`; Bean Validation `compileOnly` |
+| [`kandra-test`](/modules/kandra-test) | `FakeKandraSession` for fast structural tests, `KandraTestcontainers` for real integration tests. | `kandra-core`, `kandra-runtime`; Testcontainers `compileOnly` |
+
+## Why this many modules
+
+The dependency shape isn't arbitrary — it's visible directly in each module's `build.gradle.kts`.
+`kandra-core` has zero dependency on the DataStax driver or Ktor, on purpose: reading and validating
+an entity's shape should never require a live session. `kandra-runtime` is the first module that
+opens a real connection. `kandra-ktor` is the only module that knows what a Ktor `Application` is —
+`kandra-koin` and `kandra-kodein` sit beside each other as siblings, not layered on one another, so
+choosing one DI framework never pulls the other framework's classes onto your classpath. Every
+inter-module dependency in the graph is `implementation`, not `api`, with exactly one deliberate
+exception — `kandra-multidc` uses `api` for its `kandra-core`/`kandra-runtime`/`kandra-ktor`
+dependencies, because it has no API surface of its own beyond one convenience function layered on top
+of `kandra-ktor`'s config types, and forcing consumers to separately re-declare the module underneath
+it would add friction with no benefit. `kandra-migrate` is the other structurally interesting case:
+it depends on `kandra-core` alone, deliberately **not** `kandra-runtime` or `kandra-ktor`, because a
+migration has to be runnable with nothing but a raw driver session, before the Kandra plugin — or any
+Kandra runtime at all — exists.
+
+If you're deciding what to add to a new project: `kandra-bom` first (pins every version), then
+`kandra-core` + `kandra-runtime` + `kandra-ktor` + `kandra-codegen` (via `ksp`) as the baseline for
+any Ktor app, one of `kandra-koin`/`kandra-kodein` if you use that DI framework, and
+`kandra-migrate`/`kandra-multidc`/`kandra-jakarta`/`kandra-test` only when you actually need
+migrations, multi-DC logging, Bean Validation, or Testcontainers-backed tests, respectively — see
+[`/getting-started`](/getting-started) for the minimal working set.
+
+## Full generated API reference
+
+Every module page above links to its own Dokka module page inline; the module-level entry points are
+also listed here: {" "}
+{["kandra-bom", "kandra-core", "kandra-runtime", "kandra-codegen", "kandra-ktor", "kandra-koin", "kandra-kodein", "kandra-migrate", "kandra-multidc", "kandra-jakarta", "kandra-test"].map((m, i, arr) => (
+  <span key={m}>
+    <a href={dokkaModuleUrl(m)} target="_blank" rel="noreferrer"><code>{m}</code></a>
+    {i < arr.length - 1 ? " · " : ""}
+  </span>
+))}
+
+See [`/reference`](/reference) for the general shape of how this site's curated reference and Dokka's
+generated signature reference fit together.

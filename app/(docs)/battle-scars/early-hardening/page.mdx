@@ -1,0 +1,135 @@
+export const metadata = {
+  title: "Early-days hardening",
+  description:
+    "ISS-007, ISS-011, ISS-015, ISS-019, ISS-021: five smaller, real bugs from the same pre-real-database audit — soft-delete filtering, bean validation, a delete path that bypassed soft-delete, ignored consistency levels, and a broken error message.",
+};
+
+# Early-days hardening
+
+Not every bug is a multi-issue saga. These five are smaller, independent, and mostly came out of the
+same pre-real-database-testing audit pass (dated 2026-07-21 in the tracker) that also found several
+of the issues covered elsewhere in this section — someone reading every write path and asking "what
+would this actually do" before ever pointing it at a live cluster. Grouped here because each is a
+complete, self-contained story, not because they share one root cause.
+
+## ISS-007: there was no way to ask "give me the non-deleted rows"
+
+The 0.4.0 spec called for a `findActive()` method on `@SoftDelete` entities. But `@SoftDelete` writes
+non-key columns with a TTL via `UPDATE ... USING TTL` — after the TTL expires, ScyllaDB removes the
+column *values* but keeps the primary-key row as a tombstone until `gc_grace_seconds` passes. There
+was no CQL predicate for "rows whose TTL has expired": `TTL(col)` exists in `SELECT`, but it requires
+knowing which specific column to check, and returns `0` (not null) for a column with no TTL set at
+all. Worse, immediately after a soft delete and before the TTL expires, the row's data is still fully
+present — there was no way to distinguish a soft-deleted row from a live one at all, at any point in
+the row's lifecycle.
+
+### The fix
+
+An opt-in marker column: `@SoftDelete(ttlSeconds = 86400, markerProperty = "isDeleted")`, where
+`markerProperty` names a `Boolean` field. Soft-delete now issues two writes instead of one: the
+TTL'd `UPDATE` on the regular columns, and a **separate, non-TTL'd `UPDATE`** setting the marker to
+`true` — so the marker persists after the other columns' values expire. `findActive()` queries
+`WHERE <marker> = false ALLOW FILTERING`, with a WARN logged (it's a scatter-gather, same as any
+other secondary-index-style query) and `KandraSchemaException` if called without `markerProperty`
+configured. This is opt-in and additive — existing `@SoftDelete` usages without `markerProperty`
+are unaffected.
+
+<Callout kind="tip">
+`findActive()` is a full-table scan with a filter, not a partition-scoped query — recommend
+`@SecondaryIndex` on the marker column for any table of meaningful size, and prefer ordinary
+`findPage`/`findAll` plus client-side filtering when you just need "my non-deleted rows" within a
+partition you already know.
+</Callout>
+
+## ISS-011: Jakarta Bean Validation was documented but never implemented
+
+The 0.4.0 spec mentioned auto-detecting `jakarta.validation` annotations (`@NotNull`, `@Size`, and
+friends) on entity fields and running them before save/update. Only the custom `KandraValidator<T>`
+hook actually existed — the documented behavior simply wasn't there.
+
+### The fix
+
+A new `kandra-jakarta` module: `JakartaKandraValidator<T>` adapts a real `jakarta.validation.Validator`
+into `KandraValidator<T>`, translating `ConstraintViolation`s into `KandraValidationError`s.
+`jakarta.validation-api` is a `compileOnly` dependency — bring your own provider (Hibernate Validator,
+typically) alongside it. `KandraJakartaSupport.isAvailable` detects whether a usable provider is
+resolvable at runtime, and `KandraConfig.validateJakarta<T>()` registers the adapter from inside
+plugin install, logging a WARN and skipping registration — not failing plugin install — if no
+provider is found on the classpath:
+
+```kotlin
+install(Kandra) {
+    register(User::class)
+    validateJakarta<User>()
+}
+```
+
+## ISS-015: `deleteById` had a different soft-delete story than every other delete method
+
+`KandraRepository.deleteById(vararg keyValues)` built a raw `LOGGED BATCH` of the primary-key delete
+plus lookup-table deletes and called `session.execute(b)` directly — it never checked
+`schema.isSoftDelete`. Meanwhile the entity-based `KandraRepository.delete(entity)` and
+`KandraSuspendRepository.deleteById` both correctly delegated to `BatchEngine.delete`/`deleteSuspend`,
+which do check it.
+
+<Callout kind="gotcha" title="Two methods on the same repository, two different behaviors">
+For any `@SoftDelete` entity, `deleteById(uuid)` on the *sync, blocking* repository permanently
+tombstoned the row — a real, immediate `DELETE` — while every other delete path on the identical
+table correctly issued the TTL'd soft delete instead. Same table, same annotation, two call
+signatures, two silently different outcomes. It also never invalidated the read-through cache, an
+independent gap in the same method.
+</Callout>
+
+### The fix
+
+`deleteById` now looks up the entity first — which it already did, to find lookup rows to clean up —
+and, when found, delegates to `batchEngine.delete(schema, entity)`, the same soft-delete-aware path
+every other delete method uses, instead of duplicating the batch-building logic. Cache invalidation
+was added at the same time. When the entity doesn't exist, a plain hard-delete-by-key statement is
+issued — harmless either way, since there's no row to have soft-deleted.
+
+## ISS-019: consistency-level settings were silently ignored on collection and counter writes
+
+`StatementBuilder.appendToCollection`, `removeFromCollection`, and `counterUpdate` never called
+`.setConsistencyLevel(...)`, unlike `insertPrimary`/`selectById`, which did. `@WriteConsistency` on
+the entity, and any explicit per-call override, were silently ignored for
+`append()`/`remove()`/`put()`/`increment()`/`decrement()` — only the driver profile's own default
+consistency applied, regardless of what the entity or the caller actually asked for.
+
+### The fix
+
+An optional `consistency: KandraConsistency? = null` parameter added to `appendToCollection`,
+`removeFromCollection`, and `counterUpdate`, resolved the same way writes already are —
+per-call override, then `@WriteConsistency`, then the configured default — and applied via
+`.setConsistencyLevel(...)`. The same optional parameter was threaded through
+`KandraRepository`/`KandraSuspendRepository`'s `append`/`remove`/`put`/`increment`/`decrement`.
+
+<Callout kind="gotcha" title="The lesson, beyond Kandra">
+Whenever a codebase has more than one code path that's supposed to apply the same cross-cutting
+setting — consistency levels, an auth check, a tenant filter — the paths *will* drift unless the
+setting is applied in exactly one shared place all of them call through, rather than being a step
+each path is separately responsible for remembering. `insertPrimary` had it. `appendToCollection`
+didn't. Nothing about writing `appendToCollection` looked wrong in isolation; it was only wrong
+relative to a sibling function it didn't share code with.
+</Callout>
+
+## ISS-021: the error message pointed callers at a method that didn't exist
+
+When an `IN` predicate targeted a column that's neither a partition key nor a `@SecondaryIndex`,
+`QueryExecutor` threw `KandraQueryException` telling the caller to "Add `allowFiltering()` to the
+query or use a `@SecondaryIndex`." No such method exists on `QueryContext` — the DSL's own doc
+comment states plainly that Kandra does not support `ALLOW FILTERING`, by design. The error message
+contradicted the actual design and pointed callers at code that would fail to compile if they tried
+to follow it.
+
+### The fix
+
+Reworded to match the documented design: the query would require `ALLOW FILTERING`, which Kandra
+does not support — add a `@SecondaryIndex` to the column instead. No false promise of a DSL escape
+hatch that was never going to exist.
+
+<Callout kind="tip">
+Small, but worth internalizing on its own: an error message is part of your API surface, not an
+afterthought bolted on after the real logic is done. One that names a method that doesn't exist
+doesn't just fail to help — it actively sends the reader chasing something that was never real.
+</Callout>

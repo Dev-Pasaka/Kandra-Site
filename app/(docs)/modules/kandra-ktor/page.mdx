@@ -1,0 +1,428 @@
+import { dokkaClassUrl, dokkaModuleUrl, dokkaPackageUrl } from "@/lib/dokka";
+
+export const metadata = {
+  title: "kandra-ktor",
+  description:
+    "The Kandra Ktor ApplicationPlugin — install(Kandra) { ... }, KandraConfig and every nested config block, SchemaMode, and the exact install-lifecycle order of operations.",
+};
+
+# kandra-ktor
+
+`kandra-ktor` is a single Ktor `ApplicationPlugin<KandraConfig>` — the `Kandra` value you pass to
+`install(Kandra) { ... }` — plus the `KandraConfig` DSL it's configured with. Installing it opens a
+`CqlSession`, optionally creates the keyspace, applies schema DDL, wires the retry/batch/metrics
+runtime, registers a health-check route, and hooks graceful shutdown. This is the module most
+applications interact with directly, even though it's a thin orchestration layer over
+`kandra-core` (schema) and `kandra-runtime` (driver calls) underneath.
+
+## Why this exists as a separate module
+
+`kandra-core` and `kandra-runtime` have no idea what a Ktor `Application` is — they're plain Kotlin
+and a driver session. `kandra-ktor` is the module that owns the Ktor dependency
+(`implementation(libs.ktor.server.core)`, `implementation(libs.ktor.server.host.common)`) and
+translates "an app is starting up" into "register these entities, run this DDL, open this session,
+hook this shutdown sequence." Keeping that translation in its own module means `kandra-runtime` stays
+usable from a plain coroutine-based service, a CLI tool, or a test harness with no Ktor `Application`
+at all (see [`kandra-kodein`](/modules/kandra-kodein)'s standalone `bindKandraRepository` for exactly
+that case) — and it means every DI-integration module (`kandra-koin`, `kandra-kodein`,
+`kandra-multidc`) can depend on `kandra-ktor` for the plugin's `Application.kandra`/`kandraSession`
+attributes without `kandra-runtime` itself ever needing to know Ktor exists.
+
+## Install lifecycle — exact order of operations
+
+`install(Kandra) { ... }` runs the following synchronously inside plugin install. Nothing below is
+asynchronous except the credential-rotation loop and the shutdown hooks, which are registered here
+but fire later.
+
+1. **Validate `keyspace` is set.** A blank `keyspace` throws `KandraSchemaException` immediately —
+   before any network call.
+2. **Open the session.** `autoCreateKeyspace = true`: build a bootstrap session with no keyspace
+   attached, run `CREATE KEYSPACE IF NOT EXISTS ...` using `replicationStrategy`, then `USE <keyspace>`
+   on the same session — no reconnect. `autoCreateKeyspace = false` (default): build the session with
+   the keyspace attached directly; if it doesn't exist, this throws at driver-connect time.
+3. Fire `eventListener?.onConnectionEstablished(contactPoints)`.
+4. **Permission validation** — only when `validatePermissions = true` (default) and
+   `schemaMode != NONE`. See below.
+5. **Register entities** — every class passed to `register(...)` is pushed into `SchemaRegistry`
+   (the same process-global registry `kandra-core` owns).
+6. **Apply schema DDL** per `schemaMode` — see the table below.
+7. **Build the runtime** — a dedicated `CoroutineScope(SupervisorJob() + Dispatchers.IO)` scoped to
+   application lifetime, then `StatementBuilder` → `BatchEngine` (batch limits, metrics recorder, and
+   registered validators wired on here) → `KandraRuntime(session, batchEngine, codec)`.
+8. **Publish attributes** onto the `Application`: `KandraSessionKey`, `KandraCodecKey`,
+   `KandraRuntimeKey`, and (if set) `KandraEventListenerKey` — these back
+   `application.kandraSession`/`.kandraCodec`/`.kandra`.
+9. **Health-check route** — `GET /kandra/health`, if `healthCheck = true` (default).
+10. **Credential rotation loop** — only if `auth.refreshIntervalSeconds != null`; loops forever on the
+    plugin's coroutine scope.
+11. **Shutdown hooks** — registered now, run later (see `shutdown { }` below).
+
+```kotlin title="Application.kt"
+fun Application.module() {
+    install(Kandra) {
+        contactPoints = "localhost:9042"
+        keyspace = "coinx"
+        localDatacenter = "datacenter1"
+        autoCreateKeyspace = true
+        schemaMode = SchemaMode.AUTO_CREATE
+        register(User::class, Wallet::class)
+        pool { requestTimeoutMillis = 10_000 }
+        auth { provider = KandraAuth.fromEnv() }
+        debug { logQueries = true; logSlowQueriesMs = 500 }
+    }
+}
+```
+
+### Permission validation
+
+Runs only when `validatePermissions = true` and `schemaMode != NONE`. `SELECT role FROM
+system.local` — if `role` comes back `null` (common on ScyllaDB, which doesn't populate this), logs
+an informational message and returns early, **no error raised**; this check is best-effort, not a
+hard gate on ScyllaDB. Otherwise queries `system_auth.role_permissions`: missing `SELECT` or `MODIFY`
+(and not `ALL`) throws `KandraAuthException` naming the exact `GRANT` to run; missing `ALTER` (only
+checked when `schemaMode != NONE`) **logs a WARN, does not throw**. Any other exception (e.g.
+`system_auth` unreachable in this deployment) is swallowed at DEBUG — the check degrades silently
+rather than blocking startup.
+
+## `SchemaMode`
+
+```kotlin
+enum class SchemaMode { AUTO_CREATE, AUTO_MIGRATE, VALIDATE, NONE }
+```
+
+| Mode | What runs at install |
+|---|---|
+| `AUTO_CREATE` (default) | `CREATE TABLE IF NOT EXISTS` for every registered entity's primary table and every `@LookupIndex` table. Never touches existing tables beyond `IF NOT EXISTS`. |
+| `AUTO_MIGRATE` | Same as `AUTO_CREATE`, then diffs `system_schema.columns` against the entity for each table. Missing columns get `ALTER TABLE ... ADD` (logged INFO). A column present in both but with a mismatched CQL type is only **logged at ERROR** with a manual-fix suggestion — it does **not** auto-fix the type. Extra columns in Scylla not on the entity are logged WARN and left alone. **Never drops or renames.** |
+| `VALIDATE` | Read-only: any entity column missing from Scylla **throws `KandraSchemaException`** (fails startup). Extra columns in Scylla are only logged WARN. |
+| `NONE` | No DDL, no diffing. Pair with a `kandra-migrate` runner (see [`/modules/kandra-migrate`](/modules/kandra-migrate)) called before `install(Kandra)`. |
+
+<Callout kind="danger" title="AUTO_MIGRATE never fixes a column type mismatch">
+It only logs an ERROR with a suggested manual `DROP` + re-add — the app keeps running with a
+silently-mismatched type, which is exactly the kind of thing that produces confusing runtime codec
+errors later. Grep logs for "type mismatch" after any entity field type change if you're running
+`AUTO_MIGRATE` in production.
+</Callout>
+
+## Health check
+
+`GET /kandra/health`, registered when `healthCheck = true` (default). Calls
+`runtime.isHealthy()` → `SELECT release_version FROM system.local`. Success: `200 OK`,
+`{"status":"UP"}`. Any exception: `503 Service Unavailable`, `{"status":"DOWN"}` — the exception
+itself is only logged at WARN, never included in the response body, so don't rely on curling this
+endpoint for diagnostics.
+
+## `KandraConfig` — top-level properties
+
+```kotlin
+class KandraConfig {
+    var contactPoints: String = "localhost:9042"
+    var keyspace: String = ""                       // required — blank throws at install
+    var localDatacenter: String = "datacenter1"
+    var autoCreateKeyspace: Boolean = false
+    var replicationStrategy: ReplicationStrategy = ReplicationStrategy.SimpleStrategy(replicationFactor = 1)
+    var schemaMode: SchemaMode = SchemaMode.AUTO_CREATE
+    var validatePermissions: Boolean = true
+    var preparedStatementCacheSize: Int = 1000
+    var tombstoneWarnThreshold: Int = 1000
+    var batchWarnThresholdKb: Int = 5
+    var batchMaxChunkSize: Int = 100
+    var batchAutoChunk: Boolean = true
+    var healthCheck: Boolean = true
+    var eventListener: KandraEventListener? = null
+
+    val pool: PoolConfig
+    val retry: RetryConfig
+    val debug: DebugConfig
+    val codec: KandraCodec
+    val consistency: ConsistencyConfig
+    val auth: AuthConfig
+    val ssl: SslConfig
+    val loadBalancing: LoadBalancingConfig
+    val failover: FailoverConfig
+    val speculativeExecution: SpeculativeExecutionConfig
+    val shutdown: ShutdownConfig
+    val metrics: MetricsConfig
+
+    fun register(vararg classes: KClass<*>)
+    fun <T : Any> validate(klass: KClass<T>, validator: KandraValidator<T>)
+    inline fun <reified T : Any> validate(noinline validator: (T) -> List<KandraValidationError>)
+}
+```
+
+<Callout kind="gotcha" title="contactPoints port parsing splits on the LAST colon">
+`contactPoints` is a comma-separated `host:port` list, port optional (defaults to `9042`). Parsing
+splits each comma-separated entry on its *last* `:` — safe for IPv6 literals with a trailing port,
+but a malformed entry with no numeric suffix after the last colon throws a raw
+`NumberFormatException`, not a Kandra-specific error.
+</Callout>
+
+<Callout kind="gotcha" title="batch* properties are top-level, not inside a batch { } block">
+`tombstoneWarnThreshold`, `batchWarnThresholdKb`, `batchMaxChunkSize`, `batchAutoChunk` are
+top-level `KandraConfig` properties — there is no `batch { }` DSL block in this module. Don't go
+looking for one.
+</Callout>
+
+## `ReplicationStrategy`
+
+```kotlin
+sealed class ReplicationStrategy {
+    data class SimpleStrategy(val replicationFactor: Int = 1) : ReplicationStrategy()
+    data class NetworkTopologyStrategy(val dcReplicationMap: Map<String, Int>) : ReplicationStrategy()
+}
+```
+
+Only consulted when `autoCreateKeyspace = true`.
+
+```kotlin
+replicationStrategy = ReplicationStrategy.NetworkTopologyStrategy(
+    mapOf("us-east" to 3, "eu-west" to 2)
+)
+// CREATE KEYSPACE IF NOT EXISTS coinx WITH replication =
+//   {'class': 'NetworkTopologyStrategy', 'us-east': 3, 'eu-west': 2}
+```
+
+## `pool { }` — `PoolConfig`
+
+```kotlin
+class PoolConfig {
+    var localRequestsPerConnection: Int = 1024
+    var maxRequestsPerConnection: Int = 32768
+    var heartbeatIntervalSeconds: Int = 30
+    var requestTimeoutMillis: Long = 5000
+    var connectionTimeoutMillis: Long = 5000
+}
+```
+
+```kotlin
+pool {
+    requestTimeoutMillis = 10_000
+    connectionTimeoutMillis = 8_000
+    maxRequestsPerConnection = 65536
+}
+```
+
+<Callout kind="gotcha">
+`localRequestsPerConnection` is declared but **not** actually applied by the driver config builder —
+only `maxRequestsPerConnection`, `requestTimeoutMillis`, `connectionTimeoutMillis`, and
+`heartbeatIntervalSeconds` are wired. Setting it changes nothing today.
+</Callout>
+
+## `auth { }` — `AuthConfig`
+
+```kotlin
+class AuthConfig {
+    var provider: KandraAuthProvider = KandraAuth.fromEnv()
+    var refreshIntervalSeconds: Long? = null
+}
+```
+
+```kotlin
+auth {
+    provider = KandraAuth.fromFile("/run/secrets/scylla_user", "/run/secrets/scylla_pass")
+    refreshIntervalSeconds = 3600
+}
+```
+
+If credentials come back blank, session building skips auth entirely (no auth attempted). Factories
+are on `KandraAuth` (`kandra-core`) — see [`/modules/kandra-core`](/modules/kandra-core#kandraauth--iokandracorekandraauth).
+
+<Callout kind="gotcha" title="Rotated credentials aren't automatically re-applied to the live session">
+When `refreshIntervalSeconds` is set, the plugin loops on its own coroutine scope, calling
+`auth.provider.getCredentials()` and firing `onCredentialRefreshed`/`onAuthFailed` — but the fetched
+credentials are **not** re-applied to the live `CqlSession`'s auth mechanism from this file. This
+call is for validating/refreshing whatever cache your own provider maintains and for firing the
+callbacks; if you need the driver connection itself to pick up new credentials, wire that into your
+provider.
+</Callout>
+
+## `ssl { }` — `SslConfig`
+
+```kotlin
+class SslConfig {
+    var enabled: Boolean = false
+    var requireEncryption: Boolean = true
+    var hostnameVerification: Boolean = true
+    var trustStorePath: String? = null
+    var trustStorePassword: String? = null
+    var trustStoreType: String = "JKS"
+    var keyStorePath: String? = null
+    var keyStorePassword: String? = null
+    var keyStoreType: String = "JKS"
+    var minimumTlsVersion: String = "TLSv1.2"
+    var cipherSuites: List<String>? = null
+}
+```
+
+```kotlin
+ssl {
+    enabled = true
+    trustStorePath = "/certs/scylla-truststore.jks"
+    trustStorePassword = System.getenv("TRUSTSTORE_PASSWORD")
+}
+```
+
+`trustStorePath` set → one-way TLS; `keyStorePath` also set → mutual TLS. `enabled = true` is
+required for any of this to matter.
+
+<Callout kind="danger" title="requireEncryption, minimumTlsVersion, and cipherSuites are not enforced">
+All three are declared config fields that the session builder never reads — `SSLContext.getInstance("TLS")`
+is hardcoded, with no protocol-version pinning or cipher-suite restriction applied from this config.
+Don't rely on these three to constrain the actual handshake; only `enabled`, `trustStorePath`/
+`keyStorePath` (and their passwords/types), and `hostnameVerification` are load-bearing.
+</Callout>
+
+## `loadBalancing { }` / `failover { }` / `speculativeExecution { }`
+
+```kotlin
+class LoadBalancingConfig {
+    var tokenAware: Boolean = true
+    var dcAwareFailover: Boolean = false
+    var allowedRemoteDcs: List<String> = emptyList()
+    var maxRemoteNodesPerRemoteDc: Int = 1
+}
+
+enum class FailoverPolicy { THROW, RETRY_REMOTE_DC }
+class FailoverConfig {
+    var onLocalDcUnavailable: FailoverPolicy = FailoverPolicy.THROW
+    var remoteRetryDelayMs: Long = 50
+}
+
+class SpeculativeExecutionConfig {
+    var enabled: Boolean = false
+    var delayMillis: Long = 100
+    var maxAttempts: Int = 2
+}
+```
+
+```kotlin
+loadBalancing {
+    dcAwareFailover = true
+    allowedRemoteDcs = listOf("eu-west")
+}
+failover {
+    onLocalDcUnavailable = FailoverPolicy.RETRY_REMOTE_DC
+}
+```
+
+`speculativeExecution { enabled = true }` wires `SPECULATIVE_EXECUTION_DELAY = delayMillis` and
+`SPECULATIVE_EXECUTION_MAX = maxAttempts - 1` (the driver counts *additional* speculative executions
+beyond the original) — see [`/modules/kandra-multidc`](/modules/kandra-multidc) for full multi-DC
+guidance, since these three blocks together are what actually implement multi-DC behavior.
+
+<Callout kind="danger" title="Validated eagerly, before any connection attempt">
+`dcAwareFailover = true` with an empty `allowedRemoteDcs` throws `KandraSchemaException` immediately
+at session-build time — as does `failover.onLocalDcUnavailable = RETRY_REMOTE_DC` with an empty
+`allowedRemoteDcs`, independently of `dcAwareFailover`. Both checks fire before any node is
+contacted.
+</Callout>
+
+<Callout kind="gotcha">
+`tokenAware`, `maxRemoteNodesPerRemoteDc`, and `remoteRetryDelayMs` are declared config surface with
+no code path reading them — the driver's own default token-aware load-balancing policy applies
+regardless of `tokenAware`'s value, and the actual DC-failover retry mechanics live in the driver's
+load-balancing policy, not an explicit delay loop honoring `remoteRetryDelayMs`.
+</Callout>
+
+## `shutdown { }` — `ShutdownConfig`
+
+```kotlin
+class ShutdownConfig {
+    var drainTimeoutMs: Long = 5000
+    var graceful: Boolean = true
+}
+```
+
+`graceful = true` (default): on `ApplicationStopping`, sets `isShuttingDown` (new `batch`/
+`batchBlocking` calls throw), then **blocks the shutdown thread** with a `Thread.sleep(50)` poll loop
+— not a suspend function — until `inFlightCount() == 0` or `drainTimeoutMs` elapses, logging a WARN
+with the remaining count if the deadline hits first. `graceful = false`: no drain wait,
+`isShuttingDown` never set. The session is always closed on `ApplicationStopped`, and the plugin's
+coroutine scope is cancelled *after* the session closes — deliberately, so no coroutine can start new
+work against an already-closed session.
+
+```kotlin
+shutdown { graceful = true; drainTimeoutMs = 10_000 }
+```
+
+## `metrics { }` — `MetricsConfig`
+
+```kotlin
+class MetricsConfig {
+    var enabled: Boolean = false
+    var recorder: KandraMetrics? = null
+}
+```
+
+```kotlin
+metrics {
+    enabled = true
+    recorder = KandraMetrics { table, op, durationMs ->
+        meterRegistry.timer("kandra.query", "table", table, "operation", op).record(durationMs, TimeUnit.MILLISECONDS)
+    }
+}
+```
+
+<Callout kind="gotcha">
+`enabled = true` with `recorder = null` does **not** throw — it logs a WARN at install and metrics
+are simply never recorded. Easy to miss in review since nothing breaks.
+</Callout>
+
+## `retry { }`, `debug { }`, `consistency { }`
+
+Re-exposed straight from `kandra-runtime` — see
+[`/modules/kandra-runtime`](/modules/kandra-runtime#config-classes) for the exact fields.
+Resolution order for consistency (highest priority first): per-call parameter on a repository method
+> `@ReadConsistency`/`@WriteConsistency` on the entity class > `consistency { }` defaults here.
+
+## `validate<T> { }`
+
+```kotlin
+fun <T : Any> validate(klass: KClass<T>, validator: KandraValidator<T>)
+inline fun <reified T : Any> validate(noinline validator: (T) -> List<KandraValidationError>)
+```
+
+```kotlin
+install(Kandra) {
+    validate<User> { user ->
+        buildList {
+            if (user.email.isBlank()) add(KandraValidationError("email", "cannot be blank"))
+            if (user.age < 0) add(KandraValidationError("age", "must be non-negative"))
+        }
+    }
+}
+```
+
+Registered validators are copied onto `BatchEngine` at install time and run before writes; a
+non-empty result list throws `KandraValidationException`. Re-registering the same `KClass` overwrites
+the previous validator (a `Map`, not a list).
+
+## Public surface
+
+```kotlin
+val Kandra: ApplicationPlugin<KandraConfig>
+
+val Application.kandraSession: CqlSession
+val Application.kandraCodec: KandraCodec
+val Application.kandra: KandraRuntime
+```
+
+<Callout kind="gotcha">
+There's no `Application.kandraEventListener` convenience property, even though
+`KandraEventListenerKey` is set (when `eventListener != null`). Read it with
+`application.attributes.getOrNull(KandraEventListenerKey)` if you need it back.
+</Callout>
+
+## Full API reference
+
+[`kandra-ktor` on Dokka →]({dokkaModuleUrl("kandra-ktor")}) ·
+[`KandraConfig` →]({dokkaClassUrl("kandra-ktor", "io.kandra.ktor", "KandraConfig")}) ·
+[`SchemaMode` →]({dokkaClassUrl("kandra-ktor", "io.kandra.ktor", "SchemaMode")})
+
+## Where this shows up elsewhere on this site
+
+- [`/getting-started`](/getting-started) and [`/tutorial/04-plugin-install`](/tutorial/04-plugin-install) —
+  `install(Kandra) { }` in a working app.
+- [`/philosophy/schema-safety`](/philosophy/schema-safety) — why DDL runs at startup, not lazily.
+- [`/recipes/multi-dc-deployment`](/recipes/multi-dc-deployment) — `loadBalancing`/`failover`/
+  `speculativeExecution` end to end.

@@ -1,0 +1,193 @@
+export const metadata = {
+  title: "08. Soft delete and undo",
+  description:
+    "A 7-day trash window for deleted todos — @SoftDelete's real TTL-driven lifecycle, why findActive() is the wrong tool for 'my non-deleted todos,' and a genuine landmine around non-nullable columns after the TTL fires.",
+};
+
+# 08. Soft delete and undo
+
+`DELETE /todos/{id}` from [page 05](/tutorial/05-routes) is permanent right now. The product wants a
+real, common feature instead: delete a todo, but let the user recover it for a week before it's
+really gone. This page builds that, and it's worth being precise about the actual timeline — "delete,
+but recoverable for a while" is not the same thing as a relational soft-delete flag, because
+Cassandra doesn't have a free, silent `DELETE` to fall back on once the window closes.
+
+## `@SoftDelete` on `Todo`
+
+```kotlin title="model/Todo.kt" {2,11}
+@ScyllaTable("todos")
+@SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted")
+data class Todo(
+    @PartitionKey val ownerId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
+    val todoId: UUID,
+    val title: String,
+    val assigneeId: UUID?,
+    val done: Boolean = false,
+    @Version val version: Long = 1L,
+    @UpdatedAt val updatedAt: Instant = Instant.EPOCH,
+    val isDeleted: Boolean = false,
+)
+```
+
+`ttlSeconds = 604_800` is seven days. `markerProperty = "isDeleted"` names a `Boolean` property
+Kandra validates exists and is actually `Boolean` at registration time — without it, `delete()` still
+works (it defaults to `86_400` seconds and no marker at all) but there is no CQL predicate that can
+tell a soft-deleted row apart from a live one before its TTL expires, and `findActive()` throws
+`KandraSchemaException` outright if called with no marker configured. No code in this app's own
+`delete()` call site changes — `todoRepo.delete(existing)`, already used since
+[page 05](/tutorial/05-routes), starts behaving differently the moment this annotation exists.
+
+## What `delete()` actually does now — two separate writes, not one
+
+<Callout kind="note" title="Verified directly from BatchEngine, not the annotation's doc comment">
+
+```sql
+-- 1. Every non-key, non-marker column, rewritten with a fresh 7-day TTL
+UPDATE todos USING TTL 604800
+SET title = ?, assignee_id = ?, done = ?, version = ?, updated_at = ?
+WHERE owner_id = ? AND created_at = ?
+
+-- 2. The marker, in a separate statement, with NO TTL
+UPDATE todos SET is_deleted = ?
+WHERE owner_id = ? AND created_at = ?
+```
+
+Both statements bind `true` conceptually for "deleted," but only the second one sets `is_deleted`.
+The first rewrites every other column with its *current* value, just now carrying a TTL — the whole
+row's data, not a single flag, is what expires. The marker is deliberately excluded from the TTL'd
+statement and written separately, with none, so it outlives the data it's marking: `findActive()`
+still needs to be able to tell "deleted" from "live" after the other columns' TTL has already
+expired.
+</Callout>
+
+## `findActive()` — and why it's the wrong tool here anyway
+
+```kotlin
+fun findActive(entityClass: KClass<T>): List<T>
+```
+
+<Callout kind="danger" title="This is the one place Kandra actually emits ALLOW FILTERING">
+`findActive()` runs `SELECT * FROM todos WHERE is_deleted = ? ALLOW FILTERING`, bound to `false` —
+verified directly from `QueryExecutor.kt`. Every other page on this site, correctly, says Kandra's
+query DSL has no method that produces `ALLOW FILTERING` — that's still true of `QueryContext`/
+`findAll`/`findPage`/`find`. `findActive()` is hand-written CQL outside that DSL entirely, built
+specifically because there is no partition-scoped way to express "every row where a non-key column
+equals X" — and it logs a `WARN` every call naming exactly that cost ("scans with ALLOW FILTERING
+... scatter-gather across all nodes"), the same treatment `@SecondaryIndex` queries get. It's a
+real, deliberate, narrow exception to the "no `ALLOW FILTERING`, ever" rule — not a contradiction of
+it, but worth knowing about precisely rather than assuming the rule is absolute everywhere.
+</Callout>
+
+More importantly for this app: `findActive()` takes **no predicate at all** — it scans the *entire*
+`todos` table, every owner's partition, and returns every non-deleted row across the whole app.
+That's exactly wrong for "show me **my** non-deleted todos." The right tool, per
+[Kandra's own capstone example](https://github.com/Dev-Pasaka/kandra/blob/main/docs/test-plan/07-realistic-workload-capstone.md)
+hitting this identical problem with a soft-deleted, partitioned `Post` table, is the query this app
+already has: an ordinary partition-scoped `findPage`, filtered client-side.
+
+```kotlin title="routes/TodoRoutes.kt" {5}
+get("/todos/mine") {
+    val ownerId = call.ownerIdOrRespondBadRequest() ?: return@get
+    // ... pageSize, token as before ...
+    val page = todoRepo.findPage(pageSize, token) { TodoTable.ownerId eq ownerId }
+    val active = page.items.filterNot { it.isDeleted }
+    call.respond(TodoPage(active, page.nextPageToken, page.hasMore))
+}
+```
+
+The one line that changes from [page 05](/tutorial/05-routes)'s version: filter out `isDeleted`
+rows after the (still cheap, still partition-scoped) fetch. `GET /todos/trash` is the mirror image —
+same query, opposite filter:
+
+```kotlin
+get("/todos/trash") {
+    val ownerId = call.ownerIdOrRespondBadRequest() ?: return@get
+    val pageSize = call.request.queryParameters["size"]?.toIntOrNull() ?: 20
+    val token = call.request.queryParameters["token"]
+    val page = todoRepo.findPage(pageSize, token) { TodoTable.ownerId eq ownerId }
+    val deleted = page.items.filter { it.isDeleted }
+    call.respond(TodoPage(deleted, page.nextPageToken, page.hasMore))
+}
+```
+
+<Callout kind="gotcha" title="A page can come back with fewer items than pageSize after filtering — possibly zero">
+Filtering happens after the fetch, so a heavily-deleted (or heavily-active) owner's page can shrink
+to a handful of items, or none, without `hasMore` being `false` — there may be more matching rows on
+the next page. A client walking pagination has to keep fetching until it has enough items or
+`hasMore` is `false`, not stop at the first partially- or fully-filtered page. This app leaves that
+loop to the client for now — the same simplification Kandra's own capstone example makes for the
+identical problem.
+</Callout>
+
+## The real timeline — not hand-waved
+
+Say a todo is soft-deleted at day 0:
+
+- **Day 0–7**: the row is fully intact — `findById(ownerId, createdAt)` returns every field with its
+  real value, `isDeleted = true`. This *is* the undo window: the data hasn't gone anywhere, only the
+  marker changed, immediately and without a TTL.
+- **Day 7**: the TTL on `title`/`assigneeId`/`done`/`version`/`updatedAt` fires. Those columns don't
+  vanish instantly and cleanly — each becomes, individually, a cell-level tombstone. `is_deleted`,
+  never TTL'd, is untouched and still reads `true`.
+- **Day 7 → day 7 + `gc_grace_seconds`** (10 days by default —
+  [`/foundations`](/foundations#tombstones-what-delete-actually-does)): the tombstones for those
+  cells persist, need to be read past on any query touching this partition, and haven't yet been
+  physically removed by compaction.
+- **After that**: compaction clears the tombstoned cells. The row itself — its partition key,
+  clustering key, and the never-TTL'd `is_deleted = true` marker — does **not** disappear. It's not
+  a row-level tombstone, only a set of cell-level ones; nothing in `@SoftDelete` ever issues a real
+  `DELETE` on the row's key. Left alone, this todo exists forever as a key-plus-marker husk.
+
+<Callout kind="danger" title="A genuine landmine: non-nullable columns and the TTL window, verified from KandraCodec">
+Once those columns' TTL fires, they read back as CQL `NULL` — not "gone," `NULL`, at the storage
+layer, regardless of what type Kandra declared for them. `Todo.title`, `.done`, `.version`, and
+`.updatedAt` are all **non-nullable** Kotlin types. `KandraCodec.decode()` checks exactly this case:
+if a column is `NULL` in Scylla and the corresponding Kotlin property isn't marked nullable, it
+throws — verbatim: `"Column 'title' is NULL in Scylla but property 'title' is non-nullable
+(kotlin.String). Mark the property nullable or ensure the column always has a value."` That means
+any read that touches this row **after day 7** — `findById`, or a `findPage` scan of that owner's
+partition that happens to include it — throws `KandraQueryException`, not "returns a mostly-empty
+todo." For `GET /todos/mine`/`GET /todos/trash`, a single expired-but-not-yet-compacted row in a
+partition would break that entire page of results, not just the one row, until it's dealt with.
+</Callout>
+
+This isn't a corner case worth glossing over — it's the actual, source-verified consequence of
+pairing `@SoftDelete`'s TTL with an entity whose columns were modeled as non-nullable (a completely
+reasonable, idiomatic choice for a `Todo` that's supposed to always have a title). Two honest ways
+to actually close this gap, neither of which this app builds out fully here (the same kind of
+deliberate, named scope cut as [page 05](/tutorial/05-routes)'s missing auth):
+
+1. **Hard-delete proactively, before the TTL fires** — a scheduled job that finds `isDeleted = true`
+   rows older than, say, 6 days and calls a real `deleteById`/`delete()` on them, so no row this app
+   ever reads is allowed to reach the expired-but-not-compacted state at all. This is the safer of
+   the two, and the one to actually build for a real deployment.
+2. **Model the fields as nullable** and accept that "a soft-deleted todo past its window might read
+   back with `null` fields" is part of the type, not an exception path — more honest to the data's
+   real lifecycle, but pushes null-handling into every reader of `Todo`, including the routes this
+   tutorial already wrote.
+
+<Callout kind="note" title="A related, now-fixed bug worth knowing about if you reach for deleteById directly">
+This app never calls `deleteById` (every delete route in this tutorial loads the entity via
+`findById` first, then calls `delete(entity)`) — worth knowing anyway: `KandraRepository.deleteById`
+(the blocking repository) used to bypass `@SoftDelete` entirely and hard-delete regardless, a real
+bug tracked and fixed as
+[`ISS-015`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-015-delete-by-id-bypasses-soft-delete.md).
+Current source confirms the fix: `deleteById` now looks the entity up first and delegates to the
+same soft-delete-aware `BatchEngine.delete` path every other delete call uses, invalidating the
+cache too. If you ever reach for `deleteById(ownerId, createdAt)` directly on a `@SoftDelete` entity
+instead of the find-then-`delete()` pattern this tutorial uses, this is the history of why that used
+to be a trap.
+</Callout>
+
+<Callout kind="tip">
+Verify the checkpoint: `DELETE /todos/{id}`, then `GET /todos/mine` (gone) and `GET /todos/trash`
+(present, with its real title intact) using the same `X-User-Id`. Nothing in this app builds a
+"restore from trash" route — per [`@SoftDelete`](/recipes/soft-delete)'s own mechanics, restoring
+before the TTL fires would mean rewriting the row with `is_deleted = false` and fresh values via a
+plain `save()`, which clears the TTL on write; left as an exercise, the same way this tutorial left
+authentication out of [page 05](/tutorial/05-routes).
+</Callout>
+
+Next: [page 09](/tutorial/09-counters) — a lifetime completion count that has to survive the todo
+itself being deleted, and stay correct under concurrent writers.

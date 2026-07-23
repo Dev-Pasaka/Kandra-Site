@@ -1,0 +1,162 @@
+export const metadata = {
+  title: "Recipe: time-series data",
+  description:
+    "Clustering keys, findPage/pageToken, and 'give me the latest N' patterns for time-ordered, partition-scoped data.",
+};
+
+# Recipe: time-series data
+
+**Problem:** you have data that naturally accumulates over time within some owner — events for a
+user, transactions for an account, posts for an author — and the query you actually need is "give
+me this owner's records, newest first," often paginated. This is the single most common access
+pattern on Cassandra, and it's a clustering-key pattern, not an `ORDER BY ... LIMIT N` bolted onto
+an unordered table. Get the clustering key right and it's close to free; get it wrong and there's no
+query-time fix.
+
+## The scenario
+
+Transaction history for a wallet: given a `walletId`, return transactions newest-first, paginated.
+
+```kotlin title="Transaction.kt"
+import io.kandra.core.annotations.*
+import java.math.BigDecimal
+import java.time.Instant
+import java.util.UUID
+
+@ScyllaTable("transactions")
+data class Transaction(
+    @PartitionKey val walletId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 1) val txId: UUID,
+    val amount: BigDecimal,
+    val memo: String,
+)
+```
+
+`walletId` is the partition key — every query in this recipe supplies it, so all of a wallet's
+transactions live together on the same replicas. `createdAt DESC` is the clustering key that makes
+"newest first" the table's native physical sort order, not something computed at query time. `txId`
+is a second clustering column (`index = 1`), included to guarantee row uniqueness — `createdAt`
+alone isn't safe as a sole clustering key when two transactions can land in the same millisecond.
+
+<Callout kind="note" title="The sort order is a schema decision, not a query decision">
+`ClusteringOrder.DESC` here is chosen once, in the entity definition, and every read against this
+partition comes back in that order for free — no `ORDER BY` at query time, because there is no
+`ORDER BY` at query time for a different order than the one baked into the clustering key. If a
+different access pattern later needs `createdAt ASC` for the same data, that's a different table,
+not a query-time flag. See
+[`/foundations`](/foundations#clustering-keys-sort-order-within-a-partition).
+</Callout>
+
+## Paginating with `findPage`
+
+```kotlin title="KandraSuspendRepository.kt"
+suspend fun findPage(
+    pageSize: Int,
+    pageToken: String? = null,
+    block: QueryContext.() -> Unit = {}
+): KandraPage<T>
+```
+
+```kotlin
+data class KandraPage<T>(
+    val items: List<T>,
+    val nextPageToken: String?,
+    val hasMore: Boolean
+)
+```
+
+```kotlin
+val page1 = txnRepo.findPage(pageSize = 20) {
+    TransactionTable.walletId eq walletId
+}
+// page1.nextPageToken is a base64-encoded driver paging state
+
+val page2 = txnRepo.findPage(pageSize = 20, pageToken = page1.nextPageToken) {
+    TransactionTable.walletId eq walletId
+}
+```
+
+`nextPageToken` is the DataStax driver's own paging state, base64-encoded — not an offset, not a
+timestamp you construct yourself. Pass it straight back into the next `findPage` call. `hasMore` is
+`true` exactly when `nextPageToken` is non-null; there's no separate "is this really the last page"
+signal to reconcile against it.
+
+<Callout kind="tip" title="Walking every page">
+
+```kotlin
+var token: String? = null
+val all = mutableListOf<Transaction>()
+do {
+    val page = txnRepo.findPage(pageSize = 50, pageToken = token) {
+        TransactionTable.walletId eq walletId
+    }
+    all += page.items
+    token = page.nextPageToken
+} while (token != null)
+```
+
+This is the pattern the capstone's real test used to walk a 30+-row feed across multiple pages and
+confirm no duplicates/gaps — see
+[`/recipes/social-feed-capstone`](/recipes/social-feed-capstone#flow-2-the-paginated-feed).
+
+</Callout>
+
+## "Give me the latest N" without pagination
+
+When you just want a bounded top-N and don't need a page token at all, `findAll(limit = N)` against
+a partition-scoped query is cheaper and simpler than `findPage`:
+
+```kotlin
+// 5 most recent transactions for this wallet
+val recent = txnRepo.findAll(limit = 5) {
+    TransactionTable.walletId eq walletId
+}
+```
+
+Because `createdAt` is clustered `DESC`, "most recent 5" *is* "first 5 rows returned" — no
+in-memory sort, no over-fetch-then-truncate. This only works because the clustering order matches
+the query's intent; if the table were clustered `ASC`, this same call would hand back the *oldest*
+five transactions instead, and there'd be no query-time way to flip it.
+
+## Range queries on the clustering key
+
+The clustering key also supports range predicates, not just equality — useful for "transactions in
+the last 24 hours" style queries:
+
+```kotlin
+val recentWindow = txnRepo.findAll {
+    TransactionTable.walletId eq walletId
+    TransactionTable.createdAt gte cutoff
+}
+```
+
+`eq`/`gt`/`gte`/`lt`/`lte`/`isIn` are all infix members on `QueryContext` — no `+` prefix. (Older
+Kandra versions required `+TransactionTable.createdAt.gte(cutoff)`; forgetting the `+` compiled
+cleanly and silently dropped the predicate. The current DSL makes the comparison itself the
+registration, so there's no intermediate value to forget — see
+[`/foundations`](/foundations#allow-filtering-why-its-dangerous-and-why-kandra-refuses-it) and
+[`/philosophy/schema-safety`](/philosophy/schema-safety).)
+
+<Callout kind="gotcha" title="findAll requires a predicate; findPage doesn't — different failure modes">
+`findAll`/`find` throw `KandraQueryException("Query must have at least one predicate.")` if called
+with an empty block — there's no accidental full-table `findAll()`. `findPage`, on the other hand,
+**allows** zero predicates: called that way, it runs a full token-range scan across the whole table,
+using the driver's native paging to walk every partition, and logs
+`"findPage on '<table>' with no predicates — full token-range scan (driver paging). Use sparingly on
+large tables."` This is never `ALLOW FILTERING` — no scatter-gather re-query per node — but it *is*
+still an unbounded, whole-table read. Always supply the partition key predicate on `findPage` calls
+like the ones above unless you genuinely mean "walk the entire table," since the API will let you do
+that by omission where `findAll` won't.
+</Callout>
+
+## Why this is the whole game on Cassandra
+
+There's no query-time way to ask for "this wallet's transactions, but sorted differently" or
+"transactions across all wallets, newest first" from this table — either needs a different table,
+denormalized for that access pattern (see
+[`/recipes/lookup-tables`](/recipes/lookup-tables) and
+[`/philosophy/denormalization`](/philosophy/denormalization)). That's not a Kandra limitation —
+it's what "the clustering key decides sort order, and the partition key decides locality" means in
+practice, and it's the reason time-series modeling on Cassandra starts with "what will I query by
+and in what order" before a single `data class` gets written.

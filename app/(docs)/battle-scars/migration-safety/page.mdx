@@ -1,0 +1,72 @@
+export const metadata = {
+  title: "Migrations: checksums & locking",
+  description:
+    "ISS-017, ISS-018: a migration checksum that couldn't detect a changed migration body, and a migration runner with no lock, letting two instances double-apply the same data-mutating migration.",
+};
+
+# Migrations: checksums & locking
+
+Both bugs here were found the same way — reading `kandra-migrate` and asking "what would this
+actually do against a live keyspace, with more than one app instance," before ever running it
+against one. Neither is exotic. Both are the kind of gap that's invisible in a single-instance dev
+loop and only matters the moment a second instance exists, which for a migration runner is the
+normal production case, not an edge case.
+
+## ISS-017: the checksum that couldn't detect a changed migration
+
+`KandraMigration`'s class doc makes an explicit promise: "Kandra validates checksums on startup and
+throws `KandraMigrationException` if a previously-applied migration's body has changed." The actual
+`checksum()` implementation hashed only `"${version}:${name}:${qualifiedClassName}"` — none of which
+changes when you edit the CQL inside an already-applied migration's `up()`. Editing the body without
+touching its version, name, or class name produced an *identical* checksum. The safety net the doc
+comment promised did nothing, silently, in exactly the scenario it exists for.
+
+<Callout kind="danger" title="A safety check that always passes is worse than no check">
+A missing safety check is at least visibly absent. A safety check that always reports "fine" gives a
+false sense of protection — someone reads the doc comment, trusts that editing an applied migration
+gets caught, and it never does. This is a real footgun once migrations run against a live keyspace:
+the exact scenario "I need to hotfix a migration that already ran" is when you most need this check
+to actually fire.
+</Callout>
+
+### The fix
+
+`checksum()` now additionally hashes the migration class's own compiled bytecode, read via
+`this::class.java.getResourceAsStream(".class")` — so a change to the body of `up()`, or any
+lambda/anonymous class it captures as a member of that class file, changes the checksum, while
+unrelated recompilation elsewhere in the project does not. This hashes bytecode, not source text —
+an approximation (a no-op reformat the compiler happens to encode identically wouldn't trip it) that
+still correctly catches every real logic edit, which the previous implementation could never catch
+under any circumstance at all.
+
+## ISS-018: no locking, so two instances could double-apply a migration
+
+`KandraMigrationRunner.run()` read the `kandra_migrations` table, then unconditionally called
+`migration.up(session)` followed by a plain, non-conditional `INSERT` recording it as applied. No
+`IF NOT EXISTS` LWT, no lock table. Two app instances starting simultaneously against the same
+keyspace could both see a migration as "not applied" and both execute `up()` concurrently.
+
+For idempotent DDL like `ALTER TABLE ... ADD`, the worst case is two instances erroring on the
+second attempt — annoying, harmless. For any migration containing data-mutating CQL — a backfill, a
+one-time data transform — running it twice concurrently is a genuinely different, and genuinely
+risky, outcome.
+
+### The fix
+
+Reworked the runner into a claim-first pattern: before running a migration, it issues
+`INSERT INTO kandra_migrations (...) VALUES (...) IF NOT EXISTS` and checks whether the write was
+applied. LWT guarantees only one instance's claim wins. Only the instance that wins the claim
+proceeds to call `up()`. If `up()` throws, the runner deletes its claim row so a later run can retry
+the migration, then rethrows as `KandraMigrationException` with the original cause attached. An
+instance that loses the race logs and skips — another instance is (or already has) applying that
+version.
+
+<Callout kind="tip" title="The lesson, beyond Kandra">
+"Only one process runs this" is an assumption, not a guarantee, unless something makes it one — and
+in a horizontally-scaled deployment, "only one instance boots at a time" is false by default, not an
+edge case you can defer. A migration runner, a scheduled job, a cache warmer, any startup-time
+one-shot task: if more than one instance can start at once, and the action isn't naturally
+idempotent, it needs an explicit claim mechanism — a conditional write, a distributed lock, anything
+that makes "only the winner proceeds" true by construction — not a `SELECT`-then-`INSERT` sequence
+that's correct only because nobody's tested it with two instances yet.
+</Callout>

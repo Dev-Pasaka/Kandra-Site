@@ -1,0 +1,227 @@
+export const metadata = {
+  title: "02. Project setup",
+  description:
+    "The full Ktor + Kandra Gradle scaffold for the todo-list app, every dependency explained line by line, plus a local single-node ScyllaDB via Docker Compose.",
+};
+
+# 02. Project setup
+
+[Page 01](/tutorial/01-modeling) fixed the shape of the two tables this app needs without writing
+any code. This page builds the project those tables will live in — a Ktor server, Gradle build,
+and a local ScyllaDB via Docker. Still no entities yet; that's [page 03](/tutorial/03-entities).
+Package root for everything from here on: `com.example.todos`.
+
+## The build file, dependency by dependency
+
+```kotlin title="build.gradle.kts"
+plugins {
+    kotlin("jvm") version "2.1.21"
+    id("com.google.devtools.ksp") version "2.1.21-2.0.1"
+    application
+}
+
+application {
+    mainClass.set("com.example.todos.ApplicationKt")
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Kandra
+    implementation(platform("ke.co.coinx.kandra:kandra-bom:0.4.5"))
+    implementation("ke.co.coinx.kandra:kandra-ktor")
+    implementation("ke.co.coinx.kandra:kandra-koin")
+    ksp("ke.co.coinx.kandra:kandra-codegen")
+    testImplementation("ke.co.coinx.kandra:kandra-test")
+
+    // Caffeine — see the note below on why this is split runtimeOnly/testImplementation
+    runtimeOnly("com.github.ben-manes.caffeine:caffeine:3.1.8")
+    testImplementation("com.github.ben-manes.caffeine:caffeine:3.1.8")
+
+    // Ktor server
+    implementation("io.ktor:ktor-server-core:2.3.13")
+    implementation("io.ktor:ktor-server-netty:2.3.13")
+    implementation("io.ktor:ktor-server-content-negotiation:2.3.13")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:2.3.13")
+
+    // Logging
+    implementation("io.github.oshai:kotlin-logging-jvm:6.0.9")
+    implementation("ch.qos.logback:logback-classic:1.5.6")
+}
+```
+
+<Callout kind="note">
+Kotlin/KSP versions here (`2.1.21` / `2.1.21-2.0.1`) match what Kandra itself is built and tested
+against. KSP processor versions are tied tightly to the Kotlin compiler version that built them —
+mismatch them and you get a cryptic KSP resolution failure at build time, not a clear "wrong
+version" error. Pinning to the same numbers Kandra ships with is the least-surprising choice.
+</Callout>
+
+### `kandra-bom` — one version string, not five
+
+```kotlin
+implementation(platform("ke.co.coinx.kandra:kandra-bom:0.4.5"))
+```
+
+Every other `ke.co.coinx.kandra:*` dependency below omits its version entirely — the BOM
+(`java-platform`) pins all of them to `0.4.5` as version *constraints*, so `kandra-ktor`,
+`kandra-koin`, and `kandra-codegen` are guaranteed to be from the same release without you repeating
+`0.4.5` four times and risking one of them drifting out of sync on the next upgrade. This is the same
+pattern as Spring Boot's BOM or the Kotlin BOM — nothing Kandra-specific about the mechanism, just
+applied to Kandra's own module set.
+
+### `kandra-ktor` — the plugin itself
+
+The `ApplicationPlugin<KandraConfig>` you install with `install(Kandra) { }` — opens the `CqlSession`,
+runs schema DDL, wires the batch/retry engine, registers `GET /kandra/health`. [Page 04](/tutorial/04-plugin-install)
+is entirely about this module's config surface.
+
+### `kandra-koin` — dependency injection
+
+Kandra ships two DI integrations as separate modules: `kandra-koin` and `kandra-kodein`. Neither is
+required — you can call `application.kandra.repository<T>()`/`suspendRepository<T>()` directly with
+no DI framework at all — but a bare `install(Kandra) { }` call gives you no wired-up way to *get* a
+repository into a route handler beyond building one by hand every time, which
+[page 04](/tutorial/04-plugin-install#a-real-gotcha-di-installation-order) explains is more expensive
+than it looks. This tutorial picks Koin: it's the smaller mental model of the two (a `single { }`
+binding per entity, resolved by a string qualifier — no dependency graph DSL to learn), and it's
+what [`/getting-started`](/getting-started) already used. If you'd rather use Kodein's typed-binding
+DSL, swap `kandra-koin` for `kandra-kodein` — the annotations and entity/route code in the rest of
+this tutorial don't change, only the wiring in [page 04](/tutorial/04-plugin-install) would.
+
+### `kandra-codegen` (via `ksp`) — type-safe `*Table` references
+
+```kotlin
+ksp("ke.co.coinx.kandra:kandra-codegen")
+```
+
+This is a KSP `SymbolProcessor` that scans for `@ScyllaTable`-annotated classes at compile time and
+generates one `*Table` object per entity — `TodoTable`, `UserTable` — each exposing a
+`KandraColumnRef<T>` per column, so a query looks like `TodoTable.ownerId eq ownerId` instead of a
+bare string `"owner_id"`. The KSP build step costs real compile time — a full symbol-processing pass
+on every incremental build touching an entity file — and it's worth it for the same reason a
+statically-typed language is worth it over a stringly-typed one at all: `TodoTable.ownerid` (typo)
+is a compile error, `"todos".find("ownerid")` (typo) is a runtime failure you find out about from a
+user, not the compiler. The DSL's whole safety story — no query against a column that doesn't exist,
+no column-name typo reaching a live query — depends on this codegen step running.
+
+### `kandra-test` — test-only
+
+```kotlin
+testImplementation("ke.co.coinx.kandra:kandra-test")
+```
+
+Ships `FakeKandraSession` (a fast, in-process fake for the CQL session — useful for checking what
+statements *would* run, not for exercising real repository CRUD, which currently throws against the
+fake) and `KandraTestcontainers` (a real Cassandra container, one per JVM, isolated keyspace per test
+class). [Page 12](/tutorial/12-testing) covers what each is actually good for. `testImplementation`
+only — this has no reason to ship in the runtime jar.
+
+### Caffeine — `compileOnly` upstream, `runtimeOnly`/`testImplementation` here
+
+This is the one dependency worth being precise about, because the split is a real and deliberate
+choice, not an oversight.
+
+<Callout kind="gotcha" title="Why two different scopes for the same library">
+Inside Kandra's own build, `kandra-runtime` declares Caffeine as `compileOnly` — it compiles against
+Caffeine's API but does **not** pull the jar into anything that depends on `kandra-runtime`
+transitively. `@CacheResult`'s cache (`KandraCache`) resolves `com.github.benmanes.caffeine.cache.Caffeine`
+by `Class.forName` at construction, and if the class isn't found on the classpath, the cache silently
+becomes a no-op — no crash, no warning beyond one log line, `@CacheResult` just does nothing. That
+means an app that never uses `@CacheResult` doesn't need Caffeine on its classpath at all, and one
+that does has to add it **itself** — Kandra won't drag it in for you. This tutorial doesn't use
+`@CacheResult` until [page 10](/tutorial/10-caching), but the dependency is added here, in
+`runtimeOnly` (the app needs the real jar at runtime, not at compile time — nothing in this app's own
+code calls Caffeine's API directly) and `testImplementation` (so tests exercising the cached path
+don't silently no-op either) so it's already in place when page 10 turns the annotation on.
+</Callout>
+
+### Ktor server dependencies
+
+Standard Ktor 2.3.13 server pieces, nothing Kandra-specific: `ktor-server-core` +
+`ktor-server-netty` for the HTTP server itself, `ktor-server-content-negotiation` +
+`ktor-serialization-kotlinx-json` so route handlers can `call.receive<CreateTodoRequest>()` and
+`call.respond(todo)` as JSON without hand-rolling serialization.
+
+### Logging
+
+`kotlin-logging-jvm` is the same logging facade Kandra's own modules use internally (`kandra-ktor`,
+`kandra-runtime`) — using it in this app's own code keeps log call sites consistent with what
+`debug { logQueries = true }` (covered in [page 11](/tutorial/11-observability)) already emits.
+`kotlin-logging` is a facade over SLF4J, not a logging implementation — without a real SLF4J backend
+on the classpath, every log call (Kandra's and this app's) silently goes nowhere. `logback-classic`
+is that backend.
+
+## Local ScyllaDB
+
+```yaml title="docker-compose.yml"
+services:
+  scylla:
+    image: scylladb/scylla:latest
+    ports:
+      - "9042:9042"
+    command: --smp 1 --memory 750M --overprovisioned 1 --api-address 0.0.0.0
+```
+
+```bash
+docker compose up -d
+```
+
+- **`image: scylladb/scylla:latest`** — the official ScyllaDB image; `latest` is fine for a local
+  dev instance you can throw away, pin a real tag for anything you'd want reproducible.
+- **`9042:9042`** — CQL's native protocol port, the only one this app talks to. `contactPoints =
+  "localhost:9042"` in [page 04](/tutorial/04-plugin-install)'s plugin config points straight at
+  this.
+- **`--smp 1 --memory 750M --overprovisioned 1`** — these three together tell Scylla "you're not
+  getting a whole machine, behave accordingly": `--smp 1` pins it to one shard/CPU instead of
+  Scylla's normal one-shard-per-core model, `--memory 750M` caps RAM to something a laptop can spare
+  alongside everything else running on it, `--overprovisioned 1` disables the aggressive
+  low-latency tuning (huge pages, IRQ pinning) that assumes it owns the whole host — all three exist
+  purely to make a production-grade database behave like a well-mannered local dev dependency.
+- **`--api-address 0.0.0.0`** — binds Scylla's REST API to all interfaces inside the container, not
+  just loopback, so it's reachable from outside the container's own network namespace (Docker's port
+  mapping needs this).
+
+<Callout kind="danger" title="Single-node here, never in production">
+This is one Scylla node with no replication — there is nothing to replicate to. That's the right
+tradeoff for local development (fast to start, nothing to configure, disposable) and the wrong one
+for anything real: a single node is a single point of failure, the opposite of what you're using
+Cassandra/ScyllaDB for in the first place. [Page 04](/tutorial/04-plugin-install) uses
+`ReplicationStrategy.SimpleStrategy(replicationFactor = 1)` (the default) to match this local
+single-node setup, and [`/foundations`](/foundations#what-a-partition-key-actually-is-physically)
+covers what replication actually buys you once there's more than one node to spread across.
+</Callout>
+
+## Auth environment variables — needed even for local, unauthenticated Scylla
+
+[Page 04](/tutorial/04-plugin-install) configures `auth { provider = KandraAuth.fromEnv() }` —
+the production-recommended default, which reads `SCYLLA_USERNAME`/`SCYLLA_PASSWORD` from the
+environment.
+
+<Callout kind="gotcha" title="This throws at startup if the env vars aren't set — even locally">
+`KandraAuth.fromEnv()`'s `getCredentials()` throws `KandraAuthException` the moment either
+environment variable is genuinely unset (`System.getenv(...) == null`), and that call happens during
+`install(Kandra) { }`, before the app takes any traffic. The Docker Compose Scylla above doesn't
+enforce authentication at all (it ships with `AllowAllAuthenticator` by default), so the *values*
+don't matter — but the variables still have to **exist**, or the app won't start. Before running
+anything in this tutorial locally:
+
+```bash
+export SCYLLA_USERNAME=cassandra
+export SCYLLA_PASSWORD=cassandra
+```
+
+Any non-empty strings work. This is exactly the mechanism [`/foundations`](/foundations#lightweight-transactions-lwt-real-and-not-free)
+and [`/why`](/why) argue for elsewhere: a config default that's *safe* in production (never guess at
+credentials, fail loudly if they're missing) costs a small amount of local-dev friction, and Kandra
+doesn't quietly special-case "looks like local dev" to smooth that over.
+</Callout>
+
+## What you should have at the end of this page
+
+A Gradle project that builds (`./gradlew build` — nothing to run yet, no entities exist), a Scylla
+container reachable on `localhost:9042`, and the two environment variables above set in your shell.
+Nothing queries the database yet — that starts on [page 03](/tutorial/03-entities), where `User` and
+`Todo` turn page 01's key decisions into actual annotated Kotlin.

@@ -1,0 +1,60 @@
+export const metadata = {
+  title: "Battle scars",
+  description:
+    "Real bugs found while building Kandra against an actual ScyllaDB cluster — what broke, why, the fix, and the lesson that applies beyond Kandra.",
+};
+
+# Battle scars
+
+Every entry in this section is a real bug, found in Kandra's own codebase, with a root cause and a
+fix. None of it is hypothetical, and none of it is here because it makes a good story — it's here
+because it's the same information you'd want if you were about to build on this library and
+wanted to know what's already been shaken out versus what hasn't.
+
+Most of these were found in two passes, not by chance. A pre-real-database-testing audit (dated
+2026-07-21 in the issue tracker) went through every write and read path asking "what would this
+actually do against a live cluster" before a live cluster was involved at all — it caught a batch
+of correctness gaps that unit tests, which run against an in-memory fake session, structurally
+cannot see. Then an actual test plan run against a real 3-node ScyllaDB cluster caught what that
+audit couldn't: bugs that only exist at the seam between two features that individually worked
+fine. A few of those seams cascaded — fixing one exposed the next, which exposed the next — and
+those are told here as one continuous story instead of three disconnected entries, because that's
+how they actually happened and it's the more useful way to read them.
+
+Some of this is Kandra-specific plumbing you'll never touch directly. All of it points at a lesson
+that isn't Kandra-specific. That's the point of writing it up at all.
+
+## The stories
+
+**[Clustering keys & lookup tables](/battle-scars/clustering-keys-and-lookup-tables)** — a delete
+call that was supposed to remove one row instead removed an entire partition. Tightening the fix
+correctly then broke lookup-index resolution and soft-delete for the exact entities that combine
+clustering keys with those features, in sequence, over three issues.
+
+**[The batch-scope shadowing saga](/battle-scars/batch-scope-shadowing)** — `KandraBatchScope`'s
+`save`/`delete` compiled, ran, and returned success, and never once actually put anything in a
+batch. Kotlin's overload resolution rules made sure of it.
+
+**[Cache invalidation](/battle-scars/cache-invalidation)** — a cache that crashed on every real
+write the moment a real Caffeine dependency was on the classpath, and, once that was fixed, quietly
+stopped invalidating itself for a whole class of entities.
+
+**[Codegen & collection types](/battle-scars/codegen-collection-types)** — `Set`/`Map` columns
+broke the generated code outright, then broke decoding empty ones, in two separate bugs a year
+apart, plus one alarm that turned out not to be a bug at all.
+
+**[Migrations: checksums & locking](/battle-scars/migration-safety)** — a migration checksum that
+couldn't detect a changed migration, and a migration runner with no lock, so two instances booting
+at once could run the same data-mutating migration twice.
+
+**[Testing the untestable: LWT & fakes](/battle-scars/testing-lwt-and-fakes)** — the in-memory test
+fake that Kandra's own unit tests ran against couldn't fail in ways that mattered, wasn't supposed
+to, and how the project found out its blocking-vs-suspend split had never actually been exercised.
+
+**[Early-days hardening](/battle-scars/early-hardening)** — a grab bag of smaller, real fixes from
+the same audit pass: soft-delete filtering, bean validation autodetection, a delete path that
+bypassed soft-delete entirely, a consistency-level setting silently ignored on collection writes,
+and an error message that pointed callers at a method that didn't exist.
+
+None of these are still open. They're left in place, not deleted, because a fixed-bug archive that
+gets erased once it's inconvenient isn't a fixed-bug archive — it's marketing.

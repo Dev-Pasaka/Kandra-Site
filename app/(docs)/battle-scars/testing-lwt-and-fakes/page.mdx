@@ -1,0 +1,101 @@
+export const metadata = {
+  title: "Testing the untestable: LWT & fakes",
+  description:
+    "ISS-013, ISS-020, ISS-014: why Kandra's own unit tests, all passing, weren't evidence that LWT, optimistic locking, or the suspend read path worked at all against a real cluster.",
+};
+
+# Testing the untestable: LWT & fakes
+
+This is the story of Kandra's own test suite lying to itself, not out of negligence but by
+construction — and what it took to find out. It's the most important page in this section for
+one specific reason: it's the one where the bug isn't a wrong line of code, it's a false sense of
+coverage.
+
+## ISS-020: `FakeKandraSession` never exercised real LWT semantics
+
+`FakeKandraSession.execute()` always returns `FakeResultSet.empty()`. That's fine for what it was
+built for — its own doc comment says it exists to assert *structural* behavior, batch composition,
+save/delete ordering, "rather than data round-trips." But `BatchEngine.saveIfNotExists` and
+optimistic-lock `update()` both check `rs.one()?.getBoolean("[applied]") ?: false` to know whether
+the LWT actually applied. Under the fake, that's always `false`, and `FakePreparedStatement.bind()`
+unconditionally throws on top of that.
+
+<Callout kind="danger" title="Zero coverage, dressed up as 43 passing tests">
+`saveIfNotExists`, optimistic-lock `update()`, and anything going through the real
+`StatementBuilder`/`BatchEngine` pipeline — not just batch-capture assertions — had effectively zero
+coverage from the unit test suite. All 43 unit tests passed. None of them could have caught a real
+LWT bug, because none of them ever exercised real LWT semantics in the first place.
+</Callout>
+
+### Why this was never "fixed" as a bug
+
+Making `FakeKandraSession` simulate real LWT would mean re-implementing a meaningful chunk of
+Cassandra's actual data-plane behavior inside a test double — exactly the work `KandraTestcontainers`
+(real Cassandra via Testcontainers) exists to avoid needing. This is filed as a **known
+limitation, by design** — not a product bug — because the honest fix isn't a smarter fake. It's
+real integration tests, which is ISS-013.
+
+<Callout kind="gotcha" title="The takeaway to actually remember">
+Don't read "43 unit tests passing" as evidence that LWT, optimistic-locking, or collection-mutation
+paths work. They were exercised for the first time by the Testcontainers suite, not by the unit
+tests that had been green the whole time.
+</Callout>
+
+## ISS-013: there were no integration tests against a real cluster at all
+
+Every Ktor/runtime test was `@Disabled`. The entire execution path from plugin install through
+`BatchEngine.save`/`findById`/`delete` was untested against a live driver — meaning LWT
+applied/not-applied semantics, real CQL parameter binding, and TTL-based soft delete had literally
+never been exercised, for the exact reason ISS-020 describes.
+
+### The fix
+
+A real `KandraIntegrationTest` suite, using `KandraTestcontainers.freshKeyspace(...)` so each test
+gets its own isolated keyspace: save/`findById` round-trip, delete, `saveAll` auto-chunking (250
+rows), `@Version` optimistic-lock conflict (confirms `KandraOptimisticLockException` on a stale
+update — the exact path ISS-020 says the unit suite couldn't reach), `@SoftDelete` + `findActive()`,
+and graceful shutdown. The two previously `@Disabled` Ktor plugin tests — hardcoded to
+`localhost:9042` — were rewired onto `KandraTestcontainers` and re-enabled.
+
+<Callout kind="note">
+Confirmed, in the Docker-less environment this was authored in, that the Docker-dependent tests fail
+fast (~19s) with a clear "Could not find a valid Docker environment" error rather than hanging —
+meaning they're structurally wired correctly and will run once Docker is available. They had not yet
+been observed passing against a live container at the time this was written; that's a real, stated
+gap between "compiles and is wired up" and "verified," and it's called out rather than glossed over.
+</Callout>
+
+## ISS-014: the entire suspend read path was blocking, and the fakes couldn't see it
+
+Found in the same pre-real-database-testing audit. Every method on `QueryExecutor` —
+`findById`, `findAll`, `findPage`, `raw`, `rawQuery`, `resolveRows` — called `session.execute(...)`
+synchronously. No suspend variant existed. `KandraSuspendRepository`'s reads all delegated to this
+same blocking executor.
+
+Against `FakeKandraSession`, this is invisible — a fake call returns instantly, so blocking the
+calling thread for a fake round-trip costs nothing measurable. Against a real cluster, every
+`find`/`findById`/`findPage`/`raw` call inside a coroutine blocked the calling dispatcher thread for
+the full network round-trip. Under load, on `Dispatchers.IO` or any limited thread pool, that starves
+the pool and causes request pile-ups and timeouts — a class of bug that only appears under real
+network latency, which is exactly what a fake session doesn't have. The write path had already been
+fixed for this same issue (`BatchEngine` and the suspend repository's collection/counter methods
+already used `executeSuspend`); the read path was simply missed.
+
+### The fix
+
+Suspend twins for every `QueryExecutor` method — `findByIdSuspend`, `findAllSuspend`, `findSuspend`,
+`findPageSuspend`, `existsSuspend`, `rawSuspend`, `rawQuerySuspend` — built on
+`CqlSession.executeSuspend`/`executeSuspendAll`/`prepareSuspend` extensions, which use
+`executeAsync().await()` under the hood. `KandraSuspendRepository` now calls the suspend variants
+exclusively. The blocking `KandraRepository` is unchanged, correctly, since blocking is what its API
+contract promises.
+
+<Callout kind="danger" title="The lesson, beyond Kandra">
+A test double that responds instantly cannot, by construction, catch a bug whose entire symptom is
+"this blocks for the length of a network round-trip." That's not a flaw in the specific fake — it's
+structural: any fake, mock, or in-memory stub that skips the real I/O also skips every failure mode
+that depends on the real I/O's timing, concurrency, or partial-failure behavior. "All tests pass
+against the fake" is evidence the *shape* of the code is right. It is not evidence that the code is
+safe to run against the real thing, and no amount of additional unit tests against the same fake
+will change that — the only fix is testing against a real instance of whatever the fake replaced.
+</Callout>

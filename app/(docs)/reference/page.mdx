@@ -1,0 +1,50 @@
+import { dokkaModuleUrl } from "@/lib/dokka";
+import { KANDRA_MODULES, DOKKA_PUBLISHED_VERSION, KANDRA_VERSION } from "@/lib/site-config";
+
+export const metadata = {
+  title: "API reference",
+  description: "Where to find exact signatures, and where to find the reasoning behind them.",
+};
+
+# API reference
+
+This site does not duplicate the exhaustive, generated signature reference — that's what
+[Dokka](https://dev-pasaka.github.io/kandra/) is for, and it's generated directly from source on
+every tag, so it's never out of date with itself. What this site adds is the part Dokka can't: why
+a given annotation or method exists, when to reach for it, and what breaks if you don't.
+
+<Callout kind="note" title="Version gap">
+This site's prose and code examples are verified against Kandra **v{KANDRA_VERSION}** (the current
+source). The published Dokka site currently serves **v{DOKKA_PUBLISHED_VERSION}** — it lags behind
+by one release. If a signature on Dokka looks different from what's shown here, trust this site's
+description of *why*, and treat the Dokka page for the exact current signature with that gap in
+mind until a new Dokka build is published.
+</Callout>
+
+## How to use this section
+
+- [`/modules`](/modules) is the curated companion reference — one page per module, every public
+  annotation/class/function with a real example, a "why this module exists separately" section, and
+  gotchas pulled from real source comments and issue reports.
+- [`/recipes`](/recipes) is task-oriented — "how do I do X," not "what does class Y expose."
+- [`/battle-scars`](/battle-scars) is where a class or method's behavior was the subject of a real,
+  root-caused bug — worth reading before you rely on that part of the API in something that matters.
+- Dokka (linked from every module and class page on this site) is the exhaustive signature source
+  of truth — every parameter, every overload, every inherited member.
+
+## Modules
+
+<table>
+  <thead>
+    <tr><th>Module</th><th>Curated reference</th><th>Dokka</th></tr>
+  </thead>
+  <tbody>
+    {KANDRA_MODULES.map((m) => (
+      <tr key={m}>
+        <td><code>{m}</code></td>
+        <td><a href={`/modules/${m}`}>/modules/{m}</a></td>
+        <td><a href={dokkaModuleUrl(m)} target="_blank" rel="noreferrer">Dokka &rarr;</a></td>
+      </tr>
+    ))}
+  </tbody>
+</table>

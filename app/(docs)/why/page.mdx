@@ -1,0 +1,180 @@
+export const metadata = {
+  title: "Why Kandra",
+  description:
+    "The pain of building on Cassandra/ScyllaDB without a library that understands distributed data modeling, and what Kandra does about each pain point.",
+};
+
+# Why Kandra
+
+Every page on this site is written by someone who has personally felt the pain of building on a
+distributed database and is done pretending it's "just SQL with extra steps." Before you read a
+single annotation reference, read this page — it's the argument the rest of the site is built on.
+
+<Callout kind="danger" title="The core claim">
+A distributed, partition-oriented, leaderless database needs distributed thinking, not a
+relational mental model wearing a Kotlin costume. If your first instinct on seeing a new access
+pattern is "how do I do a JOIN," that instinct is wrong here — not inconvenient, wrong — and the
+job of this page is to replace it, not accommodate it.
+</Callout>
+
+Cassandra and ScyllaDB give you horizontal scalability and no single point of failure by giving up
+things a relational database treats as free: joins, foreign keys, ad-hoc `WHERE` clauses on any
+column, and transactions that span arbitrary tables. None of that is a missing feature. It's the
+actual tradeoff that buys you the scalability and availability, and every ORM that hides it from
+you is setting you up to discover it in production, under load, at the worst possible time.
+
+Kandra's position is that hiding the tradeoff is the wrong kind of "developer experience." Good
+developer experience for a distributed database means making the tradeoff *visible* — in the type
+system, in the annotations, in the compile errors — early enough that you make the decision on
+purpose instead of finding out later that you didn't make it at all.
+
+Here is what that looks like, pain point by pain point.
+
+## "Where did my lookup table go out of sync?"
+
+Cassandra has no joins and no foreign keys. Every table is designed around the queries it needs to
+serve — "query-first modeling" — and any "find X by Y" query that isn't servable by the table's
+partition key needs its own table, denormalized, keeping a second copy of (some of) the data,
+indexed by the field you actually want to query on.
+
+In a codebase without a library that treats this as first-class, that second table is maintained
+by hand: every write path that touches the primary table has to remember to also write the lookup
+table, and every one of those write paths is a place a bug can hide. A `save()` that updates
+`users` but fails — or is simply never updated by whoever adds the next field — to update
+`users_by_email` leaves a user who is permanently unfindable by email. Nothing about the code
+*looks* wrong. The primary table is correct. The bug is an absence, and absences don't show up in
+code review.
+
+Kandra's answer is `@LookupIndex`: annotate the field, and the denormalized table's DDL, writes,
+and deletes are generated and kept in sync by the framework, not by the discipline of whoever
+touches that entity next.
+
+```kotlin
+@LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
+val email: String
+```
+
+`LookupConsistency.BATCH` writes the lookup row in the same `LOGGED BATCH` as the primary row —
+atomic, at a latency cost. `LookupConsistency.EVENTUAL` fires the lookup write asynchronously after
+the primary write commits — cheaper, with a real lag window where the lookup table trails the
+primary write. That window isn't self-healing: the async write has no automatic retry, so a failure
+leaves the lookup row wrong until something — a `KandraEventListener.onEventualWriteFailed` hook you
+wire yourself, or a later corrective write — intervenes. That's a decision Kandra makes you make
+per-field, not a default it picks for you silently. Go deeper:
+[`/philosophy/denormalization`](/philosophy/denormalization),
+[`/recipes/lookup-tables`](/recipes/lookup-tables).
+
+## "Why is this DELETE eating my whole partition?"
+
+A relational developer's instinct for "delete by ID" is shaped by tables where the primary key is
+one column. In Cassandra, a table can have a partition key *and* one or more clustering keys, and
+the partition key alone doesn't identify a row — it identifies the whole partition, which can
+contain many rows sorted by the clustering key. `DELETE FROM t WHERE partition_key = ?` on a
+clustering-keyed table doesn't delete "the row with that ID." It deletes every row in that
+partition.
+
+This isn't hypothetical. It's [`ISS-025`](/battle-scars/clustering-keys-and-lookup-tables), a real
+bug found in Kandra's own development: an early delete path built its `WHERE` clause from the
+partition key alone and silently dropped the clustering key, so "delete this one todo" deleted
+every todo the owner had ever created. The fix, and the lesson, is structural: a delete on a
+clustering-keyed entity has to supply the full key shape at the type level, so there's no
+partition-only delete call to reach for by accident.
+
+## "My ORM says it's atomic — but is it really?"
+
+Cassandra's only cross-table atomicity primitive is `LOGGED BATCH`. There is no ambient
+transaction you can wrap arbitrary calls in — no `@Transactional` that quietly makes three
+`save()` calls atomic because they happened to run inside the same method. Without a library that
+makes this explicit, it's easy to write code that *looks* transactional — a few sequential
+`save()` calls — while it actually executes as N independent, non-atomic writes, any of which can
+fail without rolling back the others.
+
+Kandra's `KandraBatchScope` exists specifically to make the atomic path opt-in and visible:
+
+```kotlin
+application.kandra.batch {
+    todoRepo.saveInBatch(todo)
+    todosByAssigneeRepo.saveInBatch(todoByAssignee)
+}
+```
+
+The method names — `saveInBatch`, not `save` — are themselves a scar. Kotlin always resolves a
+same-named repository *member* function over an extension function, even one added by the batch
+scope itself, so a batch-scoped `save()` would have compiled, looked correct, and silently never
+been called inside a batch context. See
+[`/battle-scars/batch-scope-shadowing`](/battle-scars/batch-scope-shadowing) for the full story —
+it's one of the more instructive Kotlin-specific footguns in the whole codebase, and it applies
+anywhere you try to shadow a member function with a same-named extension, not just here.
+
+## "Why does this need ALLOW FILTERING, and why is everyone telling me not to use it?"
+
+Cassandra's query planner will, if you ask it to, run a query that has to scan every partition on
+every node to find matching rows — a scatter-gather query, `ALLOW FILTERING`. It will let you
+write this. It will run fine on your laptop against a handful of rows. It will not run fine on a
+production cluster with real data volume and real request concurrency, and by the time it doesn't,
+it's usually paging someone.
+
+Kandra's query DSL cannot express `ALLOW FILTERING` — there is no method on the query builder that
+produces it, at all. A query against a column that's neither a partition key, a clustering key, nor
+annotated `@SecondaryIndex` throws `KandraQueryException` at query-build time, with a message that
+tells you to add `@SecondaryIndex` (an explicit, WARN-logged scatter-gather you opted into) instead
+of silently degrading into one. That message itself was a bug once —
+[`ISS-021`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-021-allow-filtering-error-message.md)
+had it pointing callers at a nonexistent `allowFiltering()` escape hatch that contradicted the
+DSL's own design. It's fixed now, and the design it describes hasn't changed: there is no
+`ALLOW FILTERING` in Kandra, on purpose.
+
+## "Tombstones are eating my cluster and nobody told me."
+
+A `DELETE` in Cassandra doesn't remove data immediately — it writes a tombstone, a marker that
+says "this is gone," which has to be read past on every query that touches that partition until
+compaction physically removes it after `gc_grace_seconds` (ten days, by default). A workload that
+deletes heavily — a queue, a session store, a todo list where "done" means "gone" — accumulates
+tombstones that make reads on that table progressively slower, and most developers with a
+relational background have never had a reason to think about this at all, because a relational
+`DELETE` really does just delete the row.
+
+Kandra's `@SoftDelete(ttlSeconds, markerProperty)` reframes "delete" as a TTL write on the
+non-key columns instead of a real `DELETE` — the row expires on its own schedule instead of
+generating an immediate tombstone. And for the cases where a real `deleteAll()` is genuinely the
+right call, Kandra doesn't leave you to find out about tombstone accumulation the hard way: it logs
+an explicit `WARN` with the row count when a delete would generate more tombstones than
+`tombstoneWarnThreshold` (default 1000), naming `gc_grace_seconds` in the log line itself. See
+[`/recipes/soft-delete`](/recipes/soft-delete).
+
+## "I need compare-and-set, but LWT is expensive — how do I not pay that cost everywhere?"
+
+Cassandra's Lightweight Transactions give you real compare-and-set — `INSERT ... IF NOT EXISTS`,
+`UPDATE ... IF version = ?` — built on Paxos consensus among replicas. They're genuinely useful for
+optimistic locking and preventing duplicate inserts, and they genuinely cost more latency than a
+plain write, because they require a round of consensus a plain write doesn't. A relational
+developer's instinct, coming from ACID transactions that are just "on" by default, is to reach for
+this kind of safety everywhere, by reflex, without a mental model of what it costs.
+
+Kandra makes the cheap path the default: a plain `save()` is a plain write, no consensus round.
+The expensive path — `@Version` for optimistic locking, `saveIfNotExists` for uniqueness — is
+something you add to an entity deliberately, and once you do, it's visible in the entity
+definition itself, not hidden behind an annotation that quietly changes behavior based on an
+isolation-level setting somewhere else in the codebase. See
+[`/philosophy/consistency`](/philosophy/consistency) and
+[`/recipes/optimistic-locking`](/recipes/optimistic-locking).
+
+## "Why does my read work in dev but throw in production?"
+
+A query's viability depends on data shape and volume in a way a small local dataset hides
+completely. A query that scans a ten-row dev table in a millisecond can be the query that takes a
+production cluster down at real volume — and if the only place that gets checked is "does this
+compile, does this pass in dev," you find out at the worst time, under load, in prod.
+
+Kandra runs schema and query-shape validation when the plugin installs — at application startup —
+not lazily on the first request that happens to hit that code path. A query that would need
+`ALLOW FILTERING` fails the moment the entity graph is registered, before the app finishes booting,
+let alone before it takes traffic. See [`/philosophy/schema-safety`](/philosophy/schema-safety).
+
+---
+
+None of this is about Kandra being clever. It's about the tradeoffs a distributed database makes
+being real, permanent, and not going away because a library papers over them for a demo. The rest
+of this site — [`/foundations`](/foundations) for the mental model, [`/tutorial`](/tutorial) for
+building a real app end to end, [`/battle-scars`](/battle-scars) for the bugs this cost in
+practice — is about learning to think in those tradeoffs instead of around them.

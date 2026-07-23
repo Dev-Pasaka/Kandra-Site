@@ -1,0 +1,83 @@
+import { dokkaModuleUrl } from "@/lib/dokka";
+
+export const metadata = {
+  title: "kandra-bom",
+  description:
+    "The Gradle BOM that pins every Kandra module to the same version — no source, just a version constraint list.",
+};
+
+# kandra-bom
+
+`kandra-bom` is not a library. It has no `src/main/kotlin`, no classes, no annotations — it's a
+Gradle [Java Platform](https://docs.gradle.org/current/userguide/java_platform_plugin.html), a
+single `build.gradle.kts` whose entire content is a list of version constraints:
+
+```kotlin title="kandra-bom/build.gradle.kts"
+plugins {
+    `java-platform`
+}
+
+javaPlatform {
+    allowDependencies()
+}
+
+dependencies {
+    constraints {
+        api("${project.group}:kandra-core:${project.version}")
+        api("${project.group}:kandra-runtime:${project.version}")
+        api("${project.group}:kandra-ktor:${project.version}")
+        api("${project.group}:kandra-kodein:${project.version}")
+        api("${project.group}:kandra-koin:${project.version}")
+        api("${project.group}:kandra-codegen:${project.version}")
+        api("${project.group}:kandra-test:${project.version}")
+        api("${project.group}:kandra-multidc:${project.version}")
+        api("${project.group}:kandra-migrate:${project.version}")
+        api("${project.group}:kandra-jakarta:${project.version}")
+    }
+}
+```
+
+Import it with `platform(...)` and every other `ke.co.coinx.kandra:*` dependency you declare —
+without a version of its own — resolves to whatever version the BOM pins, all in lockstep:
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation(platform("ke.co.coinx.kandra:kandra-bom:0.4.5"))
+
+    implementation("ke.co.coinx.kandra:kandra-ktor")     // no version string
+    implementation("ke.co.coinx.kandra:kandra-koin")     // no version string
+    ksp("ke.co.coinx.kandra:kandra-codegen")              // no version string
+}
+```
+
+## Why this exists as a separate module
+
+Kandra ships as ten independently-versioned artifacts (`kandra-core`, `kandra-runtime`,
+`kandra-ktor`, `kandra-koin`, `kandra-kodein`, `kandra-codegen`, `kandra-test`, `kandra-multidc`,
+`kandra-migrate`, `kandra-jakarta` — see [`/modules`](/modules) for what each one does). A project
+that pulls in several of them by hand has to repeat the version string on every one of them, and
+every repetition is a place a future bump can miss one — a mismatched `kandra-runtime` and
+`kandra-codegen` version is exactly the kind of "compiles, then breaks in a way nothing points you
+at" mismatch a BOM exists to prevent. Publishing the version constraints as their own artifact means
+there's exactly one place a consumer's build file states "which Kandra," not N places that have to
+agree by discipline.
+
+<Callout kind="tip">
+This is the same pattern as Spring Boot's `spring-boot-dependencies` BOM or Jackson's
+`jackson-bom` — a `java-platform` module has no code of its own, only constraints, and Gradle/Maven
+treat it specially: importing it doesn't add a dependency, it only sets version defaults for
+artifacts you separately declare.
+</Callout>
+
+<Callout kind="gotcha" title="The BOM doesn't add any modules to your classpath">
+Importing `kandra-bom` with `implementation(platform(...))` pins versions — it does not pull in
+`kandra-ktor`, `kandra-koin`, or anything else. You still declare each module you actually use,
+without a version string. Forgetting the module declaration and only importing the platform gives
+you a build with no Kandra classes on the classpath at all, no error pointing at why.
+</Callout>
+
+`allowDependencies()` in the plugin block is what lets this platform module itself depend on
+(constrain) other project modules under Gradle's `java-platform` plugin — without it, a Java
+platform is normally not allowed to declare dependencies on non-platform modules at all.
+
+[Full Dokka module reference →]({dokkaModuleUrl("kandra-bom")})

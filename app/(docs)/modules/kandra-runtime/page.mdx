@@ -1,0 +1,585 @@
+import { dokkaClassUrl, dokkaModuleUrl, dokkaPackageUrl } from "@/lib/dokka";
+
+export const metadata = {
+  title: "kandra-runtime",
+  description:
+    "The module that turns a TableSchema into actual DataStax driver calls: KandraRepository/KandraSuspendRepository, BatchEngine, StatementBuilder, the query DSL, codec, and caching.",
+};
+
+# kandra-runtime
+
+`kandra-runtime` is where a `@ScyllaTable` entity and its `TableSchema` (built by `kandra-core`)
+turn into real DataStax driver calls: `KandraRepository<T>` (blocking) and
+`KandraSuspendRepository<T>` (suspend) for CRUD, `BatchEngine` for retry/shutdown/metrics-wrapped
+execution, `StatementBuilder` for CQL construction, a small predicate DSL (`QueryContext`,
+`KandraColumnRef`) for type-safe queries against KSP-generated `*Table` objects, `KandraCodec` for
+Kotlin ⇄ driver type conversion, and an optional Caffeine-backed `KandraCache`. Nothing in this
+module reads annotations — everything here operates on the already-built `TableSchema`.
+
+Package map: `io.kandra.runtime` (`KandraRuntime`, `BatchEngine`, `StatementBuilder`,
+`KandraBatchScope`, config classes), `io.kandra.runtime.repository` (the two repository classes),
+`io.kandra.runtime.dsl` (`QueryContext`, `KandraPredicate`, `KandraColumnRef`, `KandraPage`,
+`KandraRawQuery`), `io.kandra.runtime.codec`, `io.kandra.runtime.cache`, `io.kandra.runtime.driver`
+(suspend `CqlSession` extensions).
+
+## Why this exists as a separate module
+
+`kandra-runtime` is the first module in the dependency graph that pulls in the actual DataStax Java
+driver (`implementation(libs.datastax.driver)`) and coroutines
+(`implementation(libs.coroutines.core)`) — `kandra-core` has neither. A consumer that only wants to
+validate entity shapes or generate DDL offline (a CI check, a schema-diffing tool) can depend on
+`kandra-core` alone and never pull in a network-capable driver at all; anything that actually wants
+to talk to ScyllaDB depends on `kandra-runtime` (`implementation(project(":kandra-core"))` plus the
+driver) to get repositories, and `kandra-ktor`/`kandra-koin`/`kandra-kodein`/`kandra-multidc` all
+depend on `kandra-runtime` in turn. Caffeine is `compileOnly` here, not `implementation` — the
+`@CacheResult` cache is reflection-based specifically so a consumer who never adds
+`com.github.ben-manes.caffeine:caffeine` to their own classpath gets a silent no-op cache instead of
+a hard dependency they didn't ask for (see `KandraCache` below).
+
+## `KandraRuntime` — the entry point
+
+```kotlin
+class KandraRuntime(val session: CqlSession, val batchEngine: BatchEngine, val codec: KandraCodec) {
+    val isShuttingDown: AtomicBoolean   // delegates to batchEngine.isShuttingDown
+    val inFlightCount: AtomicInteger    // delegates to batchEngine.inFlightCount
+
+    @ExperimentalKandraApi suspend fun batch(block: suspend KandraBatchScope.() -> Unit)
+    @ExperimentalKandraApi fun batchBlocking(block: KandraBatchScope.() -> Unit)
+
+    fun <T : Any> repository(entityClass: KClass<T>): KandraRepository<T>
+    fun <T : Any> suspendRepository(entityClass: KClass<T>): KandraSuspendRepository<T>
+    inline fun <reified T : Any> repository(): KandraRepository<T>
+    inline fun <reified T : Any> suspendRepository(): KandraSuspendRepository<T>
+
+    suspend fun isHealthy(): Boolean   // SELECT release_version FROM system.local; false on any exception
+}
+```
+
+`repository()`/`suspendRepository()` call `SchemaRegistry.get(entityClass)` and build a **brand-new**
+repository instance every call — see the Gotchas section for why this matters for hot paths.
+`isHealthy()` never throws, so it's safe to wire directly into a health-check route (`kandra-ktor`
+does exactly this for `GET /kandra/health`).
+
+```kotlin
+routing {
+    get("/users/{id}") {
+        val repo = application.kandra.suspendRepository<User>()
+        val user = repo.findById(UUID.fromString(call.parameters["id"]!!))
+        call.respond(user ?: HttpStatusCode.NotFound)
+    }
+}
+```
+
+## Repository API
+
+`KandraRepository<T>` and `KandraSuspendRepository<T>` expose the identical surface — the suspend
+repository's writes route through `BatchEngine`'s `*Suspend` methods (truly non-blocking
+prepare/execute via `CqlSession.prepareSuspend`/`executeSuspend`), the blocking repository through
+the plain synchronous ones. Both are constructed `(session, schema, entityClass, batchEngine)` and
+build their **own** `StatementBuilder(session)` (its own 1000-entry prepared-statement cache) and
+`KandraCache<Any, T>(schema.cacheConfig)` internally — see Gotchas for why constructing repositories
+per-request instead of once is expensive.
+
+### Save family
+
+```kotlin
+fun save(entity: T, ttlSeconds: Int? = null, timestampMicros: Long? = null, consistency: KandraConsistency? = null)
+fun saveIfNotExists(entity: T, serialConsistency: KandraConsistency = KandraConsistency.LOCAL_SERIAL): Boolean
+fun saveWithNulls(entity: T, ttlSeconds: Int? = null)
+fun saveAll(entities: List<T>, useBatch: Boolean = true)
+```
+
+```kotlin
+userRepo.save(user, ttlSeconds = 3600)
+val created = userRepo.saveIfNotExists(user)              // false if the partition key already exists
+userRepo.saveWithNulls(user.copy(nickname = null))         // tombstones `nickname`
+userRepo.saveAll(users, useBatch = true)                   // chunks at 100 statements by default
+```
+
+- **`save`** — runs any registered validator, stamps `@CreatedAt`/`@UpdatedAt` via reflective
+  `copy()`, sets the initial `@Version` value if present (`1L` for `Long`, `Instant.now()` for
+  `Instant`), then executes one `LOGGED BATCH`: the primary `INSERT` plus one `INSERT` per
+  `@LookupIndex(consistency = BATCH)` table. `EVENTUAL` lookups fire on a background coroutine
+  *after* the batch commits; failures there are logged and forwarded to
+  `KandraEventListener.onEventualWriteFailed` if one is registered. A nullable field set to `null`
+  encodes to `KandraUnset` → the driver's `unset(idx)`, **not** a bound `null` — no tombstone, the
+  existing stored value is left alone. Throws `KandraQueryException` immediately on a counter table.
+- **`saveIfNotExists`** — LWT `INSERT ... IF NOT EXISTS`. Throws up front if `serialConsistency`
+  isn't `LOCAL_SERIAL`/`SERIAL`. Reads the driver's synthetic `[applied]` column; if `false`, returns
+  `false` **without touching lookup tables at all**. If applied, `BATCH` lookups go in a *second*,
+  separate `LOGGED BATCH` — not atomic with the primary insert, so a crash between the two can leave
+  the primary row without its lookup rows.
+- **`saveWithNulls`** — binds `null` directly (`setBytesUnsafe`) instead of `unset()`, which **does**
+  write a tombstone. Does not inject an initial `@Version` value the way `save` does.
+- **`saveAll`** — no-op on an empty list. `useBatch = false` calls `save()` per entity (own atomic
+  batch each, but **skips the validator** — only single `save()` validates). `useBatch = true`
+  (default) builds one flat statement list, estimates size as `statements.size * 512` bytes (a fixed
+  heuristic, not real serialized size) and warns above `batchWarnThresholdKb`; if the count exceeds
+  `batchMaxChunkSize` and `batchAutoChunk` is true, it splits into **multiple independent
+  `LOGGED BATCH`es** — breaking cross-chunk atomicity.
+
+<Callout kind="danger" title="saveAll's auto-chunking breaks cross-chunk atomicity">
+Once statement count exceeds `batchMaxChunkSize` (default 100), a large `saveAll` issues several
+independent `LOGGED BATCH` statements. A failure partway through leaves earlier chunks committed and
+later ones not — `saveAll` is not one atomic operation once it's large enough to chunk.
+</Callout>
+
+### Update family
+
+```kotlin
+fun update(old: T, new: T)
+fun updateForce(entity: T)
+```
+
+```kotlin
+val loaded = userRepo.findById(userId)!!
+val changed = loaded.copy(email = "new@example.com")
+userRepo.update(loaded, changed)     // LWT IF version=? when @Version is present, else a blind overwrite
+```
+
+- **`update(old, new)`** validates `new`. **With a `@Version` column**: reads `old`'s current version
+  via reflection, computes the next value, and issues
+  `UPDATE ... SET ... WHERE pk=? IF <versionCol> = ?` with `LOCAL_SERIAL` (hardcoded, not
+  configurable per-call). A non-applied result throws `KandraOptimisticLockException`. **Without a
+  `@Version` column**, `update()` issues **no CQL `UPDATE` at all** — it does a full-row `INSERT`
+  overwriting every column, with **no concurrency check whatsoever**; `old` is used purely to diff
+  which lookup-table rows to delete/insert against `new`, never compared to what's actually stored.
+- **`updateForce(entity)`** bypasses the `@Version` check entirely, even if one exists — always a
+  full-row overwrite in a batch.
+
+<Callout kind="gotcha" title="updateForce never cleans up a changed lookup-index column">
+`updateForce` has no separate "old" entity to diff against, so it diffs `entity` against itself
+(pre- vs. post-timestamp-injection) — the lookup-index-column-changed check can never fire, because
+both sides of the diff have the identical value. If `email` drives a `@LookupIndex` and you change it
+via `updateForce`, the **old** lookup row for the previous email is never deleted. Only two-argument
+`update(old, new)` correctly diffs a real "before" against a real "after."
+</Callout>
+
+### Delete family
+
+```kotlin
+fun delete(entity: T)
+fun deleteAll(entities: List<T>)
+fun deleteById(vararg keyValues: Any)
+fun deleteBy(block: QueryContext.() -> Unit)
+```
+
+```kotlin
+userRepo.delete(user)                 // hard delete unless @SoftDelete
+userRepo.deleteAll(inactiveUsers)     // N sequential deletes; warns above tombstoneWarnThreshold rows
+userRepo.deleteById(userId)           // full primary key required — partition + clustering columns
+userRepo.deleteBy { UserTable.email eq "x@example.com" }
+```
+
+- **`delete(entity)`** — if `@SoftDelete` with a configured TTL: issues `UPDATE ... USING TTL <ttl>`
+  over every non-transient, non-counter, non-marker column (rewriting the whole row with a fresh
+  TTL), then a separate `UPDATE` writing `true` to the marker column **without** a TTL — the marker
+  must outlive the rest of the row so `findActive()` can still tell it apart from a live row after
+  the other columns expire. **Lookup-table rows are deliberately left alone on a soft delete** — a
+  soft-deleted row still "exists" until its TTL expires, so it has to remain resolvable via its
+  `@LookupIndex` too, exactly like a direct `findById`/`findActive` still sees it. Otherwise (hard
+  delete): one `LOGGED BATCH` of `DELETE FROM <table> WHERE pk=...` plus one `DELETE` per lookup
+  table — this is the only path that removes lookup rows.
+- **`deleteAll(entities)`** — no-op on empty; above `tombstoneWarnThreshold` (default 1000) rows,
+  logs a WARN naming `gc_grace_seconds`. Then calls `delete()` once per entity, **sequentially** — N
+  separate round trips, not one combined batch.
+- **`deleteById(vararg keyValues)`** — must cover the **full** primary key, partition then
+  clustering columns in schema order; passing fewer throws `KandraSchemaException` naming exactly
+  which columns are missing rather than silently scoping to a partial key (see
+  [`ISS-025`](/battle-scars/clustering-keys-and-lookup-tables)). Looks the entity up first
+  (bypassing the entity cache), then deletes it and invalidates the cache entry if found.
+- **`deleteBy(block)`** — resolves one matching entity via the query DSL, then deletes it through
+  `BatchEngine` (so soft-delete and retry apply). No-ops if nothing matches.
+
+<Callout kind="gotcha" title="Blocking deleteById skips retry, shutdown-rejection, and @SoftDelete">
+Blocking `KandraRepository.deleteById()` looks the entity up via `QueryExecutor` first, then — if
+found — issues the delete `LOGGED BATCH` directly via `session.execute`, **bypassing `BatchEngine`
+entirely**: no retry-on-timeout, no shutdown rejection, and it **always hard-deletes**, even on a
+`@SoftDelete`-annotated entity. The suspend version delegates to `batchEngine.deleteSuspend`
+instead, so it *does* honor soft-delete/retry. Both versions do invalidate the `KandraCache` entry
+when the entity was found.
+</Callout>
+
+### Read family
+
+```kotlin
+fun findById(vararg idValues: Any, consistency: KandraConsistency? = null): T?
+fun find(block: QueryContext.() -> Unit): T?
+fun findAll(limit: Int? = null, block: QueryContext.() -> Unit): List<T>
+fun findPage(pageSize: Int, pageToken: String? = null, block: QueryContext.() -> Unit = {}): KandraPage<T>
+fun findActive(): List<T>
+fun exists(block: QueryContext.() -> Unit): Boolean
+fun raw(cql: String, vararg params: Any?): List<Row>
+fun rawQuery(query: KandraRawQuery): List<Row>
+```
+
+```kotlin
+val u = userRepo.findById(userId)                              // cached if @CacheResult
+val one = userRepo.find { UserTable.email eq "a@b.com" }        // fetches all matches, takes the first
+val page = userRepo.findPage(pageSize = 50) { UserTable.status eq "ACTIVE" }
+val next = userRepo.findPage(pageSize = 50, pageToken = page.nextPageToken) { UserTable.status eq "ACTIVE" }
+val active = todoRepo.findActive()                              // requires @SoftDelete(markerProperty = "...")
+```
+
+- **`findById`** — checks the `KandraCache` first (no-op if there's no `@CacheResult` or Caffeine
+  isn't on the classpath); on a miss, queries by the full primary key and populates the cache.
+  `idValues` must cover the full key — a `KandraSchemaException` names what's missing otherwise.
+- **`find(block)`** — `findAll(block).firstOrNull()` under the hood — it still fetches and decodes
+  **every** matching row before taking the first, not a `LIMIT 1`, unless the block itself calls
+  `limit(1)`.
+- **`findAll(limit, block)`** — predicate resolution, in order: (1) throws
+  `KandraQueryException("Query must have at least one predicate.")` on an empty block; (2) an `In`
+  predicate must target a partition key or a `@SecondaryIndex` column, else throws
+  `KandraQueryException` pointing you at `@SecondaryIndex` — `IN` on a composite partition key throws
+  `KandraSchemaException` instead, a different exception type, because that check happens inside
+  `StatementBuilder`; (3) a predicate on a `@LookupIndex` column supports `Eq` only, resolves via the
+  lookup table, then queries the primary table by the full reconstructed key; a lookup miss returns
+  `emptyList()` without touching the primary table; (4) a `@SecondaryIndex` predicate logs a WARN on
+  every call, then falls through to; (5) direct CQL — `WHERE col op ? [AND ...]`, `LIMIT n` if set.
+  **Kandra never appends `ALLOW FILTERING` in this path.**
+- **`findPage`** — driver-native, token-range paging, not offset-based. With no predicate: a full
+  token-range scan (`SELECT * FROM <table>`, no `WHERE`) — the DataStax driver pages across token
+  ranges automatically; this is the sanctioned way to iterate a whole table, and it logs an INFO the
+  first time. With a `@LookupIndex` equality predicate: resolves the lookup row once, then paginates
+  the primary table by the resolved key. `pageToken` is the driver's raw paging state, base64-encoded.
+- **`findActive()`** — requires `@SoftDelete(markerProperty = "...")`, else
+  `KandraSchemaException`. Internally issues `SELECT * FROM <table> WHERE <marker> = false
+  ALLOW FILTERING` and logs a WARN every call, naming the cost.
+- **`exists(block)`** — routes through the same resolution as `findAll` with `limitOne = true,
+  selectKeys = true`, but those flags are only honored on the final direct-CQL branch
+  (`SELECT pk... LIMIT 1`). Via a lookup or `IN` predicate, `exists()` runs the **full** query and
+  just checks non-emptiness — no cheaper than `find()` for those paths.
+- **`raw`/`rawQuery`** — `raw` prepares and binds CQL directly, warning if `params` is empty and the
+  CQL contains a `'` or the literal `"="` (a narrow heuristic, not a security guarantee).
+  `rawQuery(KandraRawQuery.cql("...").bind(...).build())` is always parameterized by construction —
+  prefer it.
+
+<Callout kind="danger" title="findActive() is the one place Kandra issues ALLOW FILTERING">
+Everywhere else on this site says Kandra's query DSL has no way to express `ALLOW FILTERING` — that
+claim is about the `QueryContext`/`findAll` predicate path, and it's still true there.
+`findActive()` is a different, narrower code path: a framework-controlled, single fixed query
+(`WHERE <marker column> = false`) that ScyllaDB genuinely cannot serve without a scan unless the
+marker column has its own `@SecondaryIndex`, so Kandra issues `ALLOW FILTERING` explicitly and logs
+a WARN naming the cost every single call. It is not exposed for you to write your own — you can't
+reach `ALLOW FILTERING` through `QueryContext` no matter what you do — but if you lean on
+`findActive()` on a large table, know exactly what it's doing under the hood. For a large table,
+`@SecondaryIndex` on the marker column (as the WARN suggests) turns this into an indexed query
+instead of a full scan-with-filter.
+</Callout>
+
+### Collection & counter family
+
+```kotlin
+fun <V> append(entity: T, field: KProperty1<T, Collection<V>?>, values: Collection<V>, consistency: KandraConsistency? = null)
+fun <V> remove(entity: T, field: KProperty1<T, Collection<V>?>, values: Collection<V>, consistency: KandraConsistency? = null)
+fun <K, V> put(entity: T, field: KProperty1<T, Map<K, V>?>, entries: Map<K, V>, consistency: KandraConsistency? = null)
+fun increment(field: KProperty1<T, Long?>, partitionKeys: Map<String, Any>, by: Long = 1L, consistency: KandraConsistency? = null)
+fun decrement(field: KProperty1<T, Long?>, partitionKeys: Map<String, Any>, by: Long = 1L, consistency: KandraConsistency? = null)
+```
+
+```kotlin
+userRepo.append(user, User::tags, listOf("vip"))
+userRepo.remove(user, User::tags, listOf("trial"))
+userRepo.put(user, User::metadata, mapOf("theme" to "dark"))
+counterRepo.increment(PageViews::count, mapOf("pageId" to id))          // +1
+counterRepo.decrement(PageViews::count, mapOf("pageId" to id), by = 5)  // -5
+```
+
+`append`/`remove` build `col = col + ?` / `col = col - ?` for CQL `list`/`set` columns. `put` is
+`col = col + ?` too — for a CQL `map`, driver-level `+` is a merge/overwrite-by-key, the correct
+"put" semantics; there's no map-remove-by-key method. `increment`/`decrement` only work on
+`schema.isCounterTable` entities (else `KandraSchemaException`); `partitionKeys` is a
+`Map<String, Any>` keyed by property name (falling back to CQL name) — you don't need to load the
+entity to bump a counter, but a clustering-keyed counter table needs an entry for each clustering
+key too, or `StatementBuilder` throws naming the missing column.
+
+<Callout kind="gotcha" title="These five bypass BatchEngine entirely">
+`append`/`remove`/`put`/`increment`/`decrement` call `session.execute`/`executeSuspend` directly from
+the repository, not through `BatchEngine` — no retry-on-transient-failure, no shutdown rejection, no
+metrics recording, no slow-query logging, and no `KandraCache` invalidation for any of the five.
+</Callout>
+
+## Query DSL — `io.kandra.runtime.dsl`
+
+```kotlin
+sealed class KandraPredicate {
+    data class Eq(val column: String, val value: Any?) : KandraPredicate()
+    data class Gt(val column: String, val value: Any?) : KandraPredicate()
+    data class Gte(val column: String, val value: Any?) : KandraPredicate()
+    data class Lt(val column: String, val value: Any?) : KandraPredicate()
+    data class Lte(val column: String, val value: Any?) : KandraPredicate()
+    data class In(val column: String, val values: List<Any?>) : KandraPredicate()
+}
+
+class KandraColumnRef<T>(val cqlName: String, val isLookup: Boolean = false)
+
+class QueryContext {
+    infix fun <T> KandraColumnRef<T>.eq(value: T)
+    infix fun <T> KandraColumnRef<T>.gt(value: T)
+    infix fun <T> KandraColumnRef<T>.gte(value: T)
+    infix fun <T> KandraColumnRef<T>.lt(value: T)
+    infix fun <T> KandraColumnRef<T>.lte(value: T)
+    infix fun <T> KandraColumnRef<T>.isIn(values: List<T>)
+    fun limit(n: Int)
+}
+
+data class KandraPage<T>(val items: List<T>, val nextPageToken: String?, val hasMore: Boolean)
+interface KandraTable<T>   // marker interface implemented by KSP-generated *Table objects
+
+class KandraRawQuery internal constructor(val cql: String, val params: List<Any?>) {
+    companion object { fun cql(template: String): KandraRawQueryBuilder }
+}
+class KandraRawQueryBuilder(template: String) {
+    fun bind(vararg values: Any?): KandraRawQueryBuilder
+    fun build(): KandraRawQuery
+}
+```
+
+```kotlin
+repository.findAll {
+    UserTable.status eq "ACTIVE"
+    limit(20)
+}
+```
+
+`KandraColumnRef` is what a `kandra-codegen`-generated `*Table` object exposes per column;
+`isLookup` is metadata only — `QueryExecutor` determines lookup-vs-direct routing from
+`schema.lookupTables` at query time regardless of the flag. Predicates are ANDed in the order added;
+there's no `or`. `KandraRawQuery` has no public constructor — always build it with
+`KandraRawQuery.cql("...").bind(...).build()`.
+
+<Callout kind="gotcha" title="The `+` prefix is gone, deliberately, and won't come back">
+Earlier versions required `+UserTable.email.eq(...)` — `eq`/etc. lived on `KandraColumnRef` and
+returned a plain `KandraPredicate` that `QueryContext.unaryPlus()` registered. Forgetting the `+` on
+one predicate out of several compiled cleanly (Kotlin only warns on an unused expression) and
+silently dropped that predicate — with no way to detect it, since the discarded value never reached
+`QueryContext`. `eq`/`gt`/`gte`/`lt`/`lte`/`isIn` are now member extensions on `QueryContext` itself
+— the comparison *is* the registration, so there's no intermediate value left to forget. Don't write
+`+UserTable.x.eq(y)` anywhere in current code; it won't compile.
+</Callout>
+
+## `BatchEngine`
+
+Not meant to be constructed directly — it's what both repositories call into for every write, and
+what `KandraBatchScope` collects statements through. `@InternalKandraApi`.
+
+```kotlin
+class BatchEngine(
+    session: CqlSession,
+    statementBuilder: StatementBuilder,
+    scope: CoroutineScope,
+    eventListener: KandraEventListener? = null,
+    retryConfig: RetryConfig = RetryConfig(),
+    debugConfig: DebugConfig = DebugConfig(),
+    codec: KandraCodec = KandraCodec.default,
+) {
+    val isShuttingDown: AtomicBoolean
+    val inFlightCount: AtomicInteger
+
+    fun setMetrics(recorder: KandraMetrics)
+    fun configureBatchLimits(warnThresholdKb: Int, maxChunkSize: Int, autoChunk: Boolean, tombstoneWarnThreshold: Int = 1000)
+    fun <T : Any> registerValidator(klass: KClass<T>, validator: KandraValidator<T>)
+}
+```
+
+- **Retry** — `executeWithRetry`/`Suspend` wrap every execution. On a `Throwable` whose class is in
+  `retryConfig.retryOn` (default `WriteTimeoutException`, `ReadTimeoutException`,
+  `NoNodeAvailableException`), retries with linear backoff (`min(backoffMillis * (attempt + 1),
+  maxBackoffMillis)`) up to `maxAttempts` (default 3) — `Thread.sleep` on the blocking path,
+  `kotlinx.coroutines.delay` on the suspend path. Anything not in `retryOn` rethrows immediately.
+  After exhausting attempts: `KandraQueryException("Query failed after N attempts", lastError)`.
+- **Shutdown** — every execute call starts with `checkNotShuttingDown()`, throwing
+  `KandraQueryException` if `isShuttingDown` is set; `inFlightCount` increments/decrements around
+  every call, feeding graceful shutdown's drain wait in `kandra-ktor`.
+- **Metrics/slow-query logging** — after a successful execute, if `debugConfig.logSlowQueriesMs > 0`
+  and elapsed time exceeds it, logs a WARN, then calls `metricsRecorder?.record(...)`. Both only on
+  success, never on a retried-then-failed call.
+
+## `StatementBuilder`
+
+Builds every `BoundStatement`. `@InternalKandraApi`.
+
+- A `Collections.synchronizedMap`-wrapped `LinkedHashMap` in access-order mode, capped at `cacheSize`
+  (default 1000, matching `KandraConfig.preparedStatementCacheSize`), caches prepared statements by
+  exact CQL string. Eviction of the LRU entry logs a WARN suggesting a larger cache.
+- **`insertPrimary`** — a `KandraUnset`-encoded value calls `unset(idx)`, **except** for
+  partition/clustering key columns, where an unset key value throws `KandraSchemaException`
+  immediately — key columns can never be left unbound. A plain `INSERT` is `setIdempotent(false)`;
+  `INSERT ... IF NOT EXISTS` is `setIdempotent(true)`.
+- **`insertPrimaryWithNulls`** — identical CQL, but binds actual `null` instead of calling `unset` —
+  this is what makes `saveWithNulls` tombstone instead of leaving the value alone.
+- **`insertLookup`/`deleteLookup`** — simple single-table statements; **neither applies any
+  consistency-level override** — they always use the driver's default consistency, regardless of the
+  entity's `@WriteConsistency` or a per-call `consistency` parameter passed to the repository method.
+- **`selectById`/`selectByPartitionKeyIn`** — apply `resolveReadConsistency`; both idempotent.
+  `selectByPartitionKeyIn` throws `KandraSchemaException` if the partition key isn't single-column.
+- **`appendToCollection`/`removeFromCollection`/`counterUpdate`** — all `setIdempotent(false)`
+  (collection and counter mutations are never safe to blindly retry); all throw
+  `KandraSchemaException` if the named column isn't found in the schema.
+
+## Codec — `io.kandra.runtime.codec.KandraCodec`
+
+```kotlin
+object KandraUnset   // sentinel: "leave this column unchanged," never a bound null
+
+class KandraCodec {
+    @ExperimentalKandraApi fun <T : Any> registerEncoder(klass: KClass<T>, encoder: (T) -> Any?)
+    @ExperimentalKandraApi fun <T : Any> registerDecoder(klass: KClass<T>, decoder: (Row, String) -> T?)
+    fun encode(value: Any?, type: KType): Any?
+    fun decode(row: Row, column: ColumnSchema): Any?
+    companion object { val default: KandraCodec }
+}
+```
+
+`encode(null, type)` returns `KandraUnset` if `type.isMarkedNullable`, else throws
+`KandraQueryException`. Non-null values check custom encoders first, then encode an `Enum` as its
+`.name` `String`; everything else passes through as-is for the driver to handle natively.
+
+<Callout kind="gotcha" title="Collection columns are exempt from the NULL check entirely">
+`decode()` treats `List`/`Set`/`Map` columns specially: Cassandra can't store an empty (non-frozen)
+collection any other way than `NULL`, so a `NULL` collection column always decodes to an empty
+collection — regardless of whether the Kotlin property is declared nullable. This is what makes
+`tags: Set<String> = emptySet()` readable after a round trip. Every other type throws
+`KandraQueryException` on a `NULL` column paired with a non-nullable Kotlin type. Custom codecs are
+per-`KandraCodec`-instance; `KandraCodec.default` is a shared singleton, and both repositories are
+constructed with default params — i.e. always `KandraCodec.default` — so a custom encoder registered
+elsewhere may not be visible unless every repository shares the same codec instance.
+</Callout>
+
+## Caching — `io.kandra.runtime.cache.KandraCache`
+
+```kotlin
+internal class KandraCache<K : Any, V : Any>(config: CacheResultConfig?) {
+    fun getIfPresent(key: K): V?
+    fun put(key: K, value: V)
+    fun invalidate(key: K)
+    val isEnabled: Boolean
+}
+```
+
+Reflection-based: resolves Caffeine's `Cache` interface by `Class.forName` at construction. If
+`config == null` (no `@CacheResult`), Caffeine isn't on the classpath, or reflective method
+resolution fails, the cache silently becomes a no-op (`isEnabled == false`) — no exception, just a
+one-time WARN. Only `findById` reads/writes this cache; `find`/`findAll`/`findPage`/`exists` never
+touch it. Invalidated from `save`, `saveIfNotExists` (only if applied), `saveAll`, `update`,
+`updateForce`, `saveWithNulls`, `delete`, `deleteAll`, and `deleteById` (when the entity was found).
+**Not** invalidated by `deleteBy`, `append`, `remove`, `put`, `increment`, or `decrement`.
+
+<Callout kind="gotcha">
+`deleteBy` routes through `BatchEngine` (so soft-delete/retry apply there) but still skips cache
+invalidation — a cached `findById` result can keep returning a row `deleteBy` just removed, until
+the cache's own TTL expires it.
+</Callout>
+
+## Config classes
+
+```kotlin
+class ConsistencyConfig {
+    var defaultRead: KandraConsistency = KandraConsistency.LOCAL_ONE
+    var defaultWrite: KandraConsistency = KandraConsistency.LOCAL_QUORUM
+    var defaultSerialConsistency: KandraConsistency = KandraConsistency.LOCAL_SERIAL
+}
+
+class DebugConfig {
+    var logQueries: Boolean = false        // CQL template only, never bound values — a PII guard
+    var logSlowQueriesMs: Long = 0L        // 0 = disabled
+    var logBatches: Boolean = false        // checked by save()/saveAll() only, not update()/delete()
+}
+
+class RetryConfig {
+    var maxAttempts: Int = 3
+    var backoffMillis: Long = 100
+    var maxBackoffMillis: Long = 2000
+    var retryOn: Set<KClass<out Throwable>> = setOf(WriteTimeoutException::class, ReadTimeoutException::class, NoNodeAvailableException::class)
+}
+```
+
+These are the same classes `kandra-ktor`'s `retry { }`/`debug { }`/`consistency { }` blocks
+configure — see [`/modules/kandra-ktor`](/modules/kandra-ktor).
+
+## `KandraBatchScope`
+
+```kotlin
+class KandraBatchScope internal constructor(session: CqlSession, batchEngine: BatchEngine) {
+    fun <T : Any> KandraRepository<T>.saveInBatch(entity: T, ttlSeconds: Int? = null)
+    fun <T : Any> KandraSuspendRepository<T>.saveInBatch(entity: T, ttlSeconds: Int? = null)
+    fun <T : Any> KandraRepository<T>.deleteInBatch(entity: T)
+    fun <T : Any> KandraSuspendRepository<T>.deleteInBatch(entity: T)
+    fun <T : Any> KandraSuspendRepository<T>.saveIfNotExistsInBatch(entity: T): Boolean   // always throws
+}
+```
+
+`@ExperimentalKandraApi`. Only reachable via `KandraRuntime.batch { }` (suspend) /
+`batchBlocking { }`. Collects statements from `saveInBatch`/`deleteInBatch` calls — same
+primary-row-plus-`BATCH`-lookup shape as the standalone methods, but `EVENTUAL` lookups are **not**
+included — into one list, then executes them as a single `LOGGED BATCH` on scope exit via a plain
+**blocking** `session.execute(batch)`, even inside the `suspend fun batch { }` variant. No cache
+invalidation happens for entities saved/deleted through a batch scope — batch collection bypasses
+the repositories' own `save`/`delete`, which are what call `cache.invalidate`.
+
+```kotlin
+runtime.batchBlocking {
+    userRepo.saveInBatch(user)
+    walletRepo.saveInBatch(wallet)
+    auditRepo.deleteInBatch(oldAudit)
+}
+```
+
+<Callout kind="danger" title="Named saveInBatch/deleteInBatch on purpose, not save/delete">
+Kotlin always resolves a member function of the receiver over an extension function with the same
+name — even a member-extension declared inside the exact scope you're standing in, which is exactly
+what a same-named `save`/`delete` here would have been. Every repository already has its own real
+`save`/`delete` member, so a same-named batch-scope version would be structurally unreachable
+through normal call syntax, defeating the batch silently with no compiler warning. This is a real
+bug Kandra shipped and fixed — see
+[`/battle-scars/batch-scope-shadowing`](/battle-scars/batch-scope-shadowing) for the full story.
+Distinct names (`saveInBatch`, not `save`) make the wrong call a compile error instead of a silent
+no-atomicity bug. `saveIfNotExistsInBatch` always throws `KandraQueryException` — LWT can't share a
+`LOGGED BATCH` with regular statements, and this is the guard that says so instead of producing a
+batch the driver would reject or mishandle.
+</Callout>
+
+## `CqlSession` extensions — `io.kandra.runtime.driver`
+
+```kotlin
+suspend fun CqlSession.prepareSuspend(cql: String): PreparedStatement
+suspend fun CqlSession.executeSuspend(statement: Statement<*>): AsyncResultSet
+suspend fun CqlSession.executeSuspendAll(statement: Statement<*>): List<Row>   // drains every page
+```
+
+`executeSuspendAll` is the only helper here that fully materializes a multi-page result via
+`fetchNextPage()` — `QueryExecutor`'s `findAll`/`raw`/`rawQuery` paths use it from the suspend side.
+
+## `KandraEntityLogger` — `internal`, `@InternalKandraApi`
+
+```kotlin
+internal object KandraEntityLogger {
+    fun safeToString(entity: Any, schema: TableSchema): String
+}
+```
+
+Reflectively renders `ClassName(prop=value, ...)`, substituting `***` for any property whose
+matching `ColumnSchema.isSensitive` is `true` — a utility for consumers (`kandra-ktor`) that want
+`@Sensitive`-aware safe logging; not automatically wired into any exception message inside
+`kandra-runtime` itself.
+
+## Full API reference
+
+[`kandra-runtime` on Dokka →]({dokkaModuleUrl("kandra-runtime")}) ·
+[`io.kandra.runtime.repository` package →]({dokkaPackageUrl("kandra-runtime", "io.kandra.runtime.repository")}) ·
+[`KandraSuspendRepository` →]({dokkaClassUrl("kandra-runtime", "io.kandra.runtime.repository", "KandraSuspendRepository")}) ·
+[`io.kandra.runtime.dsl` package →]({dokkaPackageUrl("kandra-runtime", "io.kandra.runtime.dsl")})
+
+## Where this shows up elsewhere on this site
+
+- [`/why`](/why#i-need-compare-and-set-but-lwt-is-expensive--how-do-i-not-pay-that-cost-everywhere) —
+  the reasoning behind cheap-by-default writes and opt-in LWT.
+- [`/battle-scars/batch-scope-shadowing`](/battle-scars/batch-scope-shadowing) — the full
+  `saveInBatch`/`deleteInBatch` naming story.
+- [`/battle-scars/clustering-keys-and-lookup-tables`](/battle-scars/clustering-keys-and-lookup-tables) —
+  why `deleteById`/`selectById` require the full primary key.
+- [`/battle-scars/cache-invalidation`](/battle-scars/cache-invalidation) — the `KandraCache` key-shape
+  bug this page's cache section references.
+- [`/recipes/lookup-tables`](/recipes/lookup-tables), [`/recipes/caching`](/recipes/caching),
+  [`/recipes/optimistic-locking`](/recipes/optimistic-locking),
+  [`/recipes/multi-table-writes`](/recipes/multi-table-writes) — task-oriented walkthroughs.

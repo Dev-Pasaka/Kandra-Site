@@ -1,0 +1,195 @@
+export const metadata = {
+  title: "05. Routes",
+  description:
+    "CRUD routes for the todo app — create, list, mark done, delete — with auth deliberately out of scope, and why the 'id' in the URL ends up being the clustering key, not a synthetic todo ID.",
+};
+
+# 05. Routes
+
+[Page 04](/tutorial/04-plugin-install) got the plugin installed and the tables created. This page
+adds the first real HTTP routes: create a todo, list "my todos," mark one done, delete one.
+
+<Callout kind="note" title="Auth is out of scope — on purpose, stated plainly">
+This tutorial does not build authentication or session management. Every route below trusts an
+`X-User-Id` header as a stand-in for "the logged-in user's ID." A real app would derive that from a
+verified session/JWT, not a client-supplied header anyone can forge — that's a real, separate
+problem this tutorial isn't solving, not a corner quietly cut without saying so.
+</Callout>
+
+## Wiring routing and JSON into the app
+
+```kotlin title="Application.kt" {1,2,10-12}
+import io.ktor.serialization.kotlinx.json.*
+import io.ktor.server.plugins.contentnegotiation.*
+import io.ktor.server.routing.*
+import com.example.todos.routes.todoRoutes
+
+fun Application.module() {
+    install(Koin) { /* ... */ }
+    install(Kandra) { /* ... as of page 04 ... */ }
+    kandraKoin()
+
+    install(ContentNegotiation) {
+        json()
+    }
+    routing {
+        todoRoutes()
+    }
+}
+```
+
+## Request/response shapes
+
+```kotlin title="routes/TodoDtos.kt"
+package com.example.todos.routes
+
+import com.example.todos.model.UUIDSerializer
+import kotlinx.serialization.Serializable
+import java.util.UUID
+
+@Serializable
+data class CreateTodoRequest(
+    val title: String,
+    @Serializable(with = UUIDSerializer::class) val assigneeId: UUID? = null,
+)
+
+@Serializable
+data class TodoPage(
+    val items: List<com.example.todos.model.Todo>,
+    val nextPageToken: String?,
+    val hasMore: Boolean,
+)
+```
+
+`KandraPage<T>` (what `findPage` returns) isn't itself a `kotlinx.serialization` type — it's a plain
+Kandra runtime class — so routes map it into this small local DTO before responding, rather than
+trying to serialize it directly.
+
+## The routes
+
+```kotlin title="routes/TodoRoutes.kt"
+package com.example.todos.routes
+
+import com.example.todos.model.Todo
+import io.ktor.http.*
+import io.ktor.server.application.*
+import io.ktor.server.request.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import java.time.Instant
+import java.util.UUID
+
+fun Route.todoRoutes() {
+    val todoRepo = application.kandra.suspendRepository<Todo>()
+
+    post("/todos") {
+        val ownerId = call.ownerIdOrRespondBadRequest() ?: return@post
+        val req = call.receive<CreateTodoRequest>()
+
+        val todo = Todo(
+            ownerId = ownerId,
+            createdAt = Instant.now(),
+            todoId = UUID.randomUUID(),
+            title = req.title,
+            assigneeId = req.assigneeId,
+        )
+        todoRepo.save(todo)
+        call.respond(HttpStatusCode.Created, todo)
+    }
+
+    get("/todos/mine") {
+        val ownerId = call.ownerIdOrRespondBadRequest() ?: return@get
+        val pageSize = call.request.queryParameters["size"]?.toIntOrNull() ?: 20
+        val token = call.request.queryParameters["token"]
+
+        val page = todoRepo.findPage(pageSize, token) { TodoTable.ownerId eq ownerId }
+        call.respond(TodoPage(page.items, page.nextPageToken, page.hasMore))
+    }
+
+    patch("/todos/{id}/done") {
+        val ownerId = call.ownerIdOrRespondBadRequest() ?: return@patch
+        val createdAt = Instant.parse(call.parameters["id"]!!)
+
+        val existing = todoRepo.findById(ownerId, createdAt)
+            ?: return@patch call.respond(HttpStatusCode.NotFound)
+
+        todoRepo.update(existing, existing.copy(done = true))
+        call.respond(existing.copy(done = true))
+    }
+
+    delete("/todos/{id}") {
+        val ownerId = call.ownerIdOrRespondBadRequest() ?: return@delete
+        val createdAt = Instant.parse(call.parameters["id"]!!)
+
+        val existing = todoRepo.findById(ownerId, createdAt)
+            ?: return@delete call.respond(HttpStatusCode.NotFound)
+
+        todoRepo.delete(existing)
+        call.respond(HttpStatusCode.NoContent)
+    }
+}
+
+private suspend fun ApplicationCall.ownerIdOrRespondBadRequest(): UUID? {
+    val raw = request.headers["X-User-Id"]
+    val parsed = raw?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+    if (parsed == null) respond(HttpStatusCode.BadRequest, "Missing or invalid X-User-Id header")
+    return parsed
+}
+```
+
+## `POST /todos` — create
+
+Ordinary `save()` — no `@LookupIndex`, no batch, nothing exotic. `createdAt = Instant.now()` is set
+right here, once, by application code, per [page 03](/tutorial/03-entities)'s resolution: this is the
+value that becomes the row's clustering key, and it's the same value the response body hands back to
+the caller so they can address this exact todo later.
+
+## `GET /todos/mine` — the cheapest read this app has
+
+```kotlin
+todoRepo.findPage(pageSize, token) { TodoTable.ownerId eq ownerId }
+```
+
+A partition-scoped range read with driver-native paging — no `ALLOW FILTERING`, no scatter-gather,
+exactly the query shape `Todo`'s partition/clustering design in
+[page 01](/tutorial/01-modeling) exists to make cheap. Results come back newest-first with zero sort
+logic in this handler, because `@ClusteringKey(order = DESC)` already baked that ordering into the
+table.
+
+## `PATCH /todos/{id}/done` and `DELETE /todos/{id}` — what "`{id}`" actually is
+
+<Callout kind="tip" title="Ties back to page 01: there's no single 'the primary key'">
+`Todo` has no synthetic single-column ID a route could look it up by directly — `todoId` exists (per
+[page 03](/tutorial/03-entities)) but isn't a key or a `@LookupIndex`, so there's no way to find a
+row by `todoId` alone without a full scan Kandra won't build. What actually identifies one todo
+within its owner's partition is the pair `(ownerId, createdAt)` — the owner comes from the
+`X-User-Id` header on every route in this app, and `{id}` in the URL is the ISO-8601
+`createdAt` value, parsed with `Instant.parse(...)`. It reads like a normal REST resource ID; under
+the hood it's literally the clustering key.
+</Callout>
+
+Both handlers do the same two-step: `findById(ownerId, createdAt)` to load the exact row (a single-
+row point lookup, not a scan — `findById` requires the *full* key, partition then clustering, in
+schema order, or it throws rather than guessing), then act on the loaded entity.
+
+**`PATCH /todos/{id}/done`** calls `todoRepo.update(existing, existing.copy(done = true))`. Right
+now, with no `@Version` column on `Todo` yet, `update(old, new)` performs a blind full-row overwrite
+— no concurrency check of any kind. If two requests race to mark the same todo done at nearly the
+same instant, both succeed, and whichever's write lands last simply wins; nothing detects the race.
+That's a real gap, left deliberately unfixed here — [page 07](/tutorial/07-concurrency) adds
+`@Version` to `Todo` and this exact call site starts enforcing a real compare-and-set, with no other
+code in this handler changing.
+
+**`DELETE /todos/{id}`** calls `todoRepo.delete(existing)` — a genuine, permanent `DELETE` right now,
+since `Todo` has no `@SoftDelete` yet. [Page 08](/tutorial/08-soft-delete-and-trash) adds a 7-day
+undo window; this same `delete()` call is what changes behavior once that annotation lands, again
+with no route code changing.
+
+<Callout kind="tip">
+Verify the checkpoint: `POST /todos` with a title, `GET /todos/mine` with the same `X-User-Id`
+should return it, `PATCH /todos/{id}/done` (using the `createdAt` from the create response) should
+flip `done`, and `DELETE /todos/{id}` should make it disappear from `GET /todos/mine`.
+</Callout>
+
+Next: [page 06](/tutorial/06-denormalization) — the app now needs "todos assigned to me," which this
+`Todo` table, partitioned by `ownerId`, cannot serve.

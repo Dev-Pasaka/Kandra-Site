@@ -1,0 +1,70 @@
+export const metadata = {
+  title: "Tutorial",
+  description:
+    "Build a multi-user todo-list Ktor server on Kandra from scratch — every modeling and config decision explained at the moment it's made, not deferred to reference docs.",
+};
+
+# Tutorial: building a todo list on Kandra
+
+Every other page on this site explains one concept at a time. This one builds an actual application
+— a multi-user todo-list Ktor server, `com.example.todos` — sixteen pages, each one a working
+checkpoint you can run against a real (local) ScyllaDB instance before moving to the next. If
+[`/why`](/why) is the argument and [`/foundations`](/foundations) is the mental model, this is where
+you put both to work under a real, if small, product requirement.
+
+<Callout kind="note">
+Read [`/foundations`](/foundations) first if you haven't. This tutorial assumes you already know what
+a partition key physically is — it spends its time on *this app's* decisions, not on re-deriving the
+mental model from scratch.
+</Callout>
+
+## Why a todo list, specifically
+
+A todo list is small enough to hold in your head and boring enough that you won't get distracted by
+the domain — but it still has every shape of problem a real Cassandra application has to solve: a
+per-user partition that needs to sort a specific way, a query that cuts across partitions the
+"natural" table can't serve, a write that has to touch two tables atomically, two people editing the
+same row at once, a delete that needs an undo window, a number that has to stay correct under
+concurrent writers, and a hot read path worth caching. None of that is manufactured to show off a
+Kandra feature — it's what "todo list with more than one user" actually requires once you take it
+seriously, and that's the point: these aren't exotic problems, they're what *any* multi-user CRUD app
+hits on a partition-oriented database, on day one.
+
+Every page below does the modeling or config decision **in the open**, with the relational instinct
+stated first and why it doesn't transfer explained second — not "here's the annotation, trust us."
+
+## The checkpoints
+
+1. [**Modeling, before any code**](/tutorial/01-modeling) — access patterns first, entities second.
+   Where `Todo`'s partition and clustering keys come from, and the one access pattern this design
+   deliberately can't serve yet.
+2. [**Project setup**](/tutorial/02-project-setup) — the full Gradle scaffold, every dependency
+   explained line by line, and a local single-node ScyllaDB via Docker.
+3. [**Entities**](/tutorial/03-entities) — `User` and `Todo`, one annotation at a time, DDL shown
+   next to the code that generates it.
+4. [**Installing the plugin**](/tutorial/04-plugin-install) — the full `install(Kandra) { }` block,
+   every config sub-block explained, and the DI ordering gotcha that throws if you get it backwards.
+5. [**Routes**](/tutorial/05-routes) — create, list, mark done, delete. Auth is explicitly out of
+   scope — a header stands in for a logged-in user, and the page says so plainly.
+6. [**Denormalization: todos assigned to me**](/tutorial/06-denormalization) — the centerpiece. The
+   relational instinct, why it doesn't translate, and a second table kept in sync with a real atomic
+   batch write.
+7. [**Concurrency: optimistic locking**](/tutorial/07-concurrency) — two edits to the same todo at
+   once, `@Version`, and why `User` doesn't get one.
+8. [**Soft delete and undo**](/tutorial/08-soft-delete-and-trash) — a trash you can recover from for
+   seven days, and the real TTL-driven timeline behind it.
+9. [**Counters: completion stats**](/tutorial/09-counters) — a lifetime count that has to be correct
+   under concurrent writers, and why that's not a plain integer column.
+10. [**Caching the hot path**](/tutorial/10-caching) — "my todo list" is read far more than it's
+    written.
+11. [**Observability**](/tutorial/11-observability) — query logging, slow-query warnings, metrics,
+    and the health-check route the plugin registers for you.
+12. [**Testing**](/tutorial/12-testing) — what you can and can't verify without a real cluster.
+13. [**Migrations**](/tutorial/13-migrations) — evolving the schema after `AUTO_CREATE` isn't the
+    right tool anymore.
+14. [**Running it and shipping it**](/tutorial/14-running-and-shipping) — `VALIDATE` schema mode, and
+    the rest of a production-shaped config.
+15. [**What we didn't do, on purpose**](/tutorial/15-what-we-didnt-do) — the corners this tutorial cut
+    and why, so you know what to go build yourself.
+
+Start at [page one](/tutorial/01-modeling) — before any code, on paper.

@@ -1,0 +1,157 @@
+export const metadata = {
+  title: "10. Caching",
+  description:
+    "@CacheResult on Todo, what it actually caches (point lookups by full key, not list queries), and the real invalidation-key-shape gotcha behind ISS-028.",
+};
+
+# 10. Caching
+
+The app is getting real traffic now, and the access-pattern shape is what you'd expect from a todo
+list: far more reads than writes. Every page load re-fetches todos; a given todo is only written
+when it's created, reassigned, marked done, or soft-deleted. That imbalance is exactly what
+`@CacheResult` exists for — but it's worth being precise about *what* it caches before wiring it
+in, because the honest answer is narrower than "caches the todo list."
+
+## What `@CacheResult` actually caches
+
+`KandraCache` — the thing `@CacheResult` turns on — sits in front of exactly one method:
+`findById`. `find`, `findAll`, `findPage`, and `exists` never touch it, at all, regardless of
+whether the entity has `@CacheResult`. That's deliberate, not an oversight: caching a paginated
+range scan safely means caching a token, a page size, and a result set that can change shape as new
+rows are written into the range — a materially harder problem than caching "the row with this
+exact key," which is what `findById` already is.
+
+<Callout kind="note" title="This matters for this app specifically">
+`GET /todos/mine` is built on `findPage` (page 05), scoped by partition key with no clustering-key
+predicate — a range read over "everything this owner has." `@CacheResult` on `Todo` does **not**
+cache that call. What it caches is repeated `findById(ownerId, createdAt)` lookups against one
+specific todo — which this app already does, in the read-before-write step of
+[page 07](/tutorial/07-concurrency)'s `PATCH /todos/{id}/done` handler. If your hot path were
+purely "list my todos" with no repeated single-todo fetches, `@CacheResult` here would do nothing
+useful — know which read pattern you're actually optimizing before reaching for it.
+</Callout>
+
+That's still a real, worthwhile cache for this app: every `done`/assignment/edit flow re-reads the
+one todo it's about to change, often more than once per user session, and those reads are cheap to
+serve from memory instead of a round trip to ScyllaDB.
+
+## Adding it to `Todo`
+
+```kotlin title="model/Todo.kt" {2}
+@ScyllaTable("todos")
+@CacheResult(ttlSeconds = 30, maxSize = 5_000)
+@SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted")
+data class Todo(
+    @PartitionKey val ownerId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
+    val todoId: UUID,
+    val title: String,
+    val assigneeId: UUID?,
+    val done: Boolean = false,
+    @Version val version: Long = 1L,
+    @UpdatedAt val updatedAt: Instant = Instant.EPOCH,
+    val isDeleted: Boolean = false,
+)
+```
+
+`@CacheResult` is its own class-level annotation, independent of `@ScyllaTable` — it just populates
+`TableSchema.cacheConfig`, which `KandraRepository`/`KandraSuspendRepository` read when they build
+their per-repository `KandraCache<Any, Todo>`. `ttlSeconds = 30` is short on purpose: this app's
+todos change often enough (done-toggles, reassignment) that a long TTL would mean serving stale
+data for longer than the invalidation-on-write path already guarantees freshness for — 30 seconds
+is "smooth out repeated reads within one request burst," not "avoid hitting the database."
+
+## The Caffeine dependency is real, not implied
+
+`kandra-runtime` declares Caffeine as `compileOnly` — it's on Kandra's own build classpath to
+compile against, but not pulled into your app transitively. `KandraCache` resolves
+`com.github.benmanes.caffeine.cache.Caffeine` via `Class.forName` at construction time; if it's not
+on your runtime classpath, the cache silently becomes a no-op (`isEnabled = false`, every
+`getIfPresent` returns `null`, every `put`/`invalidate` does nothing) and logs exactly one `WARN`.
+Nothing throws. Nothing else tells you caching quietly isn't happening — the app behaves
+identically, just slower, and the only signal is a log line you have to be looking for.
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("com.github.ben-manes.caffeine:caffeine:3.1.8")
+}
+```
+
+Add that (already implied by [page 02](/tutorial/02-project-setup)'s dependency list if you
+included it there — if you skipped it as "not needed yet," this is the page where it becomes
+needed) and `@CacheResult` does real work. Skip it, and `@CacheResult(ttlSeconds = 30, maxSize =
+5_000)` on the entity compiles and runs fine, just as a permanent no-op.
+
+## `findById` populates it, writes invalidate it — but which writes?
+
+```kotlin
+val todoRepo = application.kandra.suspendRepository<Todo>()
+val todo = todoRepo.findById(ownerId, createdAt)   // cache miss → query → cache.put(key, todo)
+val same = todoRepo.findById(ownerId, createdAt)   // cache hit → no query
+```
+
+Invalidation is wired into `save`, `saveIfNotExists` (only when it actually applied),
+`saveAll`, `update`, `updateForce`, `saveWithNulls`, `delete`, and `deleteAll` — every write path
+this app already uses for `Todo` (`update()` from page 07, `delete()` for the soft-delete flow from
+page 08). It is **not** wired into `deleteById`, `deleteBy`, or any of `append`/`remove`/`put`/
+`increment`/`decrement` — this app doesn't call any of those on `Todo`, so it's not a live gap
+here, but it's worth knowing if you extend the routes later: a hand-rolled `deleteById(ownerId,
+createdAt)` call would soft-delete the row correctly (on the suspend repo) but leave a stale
+`findById` result cached until the 30-second TTL expires on its own.
+
+## The real gotcha: the invalidation key has to match the read key, exactly
+
+This is the load-bearing lesson of this page, and it's a real bug Kandra shipped once
+([`ISS-028`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-028-cache-invalidation-key-mismatch.md)),
+not a hypothetical.
+
+`findById`'s cache key isn't always "the ID." For a single-partition-key entity like `User`, it's a
+bare `UUID`. For `Todo` — partition key **and** clustering key — the full primary key is two
+values, so `findById`'s real cache key is an ordered `List(ownerId, createdAt)`, not `ownerId`
+alone. That distinction is exactly where the bug lived: the invalidation helper used to derive its
+key from `partitionKeyOf(entity)` — partition key only, a bare `ownerId` — while `findById`'s
+actual cache key for the same row was the two-element `List`. A bare `UUID` and a two-element
+`List` are never `equal()`, so every invalidation call for a clustering-keyed cached entity
+silently missed the real cache entry:
+
+<Callout kind="danger" title="Stale read after update — the exact failure mode">
+1. `findById(ownerId, createdAt)` — cache miss, queries ScyllaDB, caches the row under key
+   `[ownerId, createdAt]`.
+2. Someone calls `todoRepo.update(old, new)` to mark it done. The write succeeds. Invalidation runs
+   — but (in the buggy version) it computes the key as bare `ownerId`, which was never the key any
+   entry was stored under. The invalidation call executes, "succeeds," and does nothing.
+3. `findById(ownerId, createdAt)` again — cache **hit**, on the pre-update row. The caller sees
+   `done: false` for up to `ttlSeconds` (30s here) after the update genuinely committed to
+   ScyllaDB. No exception, no log line pointing at the cache — the write looks like it worked, and
+   the very next read looks like it didn't.
+</Callout>
+
+The fix, verified in current `kandra-runtime` source (`KandraRepository.kt`/
+`KandraSuspendRepository.kt`), replaced `partitionKeyOf` with `cacheKeyOf`, which reuses the same
+`keyValuesOf` helper `findById` itself uses to build its lookup key — partition **and** clustering
+columns, same bare-value-vs-`List` shape convention in both places. Invalidation and lookup now
+derive their keys from literally the same code path, so they can't drift apart again by
+construction, not just by discipline. This app is on a version of Kandra with the fix — the
+walkthrough above happened, historically, on the codebase this tutorial is built against, and it's
+already fixed by the time you're reading this. It's included here because the *shape* of the bug
+generalizes past Kandra: if you ever build your own cache on top of any keyed store — a local
+in-memory cache in front of a REST call, a Redis layer over a multi-column key — the invalidation
+key and the lookup key have to be computed by the same function, not two functions that are
+supposed to agree. "Supposed to agree" is exactly how this one drifted.
+
+## Verifying it
+
+```kotlin
+val existing = todoRepo.findById(ownerId, createdAt)!!         // populates cache
+val updated = existing.copy(title = "Buy milk (urgent)")
+todoRepo.update(existing, updated)                              // invalidates the SAME key
+val reread = todoRepo.findById(ownerId, createdAt)!!            // cache miss again, fresh row
+check(reread.title == "Buy milk (urgent)")                      // passes on current Kandra
+```
+
+<VersionNote>Verified against `kandra-runtime` as of Kandra v0.4.5 — `cacheKeyOf` is the live
+invalidation-key implementation.</VersionNote>
+
+Next: [`/tutorial/11-observability`](/tutorial/11-observability) — now that there's a cache, a
+retry policy, and multiple tables in play, it's worth being able to see what the app is actually
+doing under load.

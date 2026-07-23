@@ -1,0 +1,162 @@
+export const metadata = {
+  title: "Consistency",
+  description:
+    "How Kandra resolves a consistency level for every read and write — the exact precedence order, verified against the resolution code — and why LWT isn't the default anywhere.",
+};
+
+# Consistency
+
+[`/foundations`](/foundations#consistency-levels-in-plain-terms) explains what a consistency level
+*is* — how many replicas have to respond before an operation counts as successful, and the real
+latency/availability/freshness trade each level makes. This page is about a narrower question:
+when an entity, a repository call, and the global plugin config all have an opinion about which
+level to use, which one wins, and why.
+
+## The resolution order, verified against source
+
+Kandra resolves a consistency level from exactly three possible sources, in this priority order:
+
+1. **A per-operation parameter** passed directly to the repository method call.
+2. **`@ReadConsistency` / `@WriteConsistency`** on the entity class.
+3. **The global default** — `KandraConfig.consistency.defaultRead` / `defaultWrite`.
+
+The first one present wins; Kandra doesn't merge or average across levels. This isn't inferred from
+documentation — it's the literal resolution function, `kandra-runtime/.../StatementBuilder.kt`:
+
+```kotlin title="StatementBuilder.kt"
+private fun resolveWriteConsistency(schema: TableSchema, override: KandraConsistency?): KandraConsistency {
+    override?.let { return it }
+    schema.entityClass.findAnnotation<WriteConsistency>()?.let { return it.level }
+    return consistencyConfig.defaultWrite
+}
+
+private fun resolveReadConsistency(schema: TableSchema, override: KandraConsistency?): KandraConsistency {
+    override?.let { return it }
+    schema.entityClass.findAnnotation<ReadConsistency>()?.let { return it.level }
+    return consistencyConfig.defaultRead
+}
+```
+
+Every statement-building call in `StatementBuilder` — `save`, `update`, `findById`,
+`selectByPartitionKeyIn`, collection `append`/`remove`, counter `increment`/`decrement` — routes its
+`consistency: KandraConsistency? = null` parameter through one of these two functions before setting
+the statement's consistency level. `override` is exactly the value a repository caller passed in;
+`null` falls through to the annotation, then to the config default. There's no fourth source and no
+per-query-DSL override today — `find { UserTable.email eq email }` resolves the same way as
+`findById`, through the entity's class-level annotation or the global default, with no consistency
+parameter on the query builder itself.
+
+```kotlin
+@ScyllaTable("orders")
+@ReadConsistency(KandraConsistency.QUORUM)
+@WriteConsistency(KandraConsistency.LOCAL_QUORUM)
+data class Order(
+    @PartitionKey val orderId: UUID,
+    val status: String,
+)
+
+// 1. Per-call override wins over the @WriteConsistency(LOCAL_QUORUM) above.
+orderRepo.save(order, consistency = KandraConsistency.QUORUM)
+
+// 2. No override — falls through to @ReadConsistency(QUORUM) on the class.
+orderRepo.findById(orderId)
+
+// 3. A different entity with no annotations at all falls through to the
+//    plugin's global defaults (read = LOCAL_ONE, write = LOCAL_QUORUM).
+userRepo.save(user)
+```
+
+<Callout kind="gotcha" title="The config DSL property names are defaultRead/defaultWrite, not read/write">
+`ConsistencyConfig`'s actual properties are `defaultRead`, `defaultWrite`, and
+`defaultSerialConsistency` — not `read`/`write`. If you've seen `consistency { read = ...; write =
+... }` in older material, that's stale; the class that block configures doesn't have those property
+names.
+
+```kotlin title="Application.kt"
+install(Kandra) {
+    consistency {
+        defaultRead = KandraConsistency.LOCAL_QUORUM   // default: LOCAL_ONE
+        defaultWrite = KandraConsistency.LOCAL_QUORUM  // default: LOCAL_QUORUM
+    }
+}
+```
+</Callout>
+
+## Why the global defaults are asymmetric
+
+Kandra's global default is `read = LOCAL_ONE`, `write = LOCAL_QUORUM` — not the same level on both
+sides, and not a coincidence.
+
+A write at `LOCAL_ONE` is fast but weak: one replica acknowledges, and if that replica is the one
+that happens to fail before the write propagates, you can lose it. A write at `LOCAL_QUORUM` costs
+one extra round of replica coordination but means a majority of the local DC's replicas have the
+data before the write is considered done — durable enough that a single node failure afterward
+can't lose it. Writes are comparatively rare relative to reads in most workloads and the durability
+matters more, so `LOCAL_QUORUM` is the sane default there.
+
+A read at `LOCAL_ONE`, paired with `LOCAL_QUORUM` writes, still gets you a *usually*-consistent
+read — most of the time the one replica you asked has the write, because `LOCAL_QUORUM` already
+landed it on a majority. It's not the same guarantee as `read LOCAL_QUORUM` (there's a real, if
+narrow, window where the one replica you hit hasn't caught up yet), but it's the fast path for the
+much more frequent operation, and the asymmetry is the actual point: pay the coordination cost on
+the side that happens less often and where losing data matters more, and take the fast path on the
+side that happens constantly.
+
+`LOCAL_QUORUM` on both reads and writes gives you the standard "read-your-writes" guarantee within a
+DC (`R + W > N` for a majority-replicated read/write pair) at a real, constant per-read latency cost.
+That's the right choice for data where staleness would be a correctness bug, not just a UX
+annoyance — set it explicitly with `@ReadConsistency(KandraConsistency.LOCAL_QUORUM)` on those
+specific entities rather than raising the global default and paying the cost everywhere.
+
+## The LWT cost, and why it isn't the default anywhere
+
+`LOCAL_SERIAL`/`SERIAL` aren't part of the read/write resolution above — they're the serial
+consistency used specifically for Lightweight Transactions (`@Version` optimistic locking,
+`saveIfNotExists`), and `ConsistencyConfig.defaultSerialConsistency` defaults to `LOCAL_SERIAL`.
+
+<Callout kind="danger" title="LWT is a real cost, not a relational-transaction reflex">
+A plain write in Cassandra is one round trip. An LWT-backed write — `INSERT ... IF NOT EXISTS`,
+`UPDATE ... IF version = ?` — runs a round of Paxos consensus among replicas first, because that's
+the only way to get a real compare-and-set guarantee in a leaderless system: every replica has to
+agree on the current value before anyone's allowed to change it. That consensus round is extra
+network hops and extra replica-side work that a plain write skips entirely. A relational developer's
+instinct — "just wrap it in a transaction, that's what correctness costs" — doesn't transfer, because
+plain Cassandra writes don't carry that cost at all, and LWT is the specific, opt-in exception you
+pay for.
+</Callout>
+
+This is why Kandra never defaults to LWT anywhere in the resolution chain above. A plain `save()` is
+always a plain, non-serial write — no Paxos round, regardless of global config. The expensive path
+is something you add to the entity on purpose:
+
+```kotlin
+@ScyllaTable("wallets")
+data class Wallet(
+    @PartitionKey val walletId: UUID,
+    val balanceCents: Long,
+    @Version val version: Long = 0,
+)
+
+// save() sets the initial version; only update(old, new) enforces the LWT check.
+walletRepo.save(wallet)
+walletRepo.update(old = wallet, new = wallet.copy(balanceCents = wallet.balanceCents - 500))
+// throws KandraOptimisticLockException if `version` no longer matches — updateForce() bypasses it.
+```
+
+`@Version` and `saveIfNotExists` are visible, per-entity, opt-in — never a default you're paying for
+without having decided to. See [`/philosophy/atomicity`](/philosophy/atomicity) for why LWT can't be
+mixed into a `LOGGED BATCH` at all, and [`/recipes/optimistic-locking`](/recipes/optimistic-locking)
+for the full worked pattern.
+
+## What this means day to day
+
+- Reach for the per-call `consistency` parameter for a one-off exception — an admin read that needs
+  `QUORUM` freshness, a bulk import write that's fine at `LOCAL_ONE`. It always wins.
+- Reach for `@ReadConsistency`/`@WriteConsistency` when a specific *table*, not a specific call,
+  needs a different level than the global default — financial balances, anything read-your-writes
+  sensitive.
+- Leave the global default alone unless most of your traffic needs the stronger (or weaker) level;
+  changing it changes every entity that doesn't have its own annotation.
+- Don't reach for `@Version`/`saveIfNotExists` by reflex the way you'd reach for a transaction
+  relationally — they cost a real Paxos round every time. Use them where the correctness property
+  (no duplicate insert, no lost update) is actually required, not as a default safety net.

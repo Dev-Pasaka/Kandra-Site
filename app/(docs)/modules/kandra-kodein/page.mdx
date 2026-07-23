@@ -1,0 +1,172 @@
+import { dokkaClassUrl, dokkaModuleUrl } from "@/lib/dokka";
+
+export const metadata = {
+  title: "kandra-kodein",
+  description:
+    "Application.kandraKodein() and the standalone bindKandraRepository<T> — auto-binding Kandra repositories into a Kodein-DI container, inside or outside the Ktor plugin.",
+};
+
+# kandra-kodein
+
+`kandra-kodein` bridges Kandra's `KandraRepository<T>`/`KandraSuspendRepository<T>` into a
+[Kodein-DI](https://kosi-libs.org/kodein/) container. Unlike `kandra-koin`, it has **two** entry
+points: an auto-binder that wires one repository pair per entity registered with
+`kandra-core`'s `SchemaRegistry` (mirroring `kandraKoin()`), and a manual, type-safe binder for a
+single entity outside the Ktor plugin entirely.
+
+## Why this exists as a separate module
+
+Same reasoning as [`kandra-koin`](/modules/kandra-koin): wiring into a DI container is optional, so
+the Kodein dependency (`implementation(libs.kodein.di)`, `implementation(libs.kodein.ktor)`) lives in
+its own module instead of `kandra-runtime`/`kandra-ktor` pulling in a second DI framework's classes
+whether or not an app uses it. `kandra-kodein` and `kandra-koin` are siblings, not layered on each
+other — pick one, or neither, and only that one's dependency graph is affected.
+
+## `Application.kandraKodein()`
+
+```kotlin
+@Suppress("OPT_IN_USAGE")
+fun Application.kandraKodein()
+```
+
+Iterates `SchemaRegistry.all()` and, for each entity, opens a Kodein `di { }` block and registers two
+`singleton` bindings, **tagged by entity simple name**:
+
+| Binding | Tag |
+|---|---|
+| `KandraRepository<*>` | `"${EntityName}"` |
+| `KandraSuspendRepository<*>` | `"${EntityName}Suspend"` |
+
+Both bindings construct the repository with the plugin's own `CqlSession` and — critically — the
+**same `BatchEngine`** instance as the installed `Kandra` plugin, so DI-resolved repositories share
+the plugin's shutdown-drain guard and in-flight query counter rather than an independent lifecycle.
+
+```kotlin
+import io.kandra.ktor.Kandra
+import io.kandra.kodein.kandraKodein
+import org.kodein.di.instance
+import org.kodein.di.ktor.closestDI
+
+fun Application.module() {
+    install(Kandra) {
+        contactPoints = "localhost:9042"
+        keyspace = "coinx"
+        localDatacenter = "datacenter1"
+        register(User::class, Wallet::class)
+    }
+
+    kandraKodein()   // after install(Kandra) — binds KandraRepository<*>/"User", "Wallet",
+                      // KandraSuspendRepository<*>/"UserSuspend", "WalletSuspend"
+
+    routing {
+        get("/users/{id}") {
+            val di = closestDI()
+            val users by di.instance<KandraSuspendRepository<*>>(tag = "UserSuspend")
+            @Suppress("UNCHECKED_CAST")
+            val repo = users as KandraSuspendRepository<User>
+            val user = repo.findById(call.parameters["id"]!!)
+            call.respond(user ?: HttpStatusCode.NotFound)
+        }
+    }
+}
+```
+
+<Callout kind="gotcha" title="Call order: after install(Kandra); does not require your own di { } first">
+`kandraKodein()` must run after `install(Kandra) { register(...) }` — it reads
+`Application.kandraSession`/`Application.kandra`, both `AttributeKey`s populated inside that block;
+calling it earlier throws (missing attribute). It opens its own `di { }` block internally, so you do
+not need to have called `di { }` yourself first — but the `org.kodein.di.ktor.di` machinery does need
+to be on the classpath and attached to the application (i.e. Kodein-Ktor set up in the usual way).
+</Callout>
+
+<Callout kind="gotcha" title="Tagged and star-projected, not reified — needs an unchecked cast">
+`kandraKodein()`'s bindings are `KandraRepository<*>`/`KandraSuspendRepository<*>` — Kodein has no
+compile-time knowledge of the entity type parameter here, so every resolved instance needs an
+unchecked cast to the concrete `KandraRepository<User>` before you get typed `save`/`update`
+overloads. This is the opposite calling convention from `bindKandraRepository<T>` below — the two
+binders are not interchangeable lookup patterns, and forgetting `Suspend` in the tag
+(`"${EntityName}Suspend"`, not `"${EntityName}SuspendRepository"` or `"Suspend${EntityName}"`) is a
+common typo.
+</Callout>
+
+## `DI.MainBuilder.bindKandraRepository<T>(session, schema, scope)`
+
+```kotlin
+@OptIn(InternalKandraApi::class)
+inline fun <reified T : Any> DI.MainBuilder.bindKandraRepository(
+    session: CqlSession,
+    schema: TableSchema,
+    scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+)
+```
+
+Type-safe, single-entity binder for a **standalone Kodein `DI { }` module built outside the Kandra
+Ktor plugin** entirely — a CLI tool, a batch job, or a test harness that talks to ScyllaDB without
+`install(Kandra)`. It's `inline`/`reified`, so bindings are keyed by the actual generic type
+(`KandraRepository<T>`, `KandraSuspendRepository<T>`) — no tag, no star-projection, no unchecked cast
+needed on resolution:
+
+| Binding | Scope |
+|---|---|
+| `KandraRepository<T>` (untagged, keyed by reified `T`) | `singleton` |
+| `KandraSuspendRepository<T>` (untagged, keyed by reified `T`) | `singleton` |
+
+```kotlin
+import io.kandra.kodein.bindKandraRepository
+import org.kodein.di.DI
+import org.kodein.di.instance
+
+val appDI = DI {
+    bind<CqlSession>() with singleton { buildStandaloneSession() }
+
+    import(DI.Module("kandra") {
+        val session = instance<CqlSession>()
+        SchemaRegistry.register(User::class)
+        val schema = SchemaRegistry.all().first { it.entityClass == User::class }
+        bindKandraRepository<User>(session, schema)
+    })
+}
+
+val userRepo: KandraRepository<User> by appDI.instance()
+val userSuspendRepo: KandraSuspendRepository<User> by appDI.instance()
+```
+
+Internally it builds its **own** `BatchEngine(session, StatementBuilder(session), scope)` — this is
+**not** shared with any Kandra plugin instance, because there isn't one in this usage. It has no
+dependency on `install(Kandra)` at all; you build/obtain the `CqlSession` and `TableSchema` yourself
+(here, via `SchemaRegistry.register(...)` then `SchemaRegistry.all().first { ... }`).
+
+<Callout kind="danger" title="The default scope is never auto-cancelled">
+If `scope` isn't supplied, it defaults to a fresh `SupervisorJob() + Dispatchers.IO` scope that
+Kandra never cancels on your behalf — you own its lifecycle. Failing to cancel it explicitly on
+shutdown leaks eventual (`@LookupIndex(consistency = EVENTUAL)`) write coroutines past process exit.
+Repositories from `kandraKodein()` don't have this problem — they share the plugin's own scope, which
+`kandra-ktor`'s shutdown hook does cancel — but repositories from `bindKandraRepository<T>` do not
+inherit any shutdown-drain behavior configured via `install(Kandra) { shutdown { ... } }`, because
+there's no installed plugin in this usage at all.
+</Callout>
+
+## Gotchas checklist
+
+- `kandraKodein()` bindings are tagged and star-projected; `bindKandraRepository<T>` is untagged and
+  reified. Match the lookup style to how the repository was actually bound — mixing them up is a
+  compile-time type mismatch for the reified case, or a runtime "no binding found" for the tagged
+  case.
+- If an entity class has no `simpleName` (an anonymous class), `kandraKodein()` throws
+  `io.kandra.core.exception.KandraException` — not a realistic scenario for a `@ScyllaTable` entity,
+  but checked anyway.
+- Repositories from `kandraKodein()` share the plugin's `BatchEngine` and its shutdown-drain
+  behavior; repositories from `bindKandraRepository<T>` get their own `BatchEngine` and their own
+  `CoroutineScope`, with no shutdown integration unless you build it yourself.
+
+## Full API reference
+
+[`kandra-kodein` on Dokka →]({dokkaModuleUrl("kandra-kodein")}) ·
+[`bindKandraRepository` →]({dokkaClassUrl("kandra-kodein", "io.kandra.kodein", "KandraKodeinKt")})
+
+## Where this shows up elsewhere on this site
+
+- [`/modules/kandra-koin`](/modules/kandra-koin) — the same auto-binding pattern for Koin, without
+  the standalone reified binder.
+- [`/tutorial/04-plugin-install`](/tutorial/04-plugin-install) — plugin install and DI wiring in a
+  working app.

@@ -1,0 +1,187 @@
+export const metadata = {
+  title: "Recipe: lookup tables",
+  description:
+    "@LookupIndex end to end — the generated table, the write path, and the real tradeoff between LookupConsistency.BATCH and EVENTUAL.",
+};
+
+# Recipe: lookup tables
+
+**Problem:** you have a table modeled correctly for its primary access pattern, and a second,
+completely reasonable query against a column that isn't the partition key — "find the user by
+email," not just by `userId`. Cassandra has no index that makes that free. You need a second table.
+
+This recipe builds one end to end: the entity, the generated DDL, what actually happens on
+`save()`/`update()`/`delete()`, and the real decision between `LookupConsistency.BATCH` and
+`LookupConsistency.EVENTUAL` — verified against `BatchEngine`'s actual write path, not just the
+annotation's doc comment.
+
+## The scenario
+
+A `User` table partitioned by `userId`. Login needs to resolve a user by email, and support wants
+to look up a user by their support ticket reference. Two lookup patterns, two `@LookupIndex` fields:
+
+```kotlin title="User.kt"
+import io.kandra.core.annotations.*
+import java.util.UUID
+
+@ScyllaTable("users")
+data class User(
+    @PartitionKey val userId: UUID,
+    @LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
+    val email: String,
+    @LookupIndex(tableSuffix = "by_ticket_ref", consistency = LookupConsistency.EVENTUAL)
+    val ticketRef: String,
+    val name: String,
+)
+```
+
+<SideBySide leftLabel="Entity" rightLabel="Generated DDL">
+<div>
+
+```kotlin
+@ScyllaTable("users")
+data class User(
+    @PartitionKey val userId: UUID,
+    @LookupIndex(
+        tableSuffix = "by_email",
+        consistency = LookupConsistency.BATCH,
+    )
+    val email: String,
+    val name: String,
+)
+```
+
+</div>
+<div>
+
+```sql
+CREATE TABLE users (
+    user_id uuid PRIMARY KEY,
+    email text,
+    name text
+);
+
+CREATE TABLE users_by_email (
+    email text PRIMARY KEY,
+    user_id uuid
+);
+```
+
+</div>
+</SideBySide>
+
+`users_by_email` carries the index column as its partition key and just enough of the primary
+table's key (partition + any clustering columns, per `ISS-029` — see below) to resolve straight
+back to the row that owns it. Querying it is transparent from the repository's point of view:
+
+```kotlin
+val user = userRepo.find { UserTable.email eq "alice@example.com" }
+```
+
+`find` resolves through `users_by_email` first — a single-partition lookup, not a scan of `users` —
+then fetches the primary row by the full key it got back.
+
+<Callout kind="note" title="Full key, not just partition key">
+A lookup table's generated row carries the primary table's **full** primary key — partition *and*
+clustering columns — not just the partition key. This wasn't always true: `ISS-029` found that
+`@LookupIndex` resolution only ever reconstructed the primary table's partition key from the lookup
+row, which broke completely for any clustering-keyed entity once `findById` started requiring the
+full key (`ISS-025`). Fixed in `0.4.4`. If you're on an older AUTO_CREATE keyspace, the lookup
+table's DDL is missing those columns — you need `AUTO_MIGRATE` or a fresh keyspace, since
+`AUTO_CREATE` never alters an existing table.
+</Callout>
+
+## What `save()` actually does
+
+`BatchEngine.save()` (and its suspend counterpart) partitions an entity's `@LookupIndex` fields by
+consistency, up front:
+
+```kotlin
+val (batchLookups, eventualLookups) = schema.lookupTables.partition { it.consistency == LookupConsistency.BATCH }
+```
+
+The `BATCH` lookups go into the *same* `LOGGED BATCH` as the primary row's `INSERT` — one atomic
+statement, at the network/coordination cost of a multi-table logged batch. The `EVENTUAL` lookups
+are handed to `fireEventual()`, which does this:
+
+```kotlin title="BatchEngine.kt"
+private fun fireEventual(eventualLookups: List<LookupTableSchema>, entity: Any) {
+    if (eventualLookups.isEmpty()) return
+    scope.launch {
+        eventualLookups.forEach { lookup ->
+            runCatching { session.execute(statementBuilder.insertLookup(lookup, entity)) }
+                .onFailure { err ->
+                    logger.error(err) { "EVENTUAL lookup insert failed for ${lookup.tableName}" }
+                    eventListener?.onEventualWriteFailed(lookup.tableName, entity, err)
+                }
+        }
+    }
+}
+```
+
+That's a real `kotlinx.coroutines.CoroutineScope.launch` — fire-and-forget, on a scope owned by
+`BatchEngine`, not the caller's request coroutine. `save()` returns to the caller as soon as the
+primary row's batch commits; the `users_by_ticket_ref` write happens on its own schedule afterward.
+If it fails, nothing propagates back to the caller — it's logged, and forwarded to
+`KandraEventListener.onEventualWriteFailed` if you've registered one (`@ExperimentalKandraApi`).
+There is no retry beyond `BatchEngine`'s normal `RetryConfig` for that single statement.
+
+<Callout kind="gotcha" title="EVENTUAL means a real, unbounded-until-observed window">
+Between the primary write committing and the eventual lookup write landing, `email`/`ticketRef`
+lookups against the *old* value (if this was an update) or a miss (if this was an insert) are both
+real possibilities — not a theoretical edge case. If a caller does `save(user)` then immediately
+`find { UserTable.ticketRef eq newRef }` in the same request, on a bad day that lookup misses. If
+your access pattern needs "read your own write" on the lookup path, use `BATCH`, not `EVENTUAL`,
+for that field — no amount of retrying the read fixes an inherently async write.
+</Callout>
+
+## `update()` and `delete()`: the same split, plus a diff
+
+`update(old, new)` diffs the lookup index column between `old` and `new` — if it changed, it
+deletes the old lookup row and inserts the new one; if unchanged, it just re-inserts (idempotent).
+The diff itself goes into the same `BATCH`-vs-`EVENTUAL` split as `save()`:
+
+```kotlin
+schema.lookupTables.forEach { lookup ->
+    val oldVal = oldProps[lookup.indexColumn.propertyName]?.call(old)
+    val newVal = newProps[lookup.indexColumn.propertyName]?.call(new)
+    val target = if (lookup.consistency == LookupConsistency.BATCH) batchStmts else eventualStmts
+    if (oldVal != newVal && oldVal != null) target.add(statementBuilder.deleteLookup(lookup, oldVal))
+    if (newVal != null) target.add(statementBuilder.insertLookup(lookup, new))
+}
+```
+
+So an `EVENTUAL` field's rename is *two* eventual statements (delete old, insert new) fired
+together — meaning there's a real window where the old lookup value is still resolvable, the new
+one isn't yet, and (briefly) neither, depending on execution order. `delete(entity)` on a
+hard-deleted entity removes every lookup row, `BATCH` or `EVENTUAL`, in the same primary-row batch
+— lookups don't get to lag behind a hard delete the way they can lag behind an insert/update. (For
+`@SoftDelete` entities specifically, lookup rows are deliberately *not* touched at all — see
+[`/recipes/soft-delete`](/recipes/soft-delete).)
+
+## `BATCH` vs `EVENTUAL`: when to use which
+
+| | `LookupConsistency.BATCH` | `LookupConsistency.EVENTUAL` |
+|---|---|---|
+| Atomicity with primary write | Same `LOGGED BATCH` — atomic | None — fire-and-forget after commit |
+| Latency cost on the write path | Higher (multi-table logged batch, cross-partition) | Primary write returns before the lookup lands |
+| Read-your-own-write on the lookup | Guaranteed | Not guaranteed — real, unbounded lag window |
+| Failure visibility | Write fails if the batch fails | Silent unless you register a `KandraEventListener` |
+| Right for... | Login-critical lookups (`email`), uniqueness-adjacent fields, anything a request immediately re-reads by | High-write-volume secondary lookups where a few seconds of staleness is fine — audit/support lookups, analytics-adjacent indexes |
+
+`email` above is `BATCH` because a signup flow that immediately logs the new user in by email can't
+tolerate a miss. `ticketRef` is `EVENTUAL` because support lookups aren't issued in the same request
+as the write that set the ticket reference, and paying full logged-batch latency on every user write
+for a field almost nobody reads right after writing it is the wrong tradeoff.
+
+<Callout kind="tip">
+This is a per-field decision, not a per-table one — a single entity can mix `BATCH` and `EVENTUAL`
+lookups, as `User` does above. Make the call per lookup based on whether *anything* in your app
+reads that lookup back immediately after the write that touches it.
+</Callout>
+
+See [`/foundations`](/foundations#why-there-are-no-joins-no-foreign-keys) for why denormalized
+lookup tables are the normal way to model this at all, and
+[`/philosophy/denormalization`](/philosophy/denormalization) for the deeper argument. For the
+fully worked tutorial version of this pattern, see
+[`/tutorial/06-denormalization`](/tutorial/06-denormalization).

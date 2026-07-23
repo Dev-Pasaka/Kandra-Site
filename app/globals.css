@@ -1,26 +1,342 @@
 @import "tailwindcss";
 
+/* ---------------------------------------------------------------------- */
+/* Design tokens. Warm paper/ink neutrals, one restrained accent (copper),*/
+/* hairline borders instead of shadow/glow.                                */
+/* ---------------------------------------------------------------------- */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --paper: #f7f4ec;
+  --paper-raised: #efe9db;
+  --paper-sunken: #eee7d4;
+  --ink: #1c1912;
+  --ink-muted: #625c4c;
+  --ink-faint: #8b8471;
+  --border: #ddd4bd;
+  --border-strong: #c9bd9c;
+
+  --accent: #b5551e;
+  --accent-strong: #9a4517;
+  --accent-ink: #fff8ef;
+  --accent-soft: #f0dcc4;
+
+  --note: #3e5c73;
+  --note-soft: #dfe7ec;
+  --tip: #3f6b4a;
+  --tip-soft: #dfeadf;
+  --danger: #a23b2e;
+  --danger-soft: #f3ddd6;
+  --gotcha: #8a5a12;
+  --gotcha-soft: #f1e2c4;
+
+  --code-bg: #fbf9f3;
+  --radius-sm: 3px;
+  --radius: 6px;
+  --radius-lg: 10px;
+}
+
+:root[data-theme="dark"] {
+  --paper: #17140e;
+  --paper-raised: #201c14;
+  --paper-sunken: #100e09;
+  --ink: #ece5d4;
+  --ink-muted: #a89d84;
+  --ink-faint: #746b57;
+  --border: #362f22;
+  --border-strong: #4a4230;
+
+  --accent: #e08a3e;
+  --accent-strong: #f0a35f;
+  --accent-ink: #1b1409;
+  --accent-soft: #3a2917;
+
+  --note: #7fa6c4;
+  --note-soft: #22303a;
+  --tip: #83c092;
+  --tip-soft: #223428;
+  --danger: #e08a75;
+  --danger-soft: #3a241f;
+  --gotcha: #e0b563;
+  --gotcha-soft: #3a2c14;
+
+  --code-bg: #100e09;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-paper: var(--paper);
+  --color-paper-raised: var(--paper-raised);
+  --color-paper-sunken: var(--paper-sunken);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+
+  --color-note: var(--note);
+  --color-note-soft: var(--note-soft);
+  --color-tip: var(--tip);
+  --color-tip-soft: var(--tip-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-gotcha: var(--gotcha);
+  --color-gotcha-soft: var(--gotcha-soft);
+
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-plex-mono);
+  --font-display: var(--font-plex-condensed);
+
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius);
+  --radius-lg: var(--radius-lg);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  border-color: var(--border);
+}
+
+html {
+  color-scheme: light;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+/* Focus rings: visible, square-ish, no glow */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Prose (MDX content)                                                     */
+/* ---------------------------------------------------------------------- */
+
+.kandra-prose {
+  max-width: 72ch;
+  line-height: 1.7;
+}
+
+.kandra-prose > * + * {
+  margin-top: 1.25em;
+}
+
+.kandra-prose h1,
+.kandra-prose h2,
+.kandra-prose h3,
+.kandra-prose h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  scroll-margin-top: 6rem;
+}
+
+.kandra-prose h2 {
+  font-size: 1.5rem;
+  margin-top: 2.75em;
+  padding-top: 0.75em;
+  border-top: 1px solid var(--border);
+}
+
+.kandra-prose h3 {
+  font-size: 1.2rem;
+  margin-top: 2em;
+}
+
+.kandra-prose h4 {
+  font-size: 1.02rem;
+  margin-top: 1.75em;
+}
+
+.kandra-prose a {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+
+.kandra-prose a:hover {
+  text-decoration-color: currentColor;
+}
+
+.kandra-prose strong {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.kandra-prose code:not([data-block-code]) {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  background: var(--paper-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.1em 0.4em;
+}
+
+.kandra-prose ul,
+.kandra-prose ol {
+  padding-left: 1.4em;
+}
+
+.kandra-prose ul {
+  list-style: none;
+}
+
+.kandra-prose ul > li {
+  position: relative;
+}
+
+.kandra-prose ul > li::before {
+  content: "";
+  position: absolute;
+  left: -1.1em;
+  top: 0.72em;
+  width: 5px;
+  height: 5px;
+  background: var(--accent);
+  border-radius: 1px;
+}
+
+.kandra-prose ol {
+  list-style: decimal;
+}
+
+.kandra-prose ol > li::marker {
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+
+.kandra-prose li + li {
+  margin-top: 0.5em;
+}
+
+.kandra-prose blockquote {
+  border-left: 2px solid var(--border-strong);
+  padding-left: 1em;
+  color: var(--ink-muted);
+  font-style: italic;
+}
+
+.kandra-prose hr {
+  border: none;
+  border-top: 1px solid var(--border);
+}
+
+.kandra-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92em;
+}
+
+.kandra-prose th {
+  text-align: left;
+  font-family: var(--font-display);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border-strong);
+  padding: 0.5em 0.75em;
+}
+
+.kandra-prose td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  vertical-align: top;
+}
+
+.kandra-prose img {
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Code blocks (rehype-pretty-code / shiki dual theme)                     */
+/* ---------------------------------------------------------------------- */
+
+.kandra-codeblock {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  font-size: 0.86rem;
+}
+
+.kandra-codeblock pre {
+  overflow-x: auto;
+  padding: 1rem 0;
+  margin: 0;
+}
+
+.kandra-codeblock code {
+  font-family: var(--font-mono);
+  display: grid;
+  counter-reset: line;
+}
+
+.kandra-codeblock code[data-line-numbers] > [data-line]::before {
+  counter-increment: line;
+  content: counter(line);
+  display: inline-block;
+  width: 1.75rem;
+  margin-right: 1rem;
+  text-align: right;
+  color: var(--ink-faint);
+  user-select: none;
+}
+
+.kandra-codeblock [data-line] {
+  padding: 0 1.25rem;
+  border-left: 2px solid transparent;
+}
+
+.kandra-codeblock [data-highlighted-line] {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-left: 2px solid var(--accent);
+}
+
+.kandra-codeblock [data-highlighted-chars] {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 2px;
+  padding: 0.05em 0.15em;
+}
+
+.kandra-codeblock code[data-theme] span {
+  color: var(--shiki-light);
+}
+
+html[data-theme="dark"] .kandra-codeblock code[data-theme] span {
+  color: var(--shiki-dark);
+}
+
+.kandra-codeblock::-webkit-scrollbar,
+.kandra-codeblock pre::-webkit-scrollbar {
+  height: 8px;
+}
+
+.kandra-codeblock::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }

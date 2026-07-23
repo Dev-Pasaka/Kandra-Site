@@ -1,0 +1,217 @@
+export const metadata = {
+  title: "Recipe: multi-DC deployment",
+  description:
+    "A real multi-DC KandraConfig walkthrough — load balancing, DC failover, speculative execution, and the consistency-level resolution order, using kandra-multidc.",
+};
+
+# Recipe: multi-DC deployment
+
+**Problem:** your ScyllaDB cluster spans more than one datacenter, and you need to decide, concretely,
+how reads/writes behave when the local DC is healthy, how they behave when it isn't, and what
+uniqueness guarantees actually hold across DCs. This is a config walkthrough, not a new API surface —
+the honest first thing to know is that `kandra-multidc` itself is a very small module, and almost
+everything you'll configure lives in `kandra-ktor`.
+
+<Callout kind="note" title="What kandra-multidc actually is">
+Its entire source is one `object` with one function: `KandraMultiDc.describe(config: KandraConfig):
+String`, a startup-logging helper that formats the multi-DC-relevant fields of your `KandraConfig`
+into a human-readable string. It contributes no config DSL, no load-balancing policy, no failover
+logic — all of that already lives in `kandra-ktor`'s `KandraConfig` and is active whether or not
+`kandra-multidc` is on your classpath at all. Adding the dependency buys you exactly
+`KandraMultiDc.describe()`, nothing more. Don't look for classes like `MultiDcPolicy` or
+`DcAwareRouter` — they don't exist.
+</Callout>
+
+## The scenario
+
+Two datacenters, `us-east-1` (primary/local) and `eu-west-1` (secondary), active-active, with
+failover into the remote DC if the local one goes down, and speculative execution to cut p99 read
+latency.
+
+```kotlin title="Application.kt"
+import io.kandra.ktor.*
+import io.kandra.core.KandraConsistency
+import io.kandra.multidc.KandraMultiDc
+
+fun Application.configureDatabase() {
+    install(Kandra) {
+        localDatacenter = "us-east-1"
+        keyspace = "app"
+
+        consistency {
+            defaultRead = KandraConsistency.LOCAL_QUORUM
+            defaultWrite = KandraConsistency.EACH_QUORUM
+            defaultSerialConsistency = KandraConsistency.LOCAL_SERIAL
+        }
+
+        loadBalancing {
+            tokenAware = true
+            dcAwareFailover = true
+            allowedRemoteDcs = listOf("eu-west-1")
+        }
+
+        failover {
+            onLocalDcUnavailable = FailoverPolicy.RETRY_REMOTE_DC
+        }
+
+        speculativeExecution {
+            enabled = true
+            delayMillis = 100
+            maxAttempts = 2
+        }
+
+        register(User::class)
+
+        // `this` here is the KandraConfig being built — log it once, after every
+        // multi-DC-relevant field above is set, so the startup log reflects reality.
+        log.info(KandraMultiDc.describe(this))
+    }
+}
+```
+
+Logged at startup:
+
+```
+Kandra Multi-DC Configuration:
+  Local DC: us-east-1
+  Read consistency: LOCAL_QUORUM
+  Write consistency: EACH_QUORUM
+  Serial consistency: LOCAL_SERIAL
+  Token-aware LB: true
+  DC failover: enabled → [eu-west-1]
+  Speculative execution: 100ms delay, 2 max attempts
+  Failover policy: RETRY_REMOTE_DC
+```
+
+<Callout kind="gotcha" title="describe()'s KDoc says it validates — it doesn't">
+The KDoc on `KandraMultiDc.describe()` calls it "Validates a multi-DC configuration." The actual
+implementation performs **no validation whatsoever** — no check that `allowedRemoteDcs` is non-empty
+when `dcAwareFailover = true`, no reachability check, no exceptions. It's `buildString { appendLine(...) }`,
+pure formatting, no I/O, no side effects of its own — you have to call your own logger with the
+result, as above. Don't rely on it to catch a misconfigured `dcAwareFailover = true` with an empty
+`allowedRemoteDcs` — that combination is a silent no-op (failover is "on" but has nowhere to go), and
+`describe()` will happily print it without complaint.
+</Callout>
+
+<Callout kind="note" title="A minor formatting quirk worth knowing before you parse this output">
+Six lines always print — header, Local DC, the three consistency lines, Token-aware LB — and,
+separately, the trailing **Failover policy** line *also* always prints, even at its default `THROW`
+with nothing multi-DC configured at all. That line isn't gated the same way the "DC failover" and
+"Speculative execution" lines above it are (those two are genuinely conditional, appearing only when
+`dcAwareFailover`/`speculativeExecution.enabled` are `true`). Don't assume every line in the output
+implies that feature is actively "on" — the Failover policy line is unconditional.
+</Callout>
+
+## The two knobs that must be set together
+
+`dcAwareFailover = true` on `loadBalancing { }` only makes remote replicas **visible** to the driver.
+It does not, by itself, cause a retry into them. `failover { onLocalDcUnavailable = ... }` is the
+separate knob that actually triggers the retry:
+
+```kotlin
+loadBalancing {
+    dcAwareFailover = true
+    allowedRemoteDcs = listOf("eu-west-1", "ap-southeast-1")
+}
+failover {
+    onLocalDcUnavailable = FailoverPolicy.RETRY_REMOTE_DC   // the default is THROW
+}
+```
+
+<Callout kind="danger" title="Left at the default, a local-DC outage still throws — even with remote DCs listed">
+`FailoverConfig.onLocalDcUnavailable` defaults to `FailoverPolicy.THROW`. Set `dcAwareFailover =
+true` and populate `allowedRemoteDcs` without also setting `onLocalDcUnavailable =
+FailoverPolicy.RETRY_REMOTE_DC`, and a local-DC outage still throws
+`com.datastax.oss.driver.api.core.NoNodeAvailableException` immediately — no automatic cross-DC
+retry happens, despite the remote DCs being configured and visible. This is a real, easy
+half-configuration: it's natural to set the DCs you'd fail over to and assume that's the whole
+story. It isn't — both knobs are required, and the source doesn't enforce that at the type level.
+</Callout>
+
+## Consistency: the resolution order, and why write/read defaults differ
+
+Every consistency decision resolves through the same three-level chain, checked in this order:
+
+1. **Per-operation parameter** — `repo.save(entity, consistency = ...)`,
+   `repo.saveIfNotExists(entity, serialConsistency = ...)`.
+2. **`@ReadConsistency`/`@WriteConsistency`** on the entity class.
+3. **`ConsistencyConfig` default** — the `consistency { }` block above.
+
+```kotlin
+@WriteConsistency(KandraConsistency.EACH_QUORUM)   // priority 2
+@ScyllaTable("balances")
+data class Balance(@PartitionKey val id: UUID, val amount: BigDecimal)
+
+install(Kandra) {
+    consistency { defaultWrite = KandraConsistency.LOCAL_QUORUM }   // priority 3, overridden above
+}
+
+balanceRepo.save(balance)                                          // EACH_QUORUM — class annotation wins
+balanceRepo.save(balance, consistency = KandraConsistency.QUORUM)  // QUORUM — per-call wins over both
+```
+
+| Scenario | `defaultRead` | `defaultWrite` | `defaultSerialConsistency` |
+|---|---|---|---|
+| Single DC (library default) | `LOCAL_ONE` | `LOCAL_QUORUM` | `LOCAL_SERIAL` |
+| Multi-DC active-active | `LOCAL_QUORUM` | `EACH_QUORUM` | `LOCAL_SERIAL` (region-scoped) or `SERIAL` (global) |
+| Strong global | `QUORUM` | `QUORUM` | `SERIAL` |
+
+For multi-DC active-active: bump reads to `LOCAL_QUORUM` (avoids reading stale data off a lagging
+local replica) and writes to `EACH_QUORUM` (every DC must acknowledge, so no DC that hasn't caught up
+can serve a stale `LOCAL_QUORUM` read afterward). This is real cross-DC round-trip latency on every
+write — the deliberate cost of an active-active guarantee, not an accident of the defaults.
+
+<Callout kind="danger" title="LOCAL_SERIAL vs SERIAL — the recurring multi-DC footgun">
+`saveIfNotExists` defaults to `serialConsistency = KandraConsistency.LOCAL_SERIAL`, which only
+guarantees uniqueness **within the local DC**. In a multi-DC deployment, a second DC can
+independently accept a conflicting "unique" row unless you explicitly pass
+`serialConsistency = KandraConsistency.SERIAL`:
+
+```kotlin
+// Global username uniqueness — Paxos consensus across ALL DCs, not just local
+val registered = userRepo.saveIfNotExists(user, serialConsistency = KandraConsistency.SERIAL)
+```
+
+If your uniqueness constraint is naturally per-region (e.g. a wallet only needs to be unique within
+its home DC), `LOCAL_SERIAL` is correct and cheaper. If it must be globally unique — usernames,
+emails — `LOCAL_SERIAL` silently does not enforce that across DCs, and this is exactly the kind of
+bug that only shows up once you actually have two DCs both accepting writes.
+</Callout>
+
+## `@ReadConsistency`/`@WriteConsistency` are table-level, not column-level
+
+Both annotations target the entity class only — one consistency override per table:
+
+```kotlin
+@ReadConsistency(KandraConsistency.LOCAL_QUORUM)
+@WriteConsistency(KandraConsistency.EACH_QUORUM)
+@ScyllaTable("critical_balances")
+data class Balance(@PartitionKey val walletId: UUID, val amount: BigDecimal)
+```
+
+If you need finer control than "reads for this whole table," the per-call `consistency` parameter on
+the repository method is the only lever finer than table-level — there's no per-column variant.
+
+## Speculative execution: only helps idempotent statements
+
+```kotlin
+speculativeExecution {
+    enabled = true
+    delayMillis = 100
+    maxAttempts = 2
+}
+```
+
+Fires a second request against a different replica if the first hasn't returned within `delayMillis`
+— reduces p99 tail latency on reads. Per the module's own doc comment, Kandra automatically marks
+plain `INSERT`, collection mutations, and counter updates `isIdempotent = false` — the driver skips
+speculative execution for those regardless of this config, since a speculative retry of a
+non-idempotent write could double-apply it. See
+[`/recipes/counters`](/recipes/counters#increment-decrement--not-save) for the counter-specific
+version of this.
+
+For the full `KandraConsistency` enum and the underlying reasoning behind Kandra's asymmetric
+read/write defaults, see
+[`/foundations`](/foundations#consistency-levels-in-plain-terms) and
+[`/philosophy/consistency`](/philosophy/consistency). For the `kandra-multidc` module's own reference,
+see [`/modules/kandra-multidc`](/modules/kandra-multidc).

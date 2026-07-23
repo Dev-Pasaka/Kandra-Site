@@ -1,0 +1,805 @@
+import { dokkaClassUrl, dokkaModuleUrl, dokkaPackageUrl } from "@/lib/dokka";
+
+export const metadata = {
+  title: "kandra-core",
+  description:
+    "The annotation, schema, and exception layer Kandra is built on — @ScyllaTable and friends, the DDL generator, KandraConsistency, and every exception type. No Ktor, no CQL session, no network I/O.",
+};
+
+# kandra-core
+
+`kandra-core` is the foundation every other Kandra module sits on: the `@ScyllaTable` annotation
+family, the immutable `TableSchema` model a class's annotations get reflected into, the CQL DDL
+generator built from that model, and every exception type and pluggable interface
+(`KandraAuthProvider`, `KandraMetrics`, `KandraEventListener`, `KandraValidator`) the rest of Kandra
+consumes. It does exactly one kind of work — turning annotated Kotlin classes into a validated
+schema description, and that schema into CQL — using nothing but plain `kotlin.reflect`. No Ktor, no
+CQL session, no network I/O, no KSP. Packages: `io.kandra.core` (top-level types),
+`io.kandra.core.annotations`, `io.kandra.core.exception`, `io.kandra.core.schema`.
+
+## Why this exists as a separate module
+
+Every other Kandra module — `kandra-runtime`, `kandra-ktor`, `kandra-codegen`, `kandra-koin`,
+`kandra-kodein`, `kandra-migrate`, `kandra-multidc`, `kandra-jakarta` — declares
+`implementation(project(":kandra-core"))`. That's a deliberate choice, not an accident of how the
+Gradle multi-module build happens to be laid out: `kandra-core` has no dependency on the DataStax
+driver, no dependency on Ktor, no coroutines. A tool that only needs to read an entity's shape — a
+schema-diffing CLI, a codegen-adjacent tool, a test that only wants `SchemaRegistry`/`DdlGenerator`
+without opening a real session — can depend on `kandra-core` alone and pull in nothing that talks to
+a network. Every annotation you write on an entity (`@PartitionKey`, `@LookupIndex`, `@Version`, …)
+lives here specifically so that reading and validating an entity's shape never requires a live
+driver session to do it.
+
+<Callout kind="note">
+`kandra-bom` pins `kandra-core`'s version alongside every other module's — see
+[`/modules/kandra-bom`](/modules/kandra-bom). You will not normally add `kandra-core` to a build
+file by hand; `kandra-runtime` and `kandra-ktor` pull it in transitively. You'll still write against
+its annotations and exceptions directly in every entity class and every `catch` block.
+</Callout>
+
+## Entity annotations — `io.kandra.core.annotations`
+
+All `RUNTIME`-retention, read via `kotlin.reflect.full.findAnnotation` inside
+`SchemaRegistry.buildSchema` (see below) — this is what makes `@ScyllaTable` classes reflectable at
+plugin-install time without any compile-time code generation.
+
+### `@ScyllaTable`
+
+```kotlin
+@Target(AnnotationTarget.CLASS)
+annotation class ScyllaTable(val name: String, val gcGraceSeconds: Int = -1)
+```
+
+Required on every entity class — `SchemaRegistry.register` throws `KandraSchemaException` if it's
+absent. `gcGraceSeconds = -1` (the default) means "omit `WITH gc_grace_seconds`, use ScyllaDB's own
+default (10 days)"; any value `>= 0` is emitted verbatim in the generated DDL.
+
+```kotlin
+@ScyllaTable("users", gcGraceSeconds = 864000)
+data class User(@PartitionKey val userId: UUID, val email: String)
+```
+
+<Callout kind="gotcha">
+`gcGraceSeconds` is checked with `takeIf { it >= 0 }`, so `0` is honored and emitted — even though
+`gc_grace_seconds = 0` disables tombstone garbage-collection protection entirely in
+Cassandra/ScyllaDB (a replica that was briefly offline can resurrect a deleted row via anti-entropy
+repair once its tombstone is gone). `-1` is the only value treated as "unset"; `0` is a real,
+dangerous value that Kandra will not stop you from passing.
+</Callout>
+
+### `@PartitionKey`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY)
+annotation class PartitionKey(val index: Int = 0)
+```
+
+At least one required per class — `SchemaRegistry` throws if none is present. Use distinct `index`
+values for a composite partition key; columns are sorted by `index` ascending into
+`TableSchema.partitionKeys`.
+
+```kotlin
+@ScyllaTable("balances")
+data class Balance(
+    @PartitionKey(index = 0) val walletId: UUID,
+    @PartitionKey(index = 1) val currency: String,
+    val amount: BigDecimal,
+)
+```
+
+<Callout kind="gotcha">
+Two properties sharing the same `index` throws `KandraSchemaException("Duplicate @PartitionKey
+index $idx on ...")` at registration time — this is checked. There is **no equivalent check for
+`@ClusteringKey`**: two clustering columns with the same `index` don't throw, they silently produce
+whatever `sortedBy` happens to yield. See `@ClusteringKey` below.
+</Callout>
+
+### `@ClusteringKey`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY)
+annotation class ClusteringKey(val order: ClusteringOrder = ClusteringOrder.ASC, val index: Int = 0)
+
+enum class ClusteringOrder { ASC, DESC }
+```
+
+Sorted by `index` ascending into `TableSchema.clusteringKeys`. Each column's `order` is emitted
+per-column in the generated `CLUSTERING ORDER BY (col1 ASC, col2 DESC, ...)` clause — the sort order
+is fixed at schema-design time, not chosen per query (see
+[`/foundations`](/foundations#clustering-keys-sort-order-within-a-partition) for why that's the
+correct mental model here).
+
+```kotlin
+@ScyllaTable("events")
+data class Event(
+    @PartitionKey val userId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC) val occurredAt: Instant,
+    val payload: String,
+)
+```
+
+<Callout kind="gotcha" title="No duplicate-index validation">
+Unlike `@PartitionKey`, `SchemaRegistry` never checks for duplicate `@ClusteringKey(index)` values.
+Two clustering columns both left at the default `index = 0` won't throw — they'll be ordered by
+whatever `sortedBy` happens to yield, silently. Always set explicit, distinct `index` values on a
+multi-column clustering key.
+</Callout>
+
+### `@LookupIndex`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY)
+annotation class LookupIndex(
+    val tableSuffix: String,
+    val consistency: LookupConsistency = LookupConsistency.BATCH,
+)
+
+enum class LookupConsistency { BATCH, EVENTUAL }
+```
+
+Generates a `{tableName}_{tableSuffix}` denormalized lookup table — see
+[`/why`](/why#where-did-my-lookup-table-go-out-of-sync) and
+[`/philosophy/denormalization`](/philosophy/denormalization) for why this exists at all. `BATCH`
+writes the lookup row inside the same `LOGGED BATCH` as the primary row (atomic, at a latency cost);
+`EVENTUAL` fires the lookup write asynchronously after the primary write commits (cheaper, with a
+real, bounded window where the lookup table lags). The actual write/delete behavior for each
+consistency level lives in `kandra-runtime`; `kandra-core` only records the choice on
+`LookupIndexSchema.consistency`.
+
+```kotlin
+@ScyllaTable("users")
+data class User(
+    @PartitionKey val userId: UUID,
+    @LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
+    val email: String,
+)
+```
+
+<Callout kind="gotcha">
+Two `@LookupIndex` properties on the same class that resolve to the same composed table name
+(`{table}_{suffix}`) throws `KandraSchemaException` mentioning "duplicate" at registration — but
+this check is on the *composed* name, so `tableSuffix = "by_email"` and `tableSuffix = "byEmail"`
+would both pass individually while colliding with each other only if they literally produce the
+same string after composition. There's no cross-check against `@SecondaryIndex` or plain column
+names, either — a lookup table name can still collide with an unrelated real table if you're not
+careful with naming.
+</Callout>
+
+### `@Column`, `@Transient`, `@Ttl`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY) annotation class Column(val name: String)
+@Target(AnnotationTarget.PROPERTY) annotation class Transient
+@Target(AnnotationTarget.CLASS) annotation class Ttl(val seconds: Int)
+```
+
+`@Column(name)` overrides the CQL column name derived from the property name — without it,
+`SchemaRegistry.camelToSnake` converts it (see below). `@Transient` excludes a property from CQL
+entirely. `@Ttl(seconds)` sets `TableSchema.defaultTtl`, emitted as `WITH default_time_to_live = N`
+on the primary table only — lookup tables never inherit it, by design (`DdlGenerator.lookupTable`
+has no TTL clause at all).
+
+<Callout kind="gotcha" title="@Transient doesn't mean what you'd assume everywhere">
+`@Transient` excludes a property from `clusteringKeys`, the lookup-column set, and
+`secondaryIndexes` via explicit `!it.isTransient` filters in `SchemaRegistry` — but a
+`@Transient @PartitionKey` property still counts toward `partitionKeys` for index-duplication
+validation, because there's no `!isTransient` filter on that branch. Don't combine `@Transient` with
+`@PartitionKey`/`@ClusteringKey` — the resulting schema is inconsistent in a way nothing will warn
+you about.
+</Callout>
+
+### `@Counter`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY) annotation class Counter
+```
+
+Marks a ScyllaDB `COUNTER` column. If **any** non-key, non-`@Transient`, non-`@CreatedAt`,
+non-`@UpdatedAt` column on a class is `@Counter`, **every** such column must be —
+`SchemaRegistry` throws `KandraSchemaException` on a mix ("mixes @Counter and non-@Counter
+columns"). This mirrors a real ScyllaDB constraint: a table can't mix counter and non-counter
+columns at all. Counter columns can't be written with `save()` — see the
+[`kandra-runtime`](/modules/kandra-runtime) page for `increment()`/`decrement()`.
+
+```kotlin
+@ScyllaTable("page_views")
+data class PageViews(
+    @PartitionKey val pageId: UUID,
+    @Counter val count: Long,
+)
+```
+
+<Callout kind="gotcha">
+The mixed-counter check excludes partition keys, clustering keys, `@Transient`, `@CreatedAt`, and
+`@UpdatedAt` columns — but it does **not** exclude `@LookupIndex` or `@SecondaryIndex` columns. A
+`@Counter` entity with a non-counter `@LookupIndex` column will fail registration, because ScyllaDB
+itself has no concept of a denormalized lookup row pointing at a counter table this way.
+</Callout>
+
+### `@CreatedAt` / `@UpdatedAt`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY) annotation class CreatedAt
+@Target(AnnotationTarget.PROPERTY) annotation class UpdatedAt
+```
+
+Both must be on an `Instant`-typed property, or registration throws
+`KandraSchemaException("...must be an Instant field.")`. At most one of each per class (a second one
+throws). `@CreatedAt` is stamped once, on insert only; `@UpdatedAt` is stamped on every insert and
+update. `kandra-core` only validates the type and cardinality here — the actual reflective `copy()`
+stamping happens in `kandra-runtime`'s `BatchEngine`.
+
+### `@SecondaryIndex`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY) annotation class SecondaryIndex
+```
+
+Native CQL `CREATE INDEX` — a real, explicit scatter-gather query across every node, opted into
+per-column. Collected into `TableSchema.secondaryIndexes` (`@Transient` columns excluded). See
+[`/foundations`](/foundations#allow-filtering-why-its-dangerous-and-why-kandra-refuses-it) for why
+this — not `ALLOW FILTERING` — is Kandra's escape hatch for a query that can't be served by a
+partition key or a `@LookupIndex`.
+
+<Callout kind="danger" title="Only for low-cardinality, non-hot-path fields">
+The annotation's own KDoc is explicit: never use `@SecondaryIndex` on a high-cardinality column
+like `email` or `userId` — use `@LookupIndex` for those. `kandra-runtime` logs a WARN on every query
+that hits a secondary index, specifically so this cost stays visible in production logs instead of
+fading into "it's just a query."
+</Callout>
+
+### `@ReadConsistency` / `@WriteConsistency`
+
+```kotlin
+@Target(AnnotationTarget.CLASS) annotation class ReadConsistency(val level: KandraConsistency)
+@Target(AnnotationTarget.CLASS) annotation class WriteConsistency(val level: KandraConsistency)
+```
+
+Class-level only — one override per table, not per column or per query. `kandra-core` only
+*declares* these two annotations; `SchemaRegistry`/`DdlGenerator` never read them. Resolution
+(per-call parameter > this annotation > `ConsistencyConfig` default) is implemented in
+`kandra-runtime`'s `StatementBuilder` — see [`/philosophy/consistency`](/philosophy/consistency).
+
+```kotlin
+@ReadConsistency(KandraConsistency.LOCAL_QUORUM)
+@WriteConsistency(KandraConsistency.EACH_QUORUM)
+@ScyllaTable("critical_balances")
+data class Balance(@PartitionKey val walletId: UUID, val amount: BigDecimal)
+```
+
+### `@Version`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY) annotation class Version
+```
+
+Marks the optimistic-lock column. Must be `Long` or `Instant` — any other type throws
+`KandraSchemaException` naming the actual `KType`. At most one per class. `save()` sets the initial
+version; only two-argument `update(old, new)` enforces the LWT `IF version = ?` check — see
+[`/modules/kandra-runtime`](/modules/kandra-runtime#update-family) and
+[`/recipes/optimistic-locking`](/recipes/optimistic-locking).
+
+### `@SoftDelete`
+
+```kotlin
+@Target(AnnotationTarget.CLASS)
+annotation class SoftDelete(val ttlSeconds: Int = 86400, val markerProperty: String = "")
+```
+
+Sets `TableSchema.isSoftDelete = true` / `softDeleteTtlSeconds`. `kandra-core` only records these
+flags — the "TTL instead of DELETE" write behavior lives in `kandra-runtime`.
+`markerProperty`, if non-blank, names a `Boolean` property on the entity that permanently records
+deletion state (`true` = deleted) — validated to exist and be `Boolean`-typed at registration,
+resolved into `TableSchema.softDeleteMarkerColumn`. This marker is what makes `findActive()`
+possible: without it there is no CQL predicate that can distinguish a soft-deleted row from a live
+one before its TTL expires, since every *other* column on a soft-deleted row is written with a TTL
+and eventually disappears.
+
+```kotlin
+@SoftDelete(ttlSeconds = 2_592_000, markerProperty = "isDeleted")
+@ScyllaTable("todos")
+data class Todo(
+    @PartitionKey val todoId: UUID,
+    val title: String,
+    val isDeleted: Boolean = false,
+)
+```
+
+<Callout kind="gotcha" title="markerProperty is opt-in, and required for findActive()">
+Leaving `markerProperty` at its default `""` is valid — `@SoftDelete` still TTLs the row on
+`delete()` — but `findActive()` on that entity's repository throws `KandraSchemaException` at call
+time, not at registration time, because there's no marker column to query on. If you want
+`findActive()`, decide the marker property name up front; adding it later is a schema-adding
+migration, not a config flag.
+</Callout>
+
+### `@Sensitive`, `@CacheResult`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY) annotation class Sensitive
+@Target(AnnotationTarget.CLASS) annotation class CacheResult(val ttlSeconds: Int = 60, val maxSize: Long = 1000)
+```
+
+`@Sensitive` sets `ColumnSchema.isSensitive = true` — `kandra-core` does no masking itself; that's a
+logging-layer concern (`KandraEntityLogger`, in `kandra-runtime`) that reads this flag.
+`@CacheResult` populates `TableSchema.cacheConfig`; no Caffeine dependency lives in `kandra-core`,
+just the config record `kandra-runtime`'s `KandraCache` reads.
+
+## Schema model — `io.kandra.core.schema`
+
+Immutable data classes. `SchemaRegistry` is the only thing that builds and validates them — nothing
+in this package validates itself.
+
+```kotlin
+data class ColumnSchema(
+    val propertyName: String,
+    val cqlName: String,
+    val type: KType,
+    val isPartitionKey: Boolean = false,
+    val clusteringKey: ClusteringKeySchema? = null,
+    val lookupIndex: LookupIndexSchema? = null,
+    val isTransient: Boolean = false,
+    val isCounter: Boolean = false,
+    val isCreatedAt: Boolean = false,
+    val isUpdatedAt: Boolean = false,
+    val isSecondaryIndex: Boolean = false,
+    val isSensitive: Boolean = false,
+    val isVersion: Boolean = false,
+)
+
+data class ClusteringKeySchema(val order: ClusteringOrder, val index: Int)
+
+data class LookupIndexSchema(val tableName: String, val consistency: LookupConsistency)
+// tableName here is already the *composed* name ("{table}_{suffix}"), not the raw tableSuffix.
+
+data class TableSchema(
+    val entityClass: KClass<*>,
+    val tableName: String,
+    val partitionKeys: List<ColumnSchema>,
+    val clusteringKeys: List<ColumnSchema>,
+    val columns: List<ColumnSchema>,
+    val lookupTables: List<LookupTableSchema>,
+    val defaultTtl: Int? = null,
+    val isCounterTable: Boolean = false,
+    val createdAtColumn: ColumnSchema? = null,
+    val updatedAtColumn: ColumnSchema? = null,
+    val secondaryIndexes: List<ColumnSchema> = emptyList(),
+    val versionColumn: ColumnSchema? = null,
+    val isSoftDelete: Boolean = false,
+    val softDeleteTtlSeconds: Int? = null,
+    val softDeleteMarkerColumn: ColumnSchema? = null,
+    val gcGraceSeconds: Int? = null,
+    val cacheConfig: CacheResultConfig? = null,
+)
+
+data class LookupTableSchema(
+    val tableName: String,
+    val indexColumn: ColumnSchema,
+    val partitionKeyColumns: List<ColumnSchema>,
+    val consistency: LookupConsistency,
+    val clusteringKeyColumns: List<ColumnSchema> = emptyList(),
+)
+
+data class CacheResultConfig(val ttlSeconds: Int, val maxSize: Long)
+```
+
+<Callout kind="gotcha" title="@LookupIndex columns appear in two places">
+`TableSchema.columns` does **not** exclude the `@LookupIndex`-annotated column itself — it ends up
+in both `columns` (as a regular column) *and* as `LookupTableSchema.indexColumn`.
+`DdlGenerator.primaryTable` relies on `.distinctBy { it.cqlName }` to avoid emitting it twice in the
+primary table's `CREATE TABLE`. If you ever combine `schema.columns` and `schema.lookupTables`
+yourself for something outside `DdlGenerator`, apply the same de-dup — otherwise you'll double-count
+or double-emit that column.
+</Callout>
+
+`LookupTableSchema.clusteringKeyColumns` carries the primary table's clustering columns alongside
+its partition key columns, so a lookup resolution can reconstruct the primary table's **full** key —
+partition *and* clustering — not just the partition key. This exists because
+`StatementBuilder.selectById` requires the complete primary key on any clustering-keyed entity (see
+[`ISS-025`](/battle-scars/clustering-keys-and-lookup-tables)); before `clusteringKeyColumns` existed,
+a lookup could only ever hand back a partition key, which stopped being enough the moment that fix
+landed. `DdlGenerator.lookupTable` includes these columns in the lookup table's own `CREATE TABLE`
+too — a lookup table for a clustering-keyed entity has more than the historically-assumed
+"index column + partition key" shape.
+
+## `SchemaRegistry` — `io.kandra.core.SchemaRegistry`
+
+```kotlin
+@InternalKandraApi
+object SchemaRegistry {
+    fun <T : Any> register(klass: KClass<T>): TableSchema
+    fun get(klass: KClass<*>): TableSchema
+    fun getOrNull(klass: KClass<*>): TableSchema?
+    fun all(): List<TableSchema>
+    fun clear()
+    internal fun camelToSnake(name: String): String
+}
+```
+
+Thread-safe, `ConcurrentHashMap<KClass<*>, TableSchema>`, **process-global state**. `register` is
+`getOrPut` — idempotent, but the *first* successful call for a class wins and is cached; all
+validation runs synchronously, inline, the first time. `get` throws `KandraSchemaException` if the
+class was never registered; `getOrNull` returns `null` instead. `all()` is a snapshot list, useful
+for bulk DDL generation at startup — this is exactly what `kandra-ktor`'s `SchemaMode.AUTO_CREATE`
+iterates over.
+
+```kotlin
+val schema = SchemaRegistry.register(User::class)
+schema.tableName                  // "users"
+schema.partitionKeys[0].cqlName   // "user_id"
+schema.lookupTables[0].tableName  // "users_by_email"
+```
+
+### `buildSchema` validation order
+
+Every violation below throws `KandraSchemaException` — there's no other exception type from this
+file. The checks run top-to-bottom, so if an entity violates several at once, the first one wins:
+
+1. `@ScyllaTable` missing.
+2. `@CreatedAt`/`@UpdatedAt` on a non-`Instant` property.
+3. No `@PartitionKey` anywhere.
+4. Duplicate `@PartitionKey(index)` values.
+5. Two `@LookupIndex` properties composing to the same table name.
+6. Mixed `@Counter`/non-`@Counter` non-key columns.
+7. More than one `@CreatedAt`, or more than one `@UpdatedAt`.
+8. More than one `@Version`.
+9. `@Version` column typed as neither `Long` nor `Instant`.
+10. `@SoftDelete(markerProperty = "...")` naming a property that doesn't exist, or that isn't
+    `Boolean`-typed.
+
+<Callout kind="gotcha" title="camelToSnake has no acronym handling">
+```kotlin
+internal fun camelToSnake(name: String): String =
+    name.replace(Regex("([A-Z])")) { "_${it.value.lowercase()}" }.trimStart('_')
+```
+Every individual uppercase letter gets its own `_` + lowercase — this is a per-character regex, not
+a word-boundary-aware converter. `userId` → `user_id` is fine, but `userURL` → `user_u_r_l`, not
+`user_url`. This exact regex is duplicated in `kandra-codegen`'s own `camelToSnake` — the two must
+stay in lockstep, since a mismatch between the CQL name `kandra-core`/`SchemaRegistry` derives and
+the one `kandra-codegen` bakes into a generated `*Table` object would silently point a query at the
+wrong column name. If a property has a run of capitals, either rename it (`userUrl` instead of
+`userURL`) or pin the CQL name explicitly with `@Column(name = "user_url")`.
+</Callout>
+
+## `DdlGenerator` — `io.kandra.core.DdlGenerator`
+
+```kotlin
+@InternalKandraApi
+object DdlGenerator {
+    fun primaryTable(schema: TableSchema): String
+    fun lookupTable(lookup: LookupTableSchema): String
+    fun secondaryIndex(schema: TableSchema, column: ColumnSchema): String
+    fun alterTableAddColumn(schema: TableSchema, column: ColumnSchema): String
+    fun cqlTypeString(column: ColumnSchema): String
+    fun allStatements(schema: TableSchema): List<String>
+    internal fun kotlinTypeToCql(type: KType): String
+}
+```
+
+<SideBySide leftLabel="Entity" rightLabel="allStatements(schema) output">
+<div>
+
+```kotlin
+@ScyllaTable("users", gcGraceSeconds = 864000)
+data class User(
+    @PartitionKey val userId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC)
+    val createdAt: Instant,
+    @LookupIndex(tableSuffix = "by_email")
+    val email: String,
+)
+```
+
+</div>
+<div>
+
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    user_id UUID,
+    created_at TIMESTAMP,
+    email TEXT,
+    PRIMARY KEY (user_id, created_at)
+)
+WITH CLUSTERING ORDER BY (created_at DESC)
+AND gc_grace_seconds = 864000;
+
+CREATE TABLE IF NOT EXISTS users_by_email (
+    email TEXT,
+    user_id UUID,
+    created_at TIMESTAMP,
+    PRIMARY KEY (email)
+);
+```
+
+</div>
+</SideBySide>
+
+- **`primaryTable`** — column list is `partitionKeys + clusteringKeys + columns +
+  lookupTables.map { it.indexColumn }`, de-duplicated by `cqlName`. A single partition key renders
+  `PRIMARY KEY (id)`; a composite one double-paren-wraps:
+  `PRIMARY KEY ((user_id, chain), created_at)`. The `WITH` clause assembles, in order,
+  `CLUSTERING ORDER BY`, `default_time_to_live`, `gc_grace_seconds` — omitted entirely if none apply.
+- **`lookupTable`** — always `1 + partitionKeyColumns.size + clusteringKeyColumns.size` columns,
+  single-column `PRIMARY KEY` on the index column. No TTL, no clustering, no `gc_grace_seconds` —
+  lookup tables are intentionally minimal.
+- **`secondaryIndex`** — `CREATE INDEX IF NOT EXISTS {table}_{col}_idx ON {table} ({col});`
+- **`alterTableAddColumn`** — `ALTER TABLE {table} ADD {col} {type};`, used by `SchemaMode.AUTO_MIGRATE`
+  in `kandra-ktor`; never drops or renames a column.
+- **`allStatements`** — `[primaryTable] + one lookupTable() per lookup + one secondaryIndex() per
+  secondary index`, in that order.
+
+### Kotlin → CQL type mapping
+
+| Kotlin type | CQL type |
+|---|---|
+| `UUID` | `UUID` |
+| `String` | `TEXT` |
+| `Int` | `INT` |
+| `Long` | `BIGINT` |
+| `Boolean` | `BOOLEAN` |
+| `Double` | `DOUBLE` |
+| `Float` | `FLOAT` |
+| `Instant` | `TIMESTAMP` |
+| `LocalDate` | `DATE` |
+| `ByteArray` | `BLOB` |
+| `BigDecimal` | `DECIMAL` |
+| `List<X>` | `LIST<cql(X)>` (recurses) |
+| `Set<X>` | `SET<cql(X)>` (recurses) |
+| `Map<K, V>` | `MAP<cql(K), cql(V)>` (recurses) |
+| any `Enum` subclass | `TEXT` |
+| anything else | throws `KandraSchemaException` |
+
+<Callout kind="gotcha">
+An unsupported field type (a plain data class, `BigInteger`, `URI`, ...) throws
+`KandraSchemaException("Unsupported type: ...")` at **DDL-generation time** — the first time that
+entity's schema is registered and turned into DDL — not at compile time. A bad field type on an
+entity you never register in a test or a path that never runs at startup can sit undetected. `List`,
+`Set`, and `Map` also throw if their type argument is missing (raw generic use without reified
+argument info).
+</Callout>
+
+## `KandraConsistency` — `io.kandra.core.KandraConsistency`
+
+```kotlin
+enum class KandraConsistency {
+    ONE, TWO, THREE, QUORUM, ALL,
+    LOCAL_ONE, LOCAL_QUORUM, EACH_QUORUM,
+    LOCAL_SERIAL, SERIAL;
+
+    val isSerial: Boolean get() = this == LOCAL_SERIAL || this == SERIAL
+}
+```
+
+See [`/foundations`](/foundations#consistency-levels-in-plain-terms) for what each level means
+physically. `isSerial` is a convenience predicate for callers deciding whether a level is valid as a
+*serial* consistency argument (e.g. for `saveIfNotExists`) — `kandra-core` doesn't enforce this
+itself anywhere; `kandra-runtime`'s `BatchEngine` does, throwing `KandraQueryException` if you pass a
+non-serial level where a serial one is required.
+
+## `KandraAuth` — `io.kandra.core.KandraAuth`
+
+```kotlin
+data class KandraCredentials(val username: String, val password: String)
+
+@ExperimentalKandraApi
+fun interface KandraAuthProvider {
+    fun getCredentials(): KandraCredentials
+}
+
+@ExperimentalKandraApi
+object KandraAuth {
+    fun fromEnv(usernameVar: String = "SCYLLA_USERNAME", passwordVar: String = "SCYLLA_PASSWORD"): KandraAuthProvider
+    fun fromFile(usernamePath: String, passwordPath: String): KandraAuthProvider
+    fun static(username: String, password: String): KandraAuthProvider
+    fun custom(provider: () -> KandraCredentials): KandraAuthProvider
+}
+```
+
+`KandraAuthProvider` is a SAM interface, so any of the four factories can be replaced inline with a
+lambda. `getCredentials()` implementations must be thread-safe (may be invoked concurrently during
+credential rotation) — none of the four built-ins hold mutable state, so they're safe as-is.
+
+```kotlin
+auth {
+    provider = KandraAuth.custom {
+        val secret = awsSecretsClient.getSecretValue("coinx/scylla")
+        KandraCredentials(secret.username, secret.password)
+    }
+}
+```
+
+- **`fromEnv`** — reads `System.getenv(...)` fresh on **every** call, not cached at construction, so
+  external credential rotation via env-var reload is picked up automatically if your process
+  supports it. Missing username throws `KandraAuthException` suggesting an alternative; missing
+  password throws a plainer message — the wording is intentionally asymmetric, not a bug.
+- **`fromFile`** — reads and `.trim()`s both files fresh on every call (Docker/K8s secret files).
+  Wraps `IOException` into `KandraAuthException`; other exception types (e.g. `SecurityException`)
+  propagate raw.
+- **`static`** — dev/test only, per its own KDoc: credentials end up in source and logs.
+- **`custom`** — thinnest wrapper; the integration point for Vault, AWS Secrets Manager, etc.
+
+<Callout kind="gotcha">
+Both `@ExperimentalKandraApi` (`WARNING`-level opt-in) — usable with a compiler warning, or
+suppress it with `@OptIn(ExperimentalKandraApi::class)`. This whole surface (`KandraAuthProvider`,
+`KandraAuth`, `KandraEventListener` below) is flagged as more likely to change shape in a future
+release than the rest of `kandra-core`.
+</Callout>
+
+## `KandraEventListener` — `io.kandra.core.KandraEventListener`
+
+```kotlin
+@ExperimentalKandraApi
+interface KandraEventListener {
+    fun onEventualWriteFailed(tableName: String, entity: Any, error: Throwable)   // abstract
+    fun onAuthFailed(contactPoint: String, error: Throwable) {}
+    fun onConnectionEstablished(contactPoint: String) {}
+    fun onCredentialRefreshed() {}
+    fun onSslHandshakeFailed(contactPoint: String, error: Throwable) {}
+}
+```
+
+Only `onEventualWriteFailed` is abstract; every other method has a no-op default, so an existing
+implementation keeps compiling as new callback methods are added.
+
+```kotlin
+eventListener = object : KandraEventListener {
+    override fun onEventualWriteFailed(tableName: String, entity: Any, error: Throwable) {
+        deadLetterQueue.publish(FailedLookupWrite(tableName, entity))
+    }
+}
+```
+
+<Callout kind="danger" title="onEventualWriteFailed must not throw">
+Per the KDoc contract, any exception `onEventualWriteFailed` raises is silently swallowed by the
+caller (`kandra-runtime`'s `BatchEngine`). Don't rely on propagating errors out of it — log or
+enqueue instead.
+</Callout>
+
+## `KandraMetrics` — `io.kandra.core.KandraMetrics`
+
+```kotlin
+fun interface KandraMetrics {
+    fun record(tableName: String, operation: String, durationMs: Long)
+}
+```
+
+SAM interface, **not** gated by `@ExperimentalKandraApi` (unlike the two above). Called after every
+query execution on both blocking and suspend paths, once wired via `kandra-ktor`'s
+`metrics { recorder = ... }`. `operation` is a free-form string; the values `kandra-runtime` actually
+emits are `"save"`, `"update"`, `"delete"`, `"saveAll"`, `"deleteAll"`, `"batch"` — documentation of
+caller behavior, not a closed set `kandra-core` enforces.
+
+```kotlin
+recorder = KandraMetrics { table, op, ms ->
+    meterRegistry.timer("kandra.query", "table", table, "operation", op).record(ms, TimeUnit.MILLISECONDS)
+}
+```
+
+## `KandraTimestamp` — `io.kandra.core.KandraTimestamp`
+
+```kotlin
+object KandraTimestamp {
+    fun now(): Long                        // System.currentTimeMillis() * 1000L
+    fun fromInstant(instant: Instant): Long // instant.toEpochMilli() * 1000L
+}
+```
+
+Both scale a millisecond value up to microseconds (ScyllaDB's native write-timestamp unit) — neither
+adds real microsecond precision, they only convert units. Use `fromInstant` when replaying or
+reprocessing events out of order, so the write timestamp reflects event time rather than
+server-processing time — that's the difference between last-event-wins and last-write-wins conflict
+resolution.
+
+```kotlin
+walletRepo.save(wallet, timestampMicros = KandraTimestamp.fromInstant(event.occurredAt))
+```
+
+<Callout kind="gotcha">
+Two calls to `now()`/`fromInstant()` within the same millisecond produce identical timestamps —
+there's no genuine sub-millisecond source here, just unit conversion.
+</Callout>
+
+## `KandraValidator` — `io.kandra.core.KandraValidator`
+
+```kotlin
+fun interface KandraValidator<T : Any> {
+    fun validate(entity: T): List<KandraValidationError>
+}
+
+data class KandraValidationError(val field: String, val message: String)
+
+class KandraValidationException(
+    val errors: List<KandraValidationError>,
+) : KandraException("Validation failed: ${errors.joinToString("; ") { "${it.field}: ${it.message}" }}")
+```
+
+An empty list from `validate()` means "valid" — there's no separate boolean. `kandra-ktor`'s
+`validate<T> { }` and `kandra-runtime`'s `BatchEngine.registerValidator` are what wire a
+`KandraValidator` into the save/update path, throwing `KandraValidationException` when the result is
+non-empty.
+
+```kotlin
+install(Kandra) {
+    validate<User> { user ->
+        buildList {
+            if (user.email.isBlank()) add(KandraValidationError("email", "must not be blank"))
+        }
+    }
+}
+```
+
+## Exceptions — `io.kandra.core.exception`
+
+```kotlin
+open class KandraException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+
+class KandraSchemaException(message: String) : KandraException(message)
+class KandraQueryException(message: String, cause: Throwable? = null) : KandraException(message, cause)
+class KandraAuthException(message: String, cause: Throwable? = null) : KandraException(message, cause)
+class KandraOptimisticLockException(
+    message: String,
+    val entityClass: KClass<*>,
+    val partitionKey: Any,
+) : KandraException(message)
+class KandraMigrationException(message: String, cause: Throwable? = null) : KandraException(message, cause)
+```
+
+```kotlin
+try {
+    repo.update(old, new)
+} catch (e: KandraOptimisticLockException) {
+    logger.warn("version conflict on ${e.entityClass.simpleName} pk=${e.partitionKey}")
+}
+```
+
+<Callout kind="gotcha" title="Two exceptions can't carry a cause">
+`KandraSchemaException` and `KandraOptimisticLockException` do **not** accept a `cause` parameter —
+every other exception here does. If you're wrapping a lower-level failure into either of those two,
+you'll lose the original stack trace unless you fold its message into the string yourself. Within
+`kandra-core` itself, only `KandraSchemaException` and `KandraAuthException` are ever thrown —
+`KandraQueryException`, `KandraOptimisticLockException`, and `KandraMigrationException` are declared
+here (this is their home package) but thrown by `kandra-runtime`/`kandra-migrate`.
+</Callout>
+
+## `ApiStability` — `io.kandra.core.InternalKandraApi` / `ExperimentalKandraApi`
+
+```kotlin
+@RequiresOptIn(level = RequiresOptIn.Level.ERROR)
+annotation class InternalKandraApi
+
+@RequiresOptIn(level = RequiresOptIn.Level.WARNING)
+annotation class ExperimentalKandraApi
+```
+
+`@InternalKandraApi` (`ERROR`-level opt-in) marks `SchemaRegistry` and `DdlGenerator` — using either
+from outside Kandra's own modules is a compile error without `@OptIn(InternalKandraApi::class)`, and
+per the KDoc you're not meant to add that opt-in in application code; these are implementation
+details other Kandra modules build on. `@ExperimentalKandraApi` (`WARNING`-level) marks
+`KandraAuthProvider`/`KandraAuth`/`KandraEventListener` and, in `kandra-runtime`, the
+`batch`/`batchBlocking` entry points.
+
+<Callout kind="note">
+Everything else — `KandraMetrics`, `KandraValidator`, `KandraConsistency`, `KandraTimestamp`, every
+annotation, every exception, and the whole `schema` package — is **not** gated by either annotation:
+it's considered stable public API.
+</Callout>
+
+## Full API reference
+
+[`kandra-core` on Dokka →]({dokkaModuleUrl("kandra-core")}) ·
+[`LookupIndex` →]({dokkaClassUrl("kandra-core", "io.kandra.core.annotations", "LookupIndex")}) ·
+[`KandraConsistency` →]({dokkaClassUrl("kandra-core", "io.kandra.core", "KandraConsistency")}) ·
+[`io.kandra.core.schema` package →]({dokkaPackageUrl("kandra-core", "io.kandra.core.schema")})
+
+## Where this shows up elsewhere on this site
+
+- [`/why`](/why) — the case for `@LookupIndex`, `@SoftDelete`, and consistency defaults, in plain
+  prose.
+- [`/foundations`](/foundations) — the mental model behind partition keys, clustering keys, and
+  consistency levels.
+- [`/battle-scars/clustering-keys-and-lookup-tables`](/battle-scars/clustering-keys-and-lookup-tables) —
+  the real bug (ISS-025) behind why lookup resolution needs the full primary key, not just the
+  partition key, and why `LookupTableSchema.clusteringKeyColumns` exists.
+- [`/recipes/lookup-tables`](/recipes/lookup-tables), [`/recipes/soft-delete`](/recipes/soft-delete),
+  [`/recipes/counters`](/recipes/counters), [`/recipes/optimistic-locking`](/recipes/optimistic-locking) —
+  task-oriented walkthroughs of the annotations on this page.

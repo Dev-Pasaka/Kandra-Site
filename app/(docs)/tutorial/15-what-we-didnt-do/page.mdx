@@ -1,0 +1,111 @@
+export const metadata = {
+  title: "15. What we didn't do, on purpose",
+  description:
+    "A closing list of relational instincts this app deliberately doesn't have — no join tables, no query-time ORDER BY, no SELECT count(*), no ambient transactions — and why each absence is a decision.",
+};
+
+# 15. What we didn't do, on purpose
+
+[`/why`](/why) opened this whole site with a claim: if your first instinct on a new access pattern
+is "how do I do a JOIN," that instinct is wrong here, not inconvenient — and the job of the site was
+to replace it, not accommodate it. Fourteen pages later, this todo app is the evidence for that
+claim, not just an assertion of it. This page is the payoff: a plain list of what a relational
+developer would expect to reach for, and exactly where in this app that instinct was replaced with
+something else — on purpose, for a specific reason, not by accident or because Kandra couldn't do
+the relational thing.
+
+## No join table for assignments
+
+The relational instinct for "todos assigned to me" is a `todo_assignments` join table —
+`(todo_id, assignee_id)` — or a foreign key column with a `JOIN` at query time. This app has
+neither. [Page 06](/tutorial/06-denormalization) built `TodoByAssignee` instead: a second, complete
+copy of exactly the columns `GET /todos/assigned-to-me` needs, partitioned by `assigneeId`, kept in
+sync with `Todo` by `KandraBatchScope` on every write that touches assignment. There is no query-time join anywhere in this app, and there
+never could be — Cassandra doesn't have one, because a join across two arbitrarily-partitioned
+tables would mean pulling data from potentially every node in the cluster for a single query. The
+tradeoff `TodoByAssignee` makes instead — a second copy of the data, updated on write, so the read
+stays a single-partition lookup — is [`/foundations`](/foundations#why-there-are-no-joins-no-foreign-keys)'s
+"denormalize, don't join" argument, applied.
+
+## No `ORDER BY` at query time for the todo list
+
+The relational instinct for "show my todos, newest first" is to sort at query time —
+`ORDER BY created_at DESC` — against an unordered table, trusting an index or the query planner to
+make it fast. `GET /todos/mine` in this app has no `ORDER BY` anywhere in its implementation,
+because it doesn't need one: `Todo`'s `@ClusteringKey(order = ClusteringOrder.DESC)` on `createdAt`,
+decided on [page 01](/tutorial/01-modeling) before a single line of entity code was written, means
+every row inside an `ownerId` partition is *physically stored* newest-first. `findPage` against that
+partition comes back pre-sorted, free, because the sort isn't a query-time operation at all — it's a
+consequence of a schema-design-time decision. Getting the clustering key's order wrong wouldn't be
+fixable with a query change later; it would mean re-modeling the table, which is exactly why
+[page 01](/tutorial/01-modeling) did data modeling before writing any code, not after.
+
+## No `SELECT count(*)` for "how many todos has this user completed"
+
+The relational instinct for a lifetime count is to count the rows — `SELECT count(*) FROM todos
+WHERE owner_id = ? AND done = true` — trusting an index to make it cheap. [Page 09](/tutorial/09-counters)
+didn't do this, for two reasons that compound: `done` isn't a key column on `Todo`, so that query
+isn't servable without a scatter-gather in the first place, and even a correctly-scoped `COUNT` over
+one partition means reading every live row in it, every time — a query that gets slower exactly as
+the users who'd find the stat most meaningful (the heavy users) make their own partition bigger.
+`CompletionStats`, a `@Counter` table, replaces "count the rows" with "maintain a running total" —
+a genuinely distinct CQL type with its own commutative, coordination-free write path, specifically
+because a plain integer column bumped with `UPDATE ... SET n = n + 1` is a real lost-update race
+under concurrent writers, not just a style preference. This is the one place in this tutorial where
+the relational reflex is an actual concurrency bug, not just a performance footgun — see
+[page 09](/tutorial/09-counters#why-not-a-plain-integer-column-with-a-normal-update) for the exact
+failure mode.
+
+## No `@Transactional` spanning arbitrary business logic
+
+The relational instinct, once more than one table needs to change together, is to wrap the whole
+method in a transaction — `@Transactional`, or an equivalent ambient scope — and let the framework
+figure out what needs to roll back if anything inside it fails, no matter how much business logic
+ends up inside that boundary over time. This app has no ambient transaction anywhere. It has exactly
+one atomicity boundary, [page 06](/tutorial/06-denormalization)'s
+`application.kandra.batch { todoRepo.saveInBatch(todo); todoByAssigneeRepo.saveInBatch(...) }`,
+from [page 06](/tutorial/06-denormalization) — scoped around precisely the two writes that must
+land together, and nothing else. `KandraBatchScope` can't accidentally grow to wrap more than that
+by reflex the way a `@Transactional` method can, because it isn't a general-purpose scope you drop
+over a whole handler — it's a narrow DSL that only exposes `saveInBatch`/`deleteInBatch`, with no
+`findAll`/`findById` inside it at all (reads can't be batched in CQL, so the API doesn't pretend
+they can). [`/philosophy/atomicity`](/philosophy/atomicity)
+covers why `LOGGED BATCH` — the only cross-table atomicity primitive Cassandra actually has — being
+explicit and narrow is the correct shape for this, not a limitation to work around.
+
+## A shorter list of smaller ones, from along the way
+
+- **No hard `DELETE` for "delete this todo."** [Page 08](/tutorial/08-soft-delete-and-trash)'s
+  `@SoftDelete` rewrites the row with a TTL instead, because a delete-heavy access pattern (an undo
+  window) is exactly the shape that accumulates tombstones fastest — see
+  [`/foundations`](/foundations#tombstones-what-delete-actually-does).
+- **No `WHERE` clause against a non-key column without an explicit index.** Every query in this app
+  resolves through a partition key, a clustering key, a `@LookupIndex`, or a `@SecondaryIndex` —
+  never a silent `ALLOW FILTERING` scatter-gather, because Kandra's query DSL has no method that
+  produces one at all.
+- **No optimistic locking on every table "just in case."** `@Version` appears on `Todo` alone,
+  introduced on [page 07](/tutorial/07-concurrency) for one specific, named race (two concurrent
+  done-toggles), not copy-pasted onto `User`, `TodoByAssignee`, or `CompletionStats` by reflex — LWT
+  costs a real round of Paxos consensus a plain write skips, and this app only pays that cost where
+  the race it prevents is real.
+
+## The point of the list
+
+None of these absences are missing features. Each one is a place where this app's design met a
+tradeoff Cassandra makes deliberately — no cross-partition joins, sort order fixed at schema-design
+time, no free row counts, no ambient cross-table transaction — and chose the tool built for that
+tradeoff instead of reaching for the relational habit anyway and finding out later why it doesn't
+hold up. That's the whole argument [`/foundations`](/foundations) opened with: a distributed,
+partition-oriented, leaderless database needs distributed thinking, not a relational mental model
+wearing a Kotlin costume. This app is what that looks like built all the way through, checkpoint by
+checkpoint, from [page 01](/tutorial/01-modeling)'s access-pattern analysis to
+[page 14](/tutorial/14-running-and-shipping)'s rolling deploy.
+
+<Callout kind="tip" title="Where to go from here">
+[`/philosophy`](/philosophy) goes deeper on each individual tradeoff this tutorial applied —
+atomicity, consistency, schema safety, denormalization, testing. [`/recipes`](/recipes) covers
+patterns this app didn't need but real apps often do — time-series data, multi-DC deployment, a
+larger worked example in [`/recipes/social-feed-capstone`](/recipes/social-feed-capstone).
+[`/battle-scars`](/battle-scars) has the real bugs — clustering-key deletes, cache invalidation,
+migration locking — that shaped several of the decisions this tutorial walked through as settled.
+</Callout>

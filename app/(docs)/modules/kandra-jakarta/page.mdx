@@ -1,0 +1,125 @@
+import { dokkaClassUrl, dokkaModuleUrl } from "@/lib/dokka";
+
+export const metadata = {
+  title: "kandra-jakarta",
+  description:
+    "JakartaKandraValidator adapts a jakarta.validation.Validator into a KandraValidator, so @NotNull/@Size-style Bean Validation constraints run before every save/update.",
+};
+
+# kandra-jakarta
+
+`kandra-jakarta` is a small adapter module: one class,
+`io.kandra.jakarta.JakartaKandraValidator<T>`, that implements `kandra-core`'s `KandraValidator<T>`
+by delegating to a real `jakarta.validation.Validator` — so entities annotated with standard Jakarta
+Bean Validation constraints (`@NotNull`, `@Size`, `@Email`, ...) get validated automatically before
+every `save`/`update`, without hand-writing a `KandraValidator` lambda per entity.
+
+## Why this exists as a separate module
+
+`jakarta.validation-api` is declared `compileOnly` in this module's `build.gradle.kts` — not
+`implementation`. That's the whole reason `kandra-jakarta` is its own module rather than folded into
+`kandra-core` or `kandra-ktor`: Bean Validation requires an actual provider implementation on the
+runtime classpath (Hibernate Validator is the common choice), and Kandra has no opinion on which one
+you use or whether you want Jakarta Bean Validation at all. Keeping the adapter in its own module
+means an app that doesn't use Jakarta annotations never pulls in `jakarta.validation-api` — a real
+compile-time dependency Kandra's core modules would otherwise force on every consumer — and an app
+that does use it brings its own validator implementation alongside this thin bridge.
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation("ke.co.coinx.kandra:kandra-jakarta")
+    implementation("org.hibernate.validator:hibernate-validator:8.0.1.Final")   // your own choice of provider
+}
+```
+
+## `JakartaKandraValidator<T>`
+
+```kotlin
+class JakartaKandraValidator<T : Any>(
+    private val validator: Validator = Validation.buildDefaultValidatorFactory().validator,
+) : KandraValidator<T> {
+    override fun validate(entity: T): List<KandraValidationError>
+}
+```
+
+Runs `validator.validate(entity)` and maps every constraint violation into a
+`KandraValidationError(field = violation.propertyPath.toString(), message = violation.message)` — the
+same error shape `kandra-core`'s `KandraValidationException` composes its message from.
+
+```kotlin
+data class User(
+    @field:NotBlank val name: String,
+    @field:Email val email: String,
+    @field:Min(0) val age: Int,
+)
+
+val validator = JakartaKandraValidator<User>()
+val errors = validator.validate(User(name = "", email = "not-an-email", age = -1))
+// [KandraValidationError("name", "must not be blank"),
+//  KandraValidationError("email", "must be a well-formed email address"),
+//  KandraValidationError("age", "must be greater than or equal to 0")]
+```
+
+<Callout kind="gotcha" title="Constraint annotations need the field: use-site target on a Kotlin data class">
+Jakarta Bean Validation reads Java-style field/getter annotations. On a Kotlin `data class`
+constructor property, the annotation has to be told to attach to the backing field —
+`@field:NotBlank val name: String`, not bare `@NotBlank val name: String` — or Hibernate Validator
+silently validates nothing for that property, since the annotation lands somewhere Bean Validation
+never looks. This is a Kotlin/Jakarta interop detail, not a Kandra-specific behavior, but it's the
+single most common reason a Jakarta-validated entity "does nothing" the first time someone wires this
+module in.
+</Callout>
+
+## `KandraConfig.validateJakarta<T>()`
+
+```kotlin
+inline fun <reified T : Any> KandraConfig.validateJakarta()
+fun <T : Any> KandraConfig.validateJakarta(klass: KClass<T>)
+```
+
+Registers a `JakartaKandraValidator<T>` with `install(Kandra) { }` in one call — equivalent to
+`validate<T> { JakartaKandraValidator<T>().validate(it) }`, but resolved through
+`KandraJakartaSupport.isAvailable` first:
+
+```kotlin
+install(Kandra) {
+    register(User::class)
+    validateJakarta<User>()
+}
+```
+
+<Callout kind="gotcha" title="Missing a Bean Validation provider degrades to a WARN, not a failed install">
+`validateJakarta<T>()` checks `KandraJakartaSupport.isAvailable` (whether
+`Validation.buildDefaultValidatorFactory()` succeeds) before registering anything. If no provider
+(e.g. Hibernate Validator) is on the runtime classpath, it logs a WARN naming the missing dependency
+and **skips registration silently** — plugin install still succeeds, and the entity is simply never
+validated. If you add `kandra-jakarta` and `validateJakarta<User>()` but forget the actual validator
+implementation dependency, nothing will tell you at startup that validation isn't running; only a bad
+row making it through unvalidated will.
+</Callout>
+
+## `KandraJakartaSupport`
+
+```kotlin
+object KandraJakartaSupport {
+    val isAvailable: Boolean   // by lazy — computed once, cached for the process lifetime
+}
+```
+
+Checks availability by actually constructing (and immediately closing) a default validator factory —
+not just a classpath/reflection check for the provider class. `by lazy`'s default `SYNCHRONIZED`
+mode makes this a thread-safe, compute-once check; the result never changes for the life of the
+process even if the classpath could theoretically change (it can't, at runtime, in a normal JVM
+deployment).
+
+## Full API reference
+
+[`kandra-jakarta` on Dokka →]({dokkaModuleUrl("kandra-jakarta")}) ·
+[`JakartaKandraValidator` →]({dokkaClassUrl("kandra-jakarta", "io.kandra.jakarta", "JakartaKandraValidator")})
+
+## Where this shows up elsewhere on this site
+
+- [`/modules/kandra-core`](/modules/kandra-core#kandravalidator--iokandracorekandravalidator) —
+  the `KandraValidator<T>` interface this module adapts, and the hand-written alternative.
+- [`/modules/kandra-ktor`](/modules/kandra-ktor#validatet--) — `validate<T> { }`, the lower-level
+  hook `validateJakarta<T>()` wraps.

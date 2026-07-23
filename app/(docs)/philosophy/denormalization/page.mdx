@@ -1,0 +1,166 @@
+export const metadata = {
+  title: "Denormalization",
+  description:
+    "@LookupIndex as a first-class, generated, maintained artifact — not a workaround — and what the BATCH vs EVENTUAL consistency choice actually costs.",
+};
+
+# Denormalization
+
+[`/foundations`](/foundations#why-there-are-no-joins-no-foreign-keys) makes the general case: in
+Cassandra, storing the same data twice, shaped for two different queries, is the normal and correct
+way to model, not a compromise you make when the "real" relational model doesn't fit. This page is
+about the specific mechanism Kandra gives you to do that without hand-maintaining the second copy
+yourself.
+
+## `@LookupIndex` is not a workaround
+
+Annotate a field, and Kandra generates the DDL for a second table keyed by that field, and keeps its
+writes and deletes in sync with the primary table — automatically, on every `save()`/`delete()`, not
+as something you remember to do in every write path that touches the entity:
+
+```kotlin
+@ScyllaTable("users")
+data class User(
+    @PartitionKey val userId: UUID,
+    @LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
+    val email: String,
+    val name: String,
+)
+```
+
+<SideBySide leftLabel="Entity" rightLabel="Generated DDL">
+<div>
+
+```kotlin
+@LookupIndex(
+    tableSuffix = "by_email",
+    consistency = LookupConsistency.BATCH,
+)
+val email: String
+```
+
+</div>
+<div>
+
+```sql
+CREATE TABLE users_by_email (
+    email text PRIMARY KEY,
+    userId uuid
+);
+```
+
+</div>
+</SideBySide>
+
+`userRepo.save(user)` writes both `users` and `users_by_email`; `userRepo.delete(user)` removes the
+row from both. `userRepo.find { UserTable.email eq email }` resolves through the lookup table's
+partition key — a fast, single-partition read, not a scatter-gather scan. There's no hand-written
+"also update the lookup table" step for a future field addition to accidentally skip. That's the
+whole point of treating denormalization as a first-class, generated artifact instead of a pattern
+every write path has to remember to implement correctly: the failure mode of a hand-rolled lookup
+table is a silent absence — the primary table is correct, the lookup table quietly isn't, and nothing
+in code review looks wrong. See [`/why`](/why#where-did-my-lookup-table-go-out-of-sync) for that
+failure mode in full, and [`/recipes/lookup-tables`](/recipes/lookup-tables) for the complete recipe.
+
+## `BATCH` vs `EVENTUAL`, and what each one actually does
+
+`LookupConsistency` is a two-value choice, and it's not a tuning knob you set once for the whole
+application — it's per-field, made at the point you annotate it:
+
+```kotlin
+enum class LookupConsistency { BATCH, EVENTUAL }
+
+annotation class LookupIndex(
+    val tableSuffix: String,
+    val consistency: LookupConsistency = LookupConsistency.BATCH,
+)
+```
+
+**`BATCH`** (the default) writes the lookup row in the same `LOGGED BATCH` as the primary row — see
+[`/philosophy/atomicity`](/philosophy/atomicity) for what that guarantee actually is. Both writes
+succeed or the batch retries as a unit; there is no window, however small, where the primary row
+exists and the lookup row doesn't (or vice versa). That safety costs the batch's usual overhead —
+one extra coordination step versus an independent write.
+
+**`EVENTUAL`** is a genuinely different mechanism, not just a weaker flag: the lookup write is not
+part of the primary write's `BatchStatement` at all. It's built, then handed to a `CoroutineScope`
+backing the plugin's lifetime, and fired with `.launch { }` — a fire-and-forget coroutine that runs
+independently of the caller, after the primary write has already returned:
+
+```kotlin title="kandra-runtime/.../BatchEngine.kt (eventual lookup insert, abridged)"
+private fun fireEventual(eventualLookups: List<LookupTableSchema>, entity: Any) {
+    if (eventualLookups.isEmpty()) return
+    scope.launch {
+        eventualLookups.forEach { lookup ->
+            runCatching { session.execute(statementBuilder.insertLookup(lookup, entity)) }
+                .onFailure { err ->
+                    logger.error(err) { "EVENTUAL lookup insert failed for ${lookup.tableName}" }
+                    eventListener?.onEventualWriteFailed(lookup.tableName, entity, err)
+                }
+        }
+    }
+}
+```
+
+`userRepo.save(user)` returns as soon as the primary write (and any `BATCH`-consistency lookups)
+commit — the `EVENTUAL` lookup write hasn't necessarily happened yet. That's the entire cost
+tradeoff: `EVENTUAL` is cheaper per call (no batchlog overhead, and it doesn't add latency to the
+caller at all, since it doesn't block the return), at the price of a real staleness window on the
+lookup table.
+
+<Callout kind="danger" title="'Bounded' means bounded in the success case only — a failed eventual write has no automatic retry">
+The staleness window is bounded by "how long the async write takes to complete" *when it succeeds* —
+typically the time for one more CQL write, not a batch, so usually fast and usually small. But look
+at the code above: it's a single attempt, wrapped in `runCatching`, with no retry logic and no
+`executeWithRetry` call (compare to every `BATCH`-path write, which does go through
+`executeWithRetry`/`executeWithRetrySuspend`). If that one attempt fails — a transient network blip,
+a timeout, a coordinator hiccup — the lookup write simply doesn't happen. There's no second attempt.
+The staleness window doesn't stay small; it becomes permanent, silently, unless you act on it.
+
+The only signal is `logger.error` and, if you've configured one,
+`KandraEventListener.onEventualWriteFailed(tableName, entity, error)` — implement this if you use
+`EVENTUAL` anywhere and actually care about the lookup table staying correct:
+
+```kotlin
+install(Kandra) {
+    eventListener = object : KandraEventListener {
+        override fun onEventualWriteFailed(tableName: String, entity: Any, error: Throwable) {
+            deadLetterQueue.publish(FailedLookupWrite(tableName, entity))
+        }
+    }
+}
+```
+
+Without a listener wired up, a failed `EVENTUAL` write is only visible in application logs.
+</Callout>
+
+<Callout kind="gotcha" title="EVENTUAL lookups are excluded from KandraBatchScope entirely">
+Inside `application.kandra.batch { }`, `saveInBatch` only collects `BATCH`-consistency lookup
+statements into the `LOGGED BATCH` — `EVENTUAL` lookups on the same entity still fire separately,
+asynchronously, after the batch commits, exactly as they would outside a batch context. Putting an
+entity with an `EVENTUAL` lookup field inside a `batch { }` block doesn't make that particular lookup
+write atomic with anything.
+</Callout>
+
+## Choosing between them
+
+`BATCH` is the right default, and it is Kandra's actual default — reach for `EVENTUAL` only when
+you've decided a specific lookup table can tolerate a real staleness window (bounded when the write
+succeeds, unbounded if it fails and nothing retries or alerts) in exchange for not paying batch
+overhead on every write to the primary table. A `users_by_email` lookup used for login is a bad
+candidate for `EVENTUAL` — a stale window means a just-registered user can't log in by email for an
+unknown period. A denormalized "recent activity feed" table, where a few seconds (or, on failure,
+longer) of staleness is a UX nit rather than a correctness bug, is a reasonable one.
+
+## What this means day to day
+
+- Default to `LookupConsistency.BATCH` unless you have a specific reason and have thought through
+  what a stale (or permanently missing) lookup row means for that table.
+- If you use `EVENTUAL` anywhere, wire up `KandraEventListener.onEventualWriteFailed` — the failure
+  mode is silent otherwise, by design of the fire-and-forget mechanism, not by oversight.
+- Denormalized tables via `@LookupIndex` are the tool for "find X by Y" queries that can't be served
+  by the primary table's partition key — not `@SecondaryIndex` (scatter-gather, logged, for
+  low-cardinality fields only) and never a hand-rolled second table maintained by discipline. See
+  [`/tutorial/06-denormalization`](/tutorial/06-denormalization) for the worked example and
+  [`/battle-scars/clustering-keys-and-lookup-tables`](/battle-scars/clustering-keys-and-lookup-tables)
+  for what goes wrong when a lookup table's key shape is designed carelessly.

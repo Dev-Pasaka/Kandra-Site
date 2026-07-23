@@ -1,0 +1,153 @@
+export const metadata = {
+  title: "Clustering keys & lookup tables",
+  description:
+    "ISS-025, ISS-029, ISS-030: a delete that wiped a whole partition instead of one row, and the two follow-on bugs tightening the fix correctly surfaced in lookup indexes and soft-delete.",
+};
+
+# Clustering keys & lookup tables
+
+This is the most important sequence in this whole section — one real data-loss bug (ISS-025), and
+two follow-on bugs (ISS-029, ISS-030) that the *correct* fix for it exposed, in order, over the
+next two test-plan runs. Read it as one story: it's a better illustration of what "tightening a
+contract" actually costs than any of the three issues is on its own.
+
+## ISS-025: the delete that ate the partition
+
+A table with a partition key *and* a clustering key doesn't have one row per partition key — it
+has many, sorted by the clustering key, all physically stored together. `DELETE FROM t WHERE
+partition_key = ?` on a table like that doesn't delete "the row." It deletes the entire partition.
+
+`StatementBuilder`'s `selectById`, `deleteById`, `appendToCollection`, `removeFromCollection`, and
+`counterUpdate` — plus `BatchEngine`'s `@Version`-checked update and soft-delete-rewrite statements
+— all built their `WHERE` clause from `schema.partitionKeys` only. Never `schema.clusteringKeys`.
+One repeated pattern, roughly eight call sites, one root cause. On any entity with a clustering
+key, the consequences split three ways:
+
+- `append`/`remove`/`put`/`update`/`updateForce`/soft-delete hard-crashed with a driver-level
+  `InvalidQueryException: Missing mandatory PRIMARY KEY part <clustering-col>`.
+- `findById` didn't crash — it silently returned an *arbitrary* row from the partition, not the
+  one you asked for.
+- `deleteById` didn't crash either. It silently deleted the entire partition.
+
+<Callout kind="danger" title="This was a real data-loss bug">
+Take a `Todo` entity keyed by `(ownerId: PartitionKey, todoId: ClusteringKey)`. Before this fix,
+`todoRepo.deleteById(ownerId)` — called expecting to delete one todo — compiled, ran without error,
+and deleted **every todo that owner had ever created**, because the generated `DELETE` statement
+only ever named `ownerId` in its `WHERE` clause. Nothing about the call site looked wrong. The bug
+was an omission in generated CQL, not a mistake a reviewer reading the calling code could catch.
+</Callout>
+
+The `vararg` key arguments made it worse in a second, quieter way: `findById`/`deleteById` zipped
+the supplied key values against the (too-short) `partitionKeys` list with `.zip()`, which silently
+drops anything past the shorter list's length. A caller who passed extra values expecting them to
+disambiguate a clustering row — the *correct* instinct — had them silently discarded, with no
+error at all.
+
+### The fix
+
+Every listed call site now builds its `WHERE` clause, and binds its values, from
+`schema.partitionKeys + schema.clusteringKeys` — the full primary key, always. And critically, the
+fix doesn't stop at "make it correct when called correctly": `selectById`/`deleteById`/
+`appendToCollection`/`removeFromCollection` now **fail loudly** — `KandraSchemaException` naming
+the missing columns — if fewer key values are supplied than the full key requires, instead of
+silently truncating. `findById`/`deleteById` on a clustering-keyed entity now require the full key:
+
+```kotlin
+// Todo(ownerId: PartitionKey, todoId: ClusteringKey, ...)
+todoRepo.findById(ownerId, todoId)   // correct — full key
+todoRepo.deleteById(ownerId, todoId) // deletes exactly one row
+
+todoRepo.findById(ownerId)   // throws KandraSchemaException, not "some row"
+todoRepo.deleteById(ownerId) // throws KandraSchemaException, not "the whole partition"
+```
+
+Verified live, against a real 3-node cluster: `findById` with a partial key throws instead of
+returning an arbitrary row; `deleteById` with the full key deletes only the targeted row, with a
+sibling row in the same partition confirmed to survive; `append` and `@Version`-checked `update`
+both succeed instead of throwing `InvalidQueryException`.
+
+<Callout kind="gotcha" title="The lesson, beyond Kandra">
+Any time an operation's "identity" is a composite key, code that builds a `WHERE`/lookup clause
+from *part* of that key doesn't fail cleanly — it silently degrades to "affects more than you
+asked for" or "returns something plausible but wrong," neither of which looks like a bug at the
+call site. If a key can have more than one column, every place that consumes it needs to either use
+all of it or refuse to run — there's no safe partial-key default. This is true for a composite
+primary key in a relational schema, a compound partition key in any wide-column store, or a
+multi-field cache key — not just Cassandra clustering keys.
+</Callout>
+
+## ISS-029: fixing findById's key shape broke lookup index resolution
+
+Making `selectById` require the full key was correct. But it had a scope gap: nothing was updated
+to make the callers that *derive* a key from somewhere else actually supply the full one.
+
+`@LookupIndex` resolution — `find`/`findAll`/`findPage`/`exists`/`deleteBy`, anything that resolves
+a row by a lookup predicate instead of the primary key — works by reading the lookup row, then
+using the columns it stored to build a `selectById` call against the primary table. Those columns
+were `lookup.partitionKeyColumns`. That was the *entire* set `LookupTableSchema` had ever stored,
+because it was fine — right up until `selectById` started requiring more than the partition key.
+
+Any entity combining `@LookupIndex` with a clustering key broke immediately:
+`KandraSchemaException: selectById on '<table>' requires N key value(s) ... but M were provided.`
+on every lookup-based read or delete. Not a corner case — this is exactly the shape of Kandra's own
+worked example: a `User` with email/phone `@LookupIndex`es and a `bucketedAt` clustering key.
+
+### The fix
+
+`LookupTableSchema` gained a `clusteringKeyColumns` field, populated the same way
+`partitionKeyColumns` already was. The generated lookup table now carries extra plain columns for
+each of the primary table's clustering-key columns (its own `PRIMARY KEY` is unchanged — it's still
+just the lookup column itself), writes and reads them, and the four lookup-resolution call sites in
+`QueryExecutor` collect the full key — partition *and* clustering — before calling `selectById`.
+`findPage`'s lookup path had a second bug baked into the same root cause: it only ever converted the
+partition key into predicates, which on a clustering-keyed entity meant it would scatter across
+every clustering row in the partition, not resolve the one the lookup value actually pointed to.
+Including the clustering key in those predicates fixed both problems in the same change.
+
+<Callout kind="note">
+This is a schema/DDL change. Lookup tables created before this fix — under `AUTO_CREATE`, which
+never alters existing tables — don't get the new clustering-key columns until `AUTO_MIGRATE` runs
+against them or the keyspace is recreated. Same migration story as any other new column: `AUTO_MIGRATE`
+handles it, `AUTO_CREATE` does not retroactively alter what's already there.
+</Callout>
+
+## ISS-030: fixing lookup resolution surfaced a soft-delete bug that couldn't be reached before
+
+While verifying the ISS-029 fix against the capstone's `Post` entity (which combines
+`@LookupIndex(postId)` with `@SoftDelete`), a `DELETE /posts/{id}` — resolved via lookup, soft
+deleted — came back wrong. `BatchEngine.softDeleteBlocking`/`softDeleteSuspend` unconditionally
+deleted every `@LookupIndex` row for the entity at the end of the soft-delete sequence, contradicting
+the documented design outright: a soft-deleted row still *exists* (queryable, non-key columns not
+yet TTL'd) until its own TTL expires, and it should stay resolvable via its lookup index for exactly
+the same reason `findById` still finds it.
+
+This bug had existed the whole time. It was never observable, because `Post` — the entity that
+combines `@LookupIndex` and clustering keys and `@SoftDelete` — couldn't even reach its own
+soft-delete path via a lookup-driven request until ISS-029 was fixed; the request failed earlier, at
+lookup resolution itself. Fixing ISS-029 didn't introduce this bug. It made an existing one
+reachable for the first time.
+
+### The fix
+
+Removed the unconditional `schema.lookupTables.forEach { ... deleteLookup(...) }` block from both
+`softDeleteBlocking` and `softDeleteSuspend` entirely. Hard delete — the other branch of `delete()`,
+used when `@SoftDelete` is absent — is unaffected and still correctly removes lookup rows, because a
+hard-deleted row really is gone and shouldn't still resolve.
+
+Verified live: `POST /posts` → `DELETE /posts/{id}` (soft delete) → `GET /posts/{id}` (resolved via
+the same `@LookupIndex`) now correctly returns the post, marked `isDeleted: true`, instead of a
+lookup-resolution failure.
+
+## The lesson across all three
+
+<Callout kind="danger" title="Tightening a contract doesn't stop at the call site that prompted it">
+ISS-025's fix was correct. It was also incomplete, twice, in a specific and predictable way: every
+place that *derives* a value from the same shape the contract governs — a cache key built from
+"the key columns," a lookup table storing "the key columns," anything computed once and assumed
+stable — silently goes stale the moment the shape of "the key columns" changes, and nothing forces
+it to change in lockstep. The fix for a bug like this isn't just "make the primary code path
+correct." It's "grep for every place that read the old assumption," including the ones that were
+never wrong on their own — they were wrong the instant something else they depended on changed
+underneath them. See [`/battle-scars/cache-invalidation`](/battle-scars/cache-invalidation) for a
+fourth instance of exactly this same root cause, in the cache layer.
+</Callout>

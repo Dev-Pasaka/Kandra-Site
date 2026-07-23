@@ -1,0 +1,144 @@
+export const metadata = {
+  title: "Recipe: multi-table writes",
+  description:
+    "KandraBatchScope done correctly — the real atomicity guarantee, the saveInBatch/deleteInBatch naming, and why the obvious-looking save()/delete() version inside a batch block doesn't work.",
+};
+
+# Recipe: multi-table writes
+
+**Problem:** a single logical operation needs to write to more than one table atomically —
+Cassandra's only cross-table atomicity primitive is a `LOGGED BATCH`, and there's no ambient
+`@Transactional` that makes a few sequential `save()` calls atomic just because they happened to run
+inside the same function. `KandraBatchScope` is Kandra's explicit, opt-in way to get that guarantee
+— but the API shape it settled on exists specifically because an earlier shape looked correct,
+compiled, and silently provided zero atomicity. Read that part before you write this code.
+
+## The scenario
+
+Creating a post that also needs a denormalized `posts_by_tag` row per tag, atomically — the same
+multi-write this site's own capstone builds (see
+[`/recipes/social-feed-capstone`](/recipes/social-feed-capstone#flow-1-the-multi-write-problem)). A
+partial failure here — the post committed, one tag row missing — leaves a post visible in the
+author's feed but invisible to tag search, or vice versa. That's exactly the bug class
+`KandraBatchScope` exists to close.
+
+```kotlin
+@OptIn(ExperimentalKandraApi::class)
+application.kandra.batch {
+    postRepo.saveInBatch(post)
+    tags.forEach { tag ->
+        postByTagRepo.saveInBatch(PostByTag(tag, post.createdAt, post.postId, post.authorId))
+    }
+}
+```
+
+`KandraRuntime.batch { }` is `suspend`; `.batchBlocking { }` is its blocking twin, for non-suspend
+contexts. In Ktor, both hang off `application.kandra` (`Application.kandra: KandraRuntime`). Every
+statement collected inside the block is folded into a single `BatchStatement` and executed as one
+`LOGGED BATCH` when the block exits — genuinely atomic, at the cost of a cross-partition batch.
+
+## `saveInBatch`/`deleteInBatch` — not `save`/`delete`, and that's deliberate
+
+<Callout kind="danger" title="ISS-026/027: the obvious-looking save()/delete() inside a batch block never actually batched anything">
+This is the single most important thing to understand about this API, because the bug it fixes was
+invisible short of reading debug logs line by line. `KandraBatchScope` originally declared `save`/
+`delete` as member-extension functions on the repository types, intended to be called as
+`with(repo) { save(entity) }` (or, in the old KDoc example, even bare `repo.save(entity)`) inside a
+`batch { }`/`batchBlocking { }` block — the extension would collect the statement instead of
+executing it.
+
+It never worked. **Kotlin always resolves a member function of the extension receiver over an
+extension function with a matching name** — unconditionally, even when the extension is itself a
+member-extension of a closer implicit receiver, which is exactly what `KandraBatchScope`'s `save`
+was. Since every repository already has its own real `save`/`delete` member, `repo.save(entity)`
+inside a batch block always resolved to the repository's **own**, immediately-executing method —
+never the batch-collecting one. For suspend repositories this failed to compile outright
+("suspension functions can only be called within a coroutine body"); for blocking repositories it
+silently **compiled, returned success, and executed N independent `LOGGED BATCH`es instead of one**
+— confirmed live, via `debug.logBatches`, as three separate batch executions for a two-tag post
+instead of the one combined batch the API was supposed to guarantee. Zero atomicity, with no error,
+no warning, and no signal short of reading batch logs.
+
+**Fixed** by renaming to `saveInBatch`/`deleteInBatch`/`saveIfNotExistsInBatch` — names that don't
+collide with any real repository member, so there is no ambiguity left for Kotlin to resolve
+incorrectly. If it compiles as `repo.saveInBatch(entity)`, it can only have resolved to the
+batch-collecting extension — the naming itself is the fix, not just a cosmetic rename.
+</Callout>
+
+```kotlin title="KandraBatchScope.kt"
+fun <T : Any> KandraSuspendRepository<T>.saveInBatch(entity: T, ttlSeconds: Int? = null)
+fun <T : Any> KandraRepository<T>.saveInBatch(entity: T, ttlSeconds: Int? = null)
+fun <T : Any> KandraSuspendRepository<T>.deleteInBatch(entity: T)
+fun <T : Any> KandraRepository<T>.deleteInBatch(entity: T)
+```
+
+Call these directly on the repository — no `with(repo) { }` wrapper needed (and none of the wording
+above should be read as endorsing that pattern; it was only ever relevant to the broken shape):
+
+```kotlin
+application.kandra.batchBlocking {
+    postRepo.saveInBatch(post)
+    postByTagRepo.deleteInBatch(staleTagRow)
+}
+```
+
+<Callout kind="gotcha" title="saveIfNotExists is also unreachable inside a batch — for the same reason, verify the guard exists">
+Fixing ISS-026 surfaced an identical bug in `KandraBatchScope`'s `saveIfNotExists` guard
+(`ISS-027`): a same-named member-extension whose only job was to throw — LWT can't share a `LOGGED
+BATCH` with regular statements — was itself unreachable via the member-over-extension rule, so
+`repo.saveIfNotExists(entity)` inside a batch block silently executed a **real, immediate** LWT
+write instead of throwing. Fixed the same way: renamed to `saveIfNotExistsInBatch`, which always
+throws `KandraQueryException` — LWT genuinely cannot be mixed into a `LOGGED BATCH` with other
+statements, so there is no working version of this call inside a batch scope, by design, not by
+current limitation.
+</Callout>
+
+## What's inside the atomic guarantee, and what isn't
+
+- **Included**: every `saveInBatch`/`deleteInBatch` call's primary-row statement, plus any
+  `LookupConsistency.BATCH` lookup writes for that entity — all folded into the one `LOGGED BATCH`
+  executed on block exit.
+- **Not included**: `LookupConsistency.EVENTUAL` lookup writes never join the batch — they still
+  fire separately, fire-and-forget, after the batch commits, exactly as they would outside a batch
+  scope. A batch block doesn't make an `EVENTUAL` lookup atomic; only the entity's own
+  `LookupConsistency` setting decides that (see [`/recipes/lookup-tables`](/recipes/lookup-tables)).
+- **Not available at all**: reads. `findAll`, `findById`, and every other read operation are simply
+  absent from `KandraBatchScope` — there is no way to read-then-conditionally-write inside a batch
+  block, because Cassandra batches don't support that shape either.
+- **Not available at all**: `saveIfNotExistsInBatch` — always throws, per ISS-027 above. LWT and
+  `LOGGED BATCH` are mutually exclusive in CQL itself; Kandra just surfaces that as an explicit
+  runtime error instead of a confusing driver exception.
+
+## Verifying it actually batched
+
+`debug.logBatches = true` on `install(Kandra) { }` logs one line per `LOGGED BATCH` execution with
+its statement count — the same signal that caught the original bug. For a two-write batch, you
+should see exactly one line covering both statements, not two lines:
+
+```
+Executing LOGGED BATCH with 3 statements for posts
+```
+
+not
+
+```
+Executing LOGGED BATCH with 2 statements for posts
+Executing LOGGED BATCH with 1 statements for posts_by_tag
+```
+
+If you see the second shape, something in the call isn't actually going through the batch-collecting
+extensions — check for a stray `with(repo) { }` or a direct `repo.save(...)` call that slipped back
+in.
+
+<Callout kind="tip">
+The `@OptIn(ExperimentalKandraApi::class)` requirement on batch APIs is a real signal, not
+boilerplate — this corner of the API had two structural bugs found against a live cluster before it
+worked as documented. Treat the experimental marker as "verify this behaves the way you expect
+before shipping it," not as noise to suppress.
+</Callout>
+
+See [`/philosophy/atomicity`](/philosophy/atomicity) for the broader argument on why Cassandra has
+no ambient transaction and what that means for how you should think about multi-table writes, and
+[`/battle-scars/batch-scope-shadowing`](/battle-scars/batch-scope-shadowing) for the full story of
+this Kotlin resolution rule — it applies anywhere you try to shadow a member function with a
+same-named extension, not just here.
