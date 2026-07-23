@@ -13,12 +13,14 @@ This site does not duplicate the exhaustive, generated signature reference — t
 every tag, so it's never out of date with itself. What this site adds is the part Dokka can't: why
 a given annotation or method exists, when to reach for it, and what breaks if you don't.
 
-<Callout kind="note" title="Version gap">
+<Callout kind="note" title="Kandra version this site tracks">
 This site's prose and code examples are verified against Kandra **v{KANDRA_VERSION}** (the current
-source). The published Dokka site currently serves **v{DOKKA_PUBLISHED_VERSION}** — it lags behind
-by one release. If a signature on Dokka looks different from what's shown here, trust this site's
-description of *why*, and treat the Dokka page for the exact current signature with that gap in
-mind until a new Dokka build is published.
+source — the latest tag on `main` in the Kandra repo). The published Dokka site currently serves
+**v{DOKKA_PUBLISHED_VERSION}**
+{" "}
+{KANDRA_VERSION === DOKKA_PUBLISHED_VERSION
+  ? "— caught up, no gap right now. Dokka publishing is a separate step from tagging a release, so this can fall behind again; if it has, trust this site's description of why over a stale Dokka signature."
+  : "— it lags behind. If a signature on Dokka looks different from what's shown here, trust this site's description of why, and treat the Dokka page for the exact current signature with that gap in mind until a new Dokka build is published."}
 </Callout>
 
 ## How to use this section

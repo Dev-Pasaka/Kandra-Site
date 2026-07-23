@@ -17,13 +17,15 @@ covers what the module is, why it's separate rather than folded into something e
 annotation/class/function relevant to a consumer with a real, compiling example, and the gotchas its
 own source comments and issue history flag.
 
-<Callout kind="note" title="Version gap between this site and Dokka">
+<Callout kind="note" title="Kandra version this site tracks">
 This site's prose and code examples are verified against Kandra **v{KANDRA_VERSION}** (current
-source). The "Full API reference" link on every module page points at the published Dokka site,
-which currently serves **v{DOKKA_PUBLISHED_VERSION}** — one release behind. If a Dokka signature
-looks different from what a module page here describes, trust this site's description of *why* a
-thing works the way it does, and treat the Dokka page as the exact-signature source for whatever the
-gap doesn't cover yet. See [`/reference`](/reference) for more on how the two fit together.
+source, i.e. the latest tag on `main` in the Kandra repo). The "Full API reference" link on every
+module page points at the published Dokka site, which currently serves **v{DOKKA_PUBLISHED_VERSION}**
+{" "}
+{KANDRA_VERSION === DOKKA_PUBLISHED_VERSION
+  ? "— caught up, no gap right now. That won't stay true forever, since Dokka publishing is a separate step from tagging a release; re-check this note if you're reading it much later."
+  : "— behind by at least one release. If a Dokka signature looks different from what a module page here describes, trust this site's description of why a thing works the way it does, and treat the Dokka page as the exact-signature source for whatever the gap doesn't cover yet."}
+{" "}See [`/reference`](/reference) for more on how the two fit together.
 </Callout>
 
 ## The modules

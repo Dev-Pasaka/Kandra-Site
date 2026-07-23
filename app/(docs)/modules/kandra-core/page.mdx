@@ -1,5 +1,4 @@
 import { dokkaClassUrl, dokkaModuleUrl, dokkaPackageUrl } from "@/lib/dokka";
-import { DOKKA_PUBLISHED_VERSION } from "@/lib/site-config";
 
 export const metadata = {
   title: "kandra-core",
@@ -860,13 +859,6 @@ it's considered stable public API.
 <a href={dokkaClassUrl("kandra-core", "io.kandra.core", "KandraUuid")} target="_blank" rel="noreferrer"><code>KandraUuid</code> →</a> ·{" "}
 <a href={dokkaClassUrl("kandra-core", "io.kandra.core", "KandraConsistency")} target="_blank" rel="noreferrer"><code>KandraConsistency</code> →</a> ·{" "}
 <a href={dokkaPackageUrl("kandra-core", "io.kandra.core.schema")} target="_blank" rel="noreferrer"><code>io.kandra.core.schema</code> package →</a>
-
-<Callout kind="note">
-`GeneratedUuid` and `KandraUuid` shipped in v0.4.6, after the Dokka snapshot currently published
-(v{DOKKA_PUBLISHED_VERSION}) — the two links above will 404 until Dokka republishes. Same version
-gap explained on [`/modules`](/modules) and [`/reference`](/reference), just visible here as a
-missing page instead of a stale one.
-</Callout>
 
 ## Where this shows up elsewhere on this site
 
