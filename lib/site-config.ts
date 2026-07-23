@@ -7,9 +7,7 @@ export const KANDRA_VERSION = "0.4.5";
 export const KANDRA_REPO_URL = "https://github.com/Dev-Pasaka/kandra";
 
 // This documentation site's own repo, for "Edit this page" links.
-// Update once the site is pushed to its permanent home.
-export const SITE_REPO_URL = "https://github.com/Dev-Pasaka/kandra-docs";
-export const SITE_REPO_CONTENT_PATH = "content"; // where MDX source lives, relative to repo root
+export const SITE_REPO_URL = "https://github.com/Dev-Pasaka/Kandra-Site";
 
 // Dokka publishes at this base. Verified live on 2026-07-22: the site redirects
 // "/" to the latest *published* version directory, which currently lags behind
