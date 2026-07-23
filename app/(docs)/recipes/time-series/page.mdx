@@ -39,6 +39,17 @@ transactions live together on the same replicas. `createdAt DESC` is the cluster
 is a second clustering column (`index = 1`), included to guarantee row uniqueness — `createdAt`
 alone isn't safe as a sole clustering key when two transactions can land in the same millisecond.
 
+<Callout kind="tip" title="Prefer @GeneratedUuid over a raw Instant clustering key">
+The two-column `createdAt` + `txId` shape above is one valid way to solve the same-millisecond
+collision problem. For a clustering key that only needs to sort by creation time — no separate,
+independently-meaningful id required — a single `@GeneratedUuid @ClusteringKey val id: UUID` column
+does both jobs at once: `UuidStrategy.TIME_ORDERED` (the default) generates a UUIDv7, which sorts
+chronologically the same way `createdAt DESC` does, with no collision risk and one fewer column to
+maintain. See [`/modules/kandra-core`](/modules/kandra-core#generateduuid) for the annotation and
+[`/battle-scars/time-ordered-clustering-keys`](/battle-scars/time-ordered-clustering-keys) for why
+this exists.
+</Callout>
+
 <Callout kind="note" title="The sort order is a schema decision, not a query decision">
 `ClusteringOrder.DESC` here is chosen once, in the entity definition, and every read against this
 partition comes back in that order for free — no `ORDER BY` at query time, because there is no

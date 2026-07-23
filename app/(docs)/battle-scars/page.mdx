@@ -56,5 +56,9 @@ the same audit pass: soft-delete filtering, bean validation autodetection, a del
 bypassed soft-delete entirely, a consistency-level setting silently ignored on collection writes,
 and an error message that pointed callers at a method that didn't exist.
 
+**[Time-ordered keys, not timestamps](/battle-scars/time-ordered-clustering-keys)** — the one entry
+here that isn't a bug: the same-millisecond collision risk in an `Instant`-derived clustering key,
+and why `@GeneratedUuid` exists so nobody has to find this one the hard way.
+
 None of these are still open. They're left in place, not deleted, because a fixed-bug archive that
 gets erased once it's inconvenient isn't a fixed-bug archive — it's marketing.

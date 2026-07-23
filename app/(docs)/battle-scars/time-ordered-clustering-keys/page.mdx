@@ -1,0 +1,64 @@
+export const metadata = {
+  title: "Time-ordered keys, not timestamps",
+  description:
+    "The one entry in this section that isn't a bug: the same-millisecond clustering-key collision that upsert semantics make silent, and why @GeneratedUuid exists so nobody has to find it the hard way.",
+};
+
+# Time-ordered keys, not timestamps
+
+Every other page in this section is a real bug, found the hard way, with a root cause and a fix.
+This one isn't. `@GeneratedUuid` shipped in v0.4.6 as a proactive design decision — nobody filed an
+`ISS-NNN` for it, because the failure mode it closes off never actually happened in Kandra's own
+codebase or its test suite. It's here anyway because the failure mode is real, it's silent, and
+every one of the other clustering-key stories in this section (see
+[`/battle-scars/clustering-keys-and-lookup-tables`](/battle-scars/clustering-keys-and-lookup-tables))
+started as exactly this kind of thing someone noticed before it became a production incident.
+
+## The problem, stated plainly
+
+Cassandra/ScyllaDB writes are upserts on partition key + clustering key — there is no separate
+insert-vs-overwrite path, and no unique-constraint violation to catch a collision for you. If an
+application derives a clustering key from `Instant.now()` (or any other source no finer than
+millisecond resolution), two rows written to the same partition in the same millisecond collide
+silently: the second `save()` just overwrites the first row. No exception. No warning. No log line.
+The row count for that partition is quietly one lower than the number of times `save()` was called.
+
+<Callout kind="danger" title="Why this is worse than it sounds">
+This isn't a rare edge case gated behind unusual timing. A tight loop, a batch import, two
+concurrent requests from the same user, or simply a fast enough write path can land two inserts in
+the same millisecond without anything unusual happening. The bug has no stack trace, no failed
+assertion, and no error log to grep for — the only symptom is a partition with fewer rows than it
+should have, discovered later, if it's discovered at all.
+</Callout>
+
+## The fix that closes it off
+
+`@GeneratedUuid` has Kandra generate the key value itself, instead of trusting a caller-supplied
+timestamp:
+
+```kotlin
+@ScyllaTable("events")
+data class Event(
+    @PartitionKey val streamId: UUID,
+    @GeneratedUuid @ClusteringKey val eventId: UUID = UUID(0, 0),
+    val payload: String,
+)
+```
+
+`UuidStrategy.TIME_ORDERED` (the default) generates a UUIDv7 via `KandraUuid.timeOrdered()`.
+UUIDv7's 48-bit millisecond timestamp sits in the leading bytes, so plain lexicographic comparison —
+exactly how Cassandra's `UUIDType` comparator orders a generic `uuid` column — already sorts
+chronologically, the same ordering an `Instant` clustering key would have given, minus the collision
+risk: the other 74 bits of a UUIDv7 are freshly random on every call, so two rows generated in the
+same millisecond still get distinct, correctly-ordered key values. See
+[`/modules/kandra-core`](/modules/kandra-core#generateduuid) for the full annotation reference and
+[`/recipes/time-series`](/recipes/time-series) for using it as a clustering key in practice.
+
+<Callout kind="tip" title="The lesson, beyond Kandra">
+Never derive a value that needs to be unique from wall-clock time at millisecond resolution. If
+"unique" and "sortable" both matter — a clustering key, an event id, anything that has to order
+correctly *and* never collide — reach for a purpose-built id scheme instead of a timestamp:
+UUIDv7, a Twitter-style snowflake id, or a database sequence. A timestamp alone gives you sortable;
+it doesn't give you unique, no matter how fine the resolution looks on paper, because two writers
+can always land in the same tick.
+</Callout>

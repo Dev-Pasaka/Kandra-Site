@@ -1,4 +1,5 @@
 import { dokkaClassUrl, dokkaModuleUrl, dokkaPackageUrl } from "@/lib/dokka";
+import { DOKKA_PUBLISHED_VERSION } from "@/lib/site-config";
 
 export const metadata = {
   title: "kandra-core",
@@ -278,6 +279,73 @@ Marks the optimistic-lock column. Must be `Long` or `Instant` — any other type
 version; only two-argument `update(old, new)` enforces the LWT `IF version = ?` check — see
 [`/modules/kandra-runtime`](/modules/kandra-runtime#update-family) and
 [`/recipes/optimistic-locking`](/recipes/optimistic-locking).
+
+### `@GeneratedUuid`
+
+```kotlin
+@Target(AnnotationTarget.PROPERTY) annotation class GeneratedUuid(val strategy: UuidStrategy = UuidStrategy.TIME_ORDERED)
+enum class UuidStrategy { TIME_ORDERED, RANDOM }
+```
+
+Auto-populates a `UUID` field on every INSERT (`save`, `saveIfNotExists`, `saveWithNulls`, and their
+suspend/batch equivalents) via `KandraUuid` below — the same reflective `copy()` mechanism
+`@CreatedAt` uses. Must be on a `UUID` field, or registration throws `KandraSchemaException` naming
+the actual `KType`, the same check `@Version` gets. Never touched by `update()`/`updateForce()`,
+since primary-key components are immutable in Cassandra — this exists for keys, not general-purpose
+columns.
+
+Solves a specific problem: Cassandra/ScyllaDB writes are upserts on the full primary key, so a
+clustering (or partition) key derived from `Instant.now()` collides silently if two rows in the same
+partition land in the same millisecond — the second `save()` just overwrites the first, no
+exception, no warning. `TIME_ORDERED` (the default) sidesteps this with a UUIDv7: its 48-bit
+millisecond timestamp sits in the leading bytes, so plain lexicographic comparison — exactly how
+Cassandra's `UUIDType` comparator orders a generic `uuid` column — already sorts chronologically, with
+no dependency on Cassandra's separate `timeuuid` CQL type, which Kandra doesn't map to at all.
+`RANDOM` generates a UUIDv4 instead, for ids that must not leak their creation time.
+
+```kotlin
+@ScyllaTable("events")
+data class Event(
+    @PartitionKey val streamId: UUID,
+    @GeneratedUuid @ClusteringKey val eventId: UUID = UUID(0, 0),
+    val payload: String,
+)
+```
+
+<Callout kind="gotcha">
+`eventId`'s default value above is a placeholder only, so the data class constructor doesn't force
+every caller to supply one — Kandra overwrites it unconditionally on every insert. Don't rely on a
+caller-supplied value surviving a `save()`; if you need a specific id ahead of time, generate one with
+`KandraUuid` directly rather than assuming whatever you pass into the constructor sticks.
+</Callout>
+
+See [`/battle-scars/time-ordered-clustering-keys`](/battle-scars/time-ordered-clustering-keys) for
+the same-millisecond collision this exists to avoid, and
+[`/recipes/time-series`](/recipes/time-series) for using it as a sortable clustering key in practice.
+
+### `KandraUuid` — `io.kandra.core.KandraUuid`
+
+```kotlin
+object KandraUuid {
+    fun timeOrdered(): UUID // UUIDv7 — sortable by creation time as a plain `uuid` column
+    fun random(): UUID      // UUIDv4 — effectively UUID.randomUUID()
+}
+```
+
+What `@GeneratedUuid` calls internally to do the actual generation — also usable directly, outside
+the annotation/insert lifecycle, wherever application code needs a UUIDv7/UUIDv4 (an id to hand a
+client before the row is ever saved, for example):
+
+```kotlin
+val id = KandraUuid.timeOrdered()
+```
+
+<Callout kind="note">
+`timeOrdered()` reads the system clock once per call, but two calls in the same millisecond still
+produce distinct, correctly-ordered UUIDs — the other 74 bits (12 in the timestamp's own 16-bit
+group, 62 in the trailing group) are freshly random each time. It's the value itself that's
+collision-resistant, not a counter or lock that needs external coordination.
+</Callout>
 
 ### `@SoftDelete`
 
@@ -786,10 +854,19 @@ it's considered stable public API.
 
 ## Full API reference
 
-[`kandra-core` on Dokka →]({dokkaModuleUrl("kandra-core")}) ·
-[`LookupIndex` →]({dokkaClassUrl("kandra-core", "io.kandra.core.annotations", "LookupIndex")}) ·
-[`KandraConsistency` →]({dokkaClassUrl("kandra-core", "io.kandra.core", "KandraConsistency")}) ·
-[`io.kandra.core.schema` package →]({dokkaPackageUrl("kandra-core", "io.kandra.core.schema")})
+<a href={dokkaModuleUrl("kandra-core")} target="_blank" rel="noreferrer"><code>kandra-core</code> on Dokka →</a> ·{" "}
+<a href={dokkaClassUrl("kandra-core", "io.kandra.core.annotations", "LookupIndex")} target="_blank" rel="noreferrer"><code>LookupIndex</code> →</a> ·{" "}
+<a href={dokkaClassUrl("kandra-core", "io.kandra.core.annotations", "GeneratedUuid")} target="_blank" rel="noreferrer"><code>GeneratedUuid</code> →</a> ·{" "}
+<a href={dokkaClassUrl("kandra-core", "io.kandra.core", "KandraUuid")} target="_blank" rel="noreferrer"><code>KandraUuid</code> →</a> ·{" "}
+<a href={dokkaClassUrl("kandra-core", "io.kandra.core", "KandraConsistency")} target="_blank" rel="noreferrer"><code>KandraConsistency</code> →</a> ·{" "}
+<a href={dokkaPackageUrl("kandra-core", "io.kandra.core.schema")} target="_blank" rel="noreferrer"><code>io.kandra.core.schema</code> package →</a>
+
+<Callout kind="note">
+`GeneratedUuid` and `KandraUuid` shipped in v0.4.6, after the Dokka snapshot currently published
+(v{DOKKA_PUBLISHED_VERSION}) — the two links above will 404 until Dokka republishes. Same version
+gap explained on [`/modules`](/modules) and [`/reference`](/reference), just visible here as a
+missing page instead of a stale one.
+</Callout>
 
 ## Where this shows up elsewhere on this site
 
@@ -800,6 +877,10 @@ it's considered stable public API.
 - [`/battle-scars/clustering-keys-and-lookup-tables`](/battle-scars/clustering-keys-and-lookup-tables) —
   the real bug (ISS-025) behind why lookup resolution needs the full primary key, not just the
   partition key, and why `LookupTableSchema.clusteringKeyColumns` exists.
+- [`/battle-scars/time-ordered-clustering-keys`](/battle-scars/time-ordered-clustering-keys) — the
+  same-millisecond collision `@GeneratedUuid` exists to avoid, shipped proactively rather than found
+  as a bug.
 - [`/recipes/lookup-tables`](/recipes/lookup-tables), [`/recipes/soft-delete`](/recipes/soft-delete),
-  [`/recipes/counters`](/recipes/counters), [`/recipes/optimistic-locking`](/recipes/optimistic-locking) —
-  task-oriented walkthroughs of the annotations on this page.
+  [`/recipes/counters`](/recipes/counters), [`/recipes/optimistic-locking`](/recipes/optimistic-locking),
+  [`/recipes/time-series`](/recipes/time-series) — task-oriented walkthroughs of the annotations on
+  this page.
