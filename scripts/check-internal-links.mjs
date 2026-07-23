@@ -70,6 +70,9 @@ async function main() {
       while ((m = re.exec(text))) {
         let route = m[1];
         if (!route || route.startsWith("//")) continue;
+        // A template-literal href like `/modules/${m}` embeds a JS variable this static scan
+        // can't evaluate — skip it rather than checking the literal placeholder text as a route.
+        if (route.includes("${")) continue;
         route = route.replace(/\/$/, "") || "/";
         if (!found.has(route)) found.set(route, []);
         found.get(route).push(rel);
