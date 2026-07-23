@@ -29,6 +29,14 @@ const STALE_PATTERNS = [
       "KandraBatchScope's methods are saveInBatch/deleteInBatch/saveIfNotExistsInBatch, not the bare names " +
       "(Kotlin resolves a same-named repository member over the batch scope's extension).",
   },
+  {
+    name: "hand-hardcoded dependency version",
+    regex: /ke\.co\.coinx\.kandra:[\w-]+:\d+\.\d+\.\d+/,
+    message:
+      "Found a literal version number on a ke.co.coinx.kandra:* dependency coordinate. Dependency " +
+      "snippets should use the __KANDRA_VERSION__ placeholder (substituted at build time from " +
+      "lib/site-config.ts by lib/remark-kandra-version.mjs), not a hand-typed version string.",
+  },
 ];
 
 async function walk(dir) {

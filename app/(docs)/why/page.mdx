@@ -1,3 +1,5 @@
+import { FaultLineScene } from "@/components/illustrations/fault-line-scene";
+
 export const metadata = {
   title: "Why Kandra",
   description:
@@ -9,6 +11,10 @@ export const metadata = {
 Every page on this site is written by someone who has personally felt the pain of building on a
 distributed database and is done pretending it's "just SQL with extra steps." Before you read a
 single annotation reference, read this page — it's the argument the rest of the site is built on.
+
+<div className="not-prose my-8 text-ink" aria-hidden="true">
+  <FaultLineScene className="w-full h-auto max-w-2xl mx-auto" />
+</div>
 
 <Callout kind="danger" title="The core claim">
 A distributed, partition-oriented, leaderless database needs distributed thinking, not a

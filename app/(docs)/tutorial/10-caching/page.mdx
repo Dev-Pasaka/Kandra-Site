@@ -149,7 +149,7 @@ val reread = todoRepo.findById(ownerId, createdAt)!!            // cache miss ag
 check(reread.title == "Buy milk (urgent)")                      // passes on current Kandra
 ```
 
-<VersionNote>Verified against `kandra-runtime` as of Kandra v0.4.5 — `cacheKeyOf` is the live
+<VersionNote>Verified against `kandra-runtime` — `cacheKeyOf` is the live
 invalidation-key implementation.</VersionNote>
 
 Next: [`/tutorial/11-observability`](/tutorial/11-observability) — now that there's a cache, a

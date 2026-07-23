@@ -1,3 +1,5 @@
+import { KANDRA_VERSION } from "@/lib/site-config";
+
 export const metadata = {
   title: "02. Project setup",
   description:
@@ -30,7 +32,7 @@ repositories {
 
 dependencies {
     // Kandra
-    implementation(platform("ke.co.coinx.kandra:kandra-bom:0.4.5"))
+    implementation(platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__"))
     implementation("ke.co.coinx.kandra:kandra-ktor")
     implementation("ke.co.coinx.kandra:kandra-koin")
     ksp("ke.co.coinx.kandra:kandra-codegen")
@@ -62,13 +64,13 @@ version" error. Pinning to the same numbers Kandra ships with is the least-surpr
 ### `kandra-bom` — one version string, not five
 
 ```kotlin
-implementation(platform("ke.co.coinx.kandra:kandra-bom:0.4.5"))
+implementation(platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__"))
 ```
 
 Every other `ke.co.coinx.kandra:*` dependency below omits its version entirely — the BOM
-(`java-platform`) pins all of them to `0.4.5` as version *constraints*, so `kandra-ktor`,
+(`java-platform`) pins all of them to `{KANDRA_VERSION}` as version *constraints*, so `kandra-ktor`,
 `kandra-koin`, and `kandra-codegen` are guaranteed to be from the same release without you repeating
-`0.4.5` four times and risking one of them drifting out of sync on the next upgrade. This is the same
+the version string four times and risking one of them drifting out of sync on the next upgrade. This is the same
 pattern as Spring Boot's BOM or the Kotlin BOM — nothing Kandra-specific about the mechanism, just
 applied to Kandra's own module set.
 
