@@ -87,3 +87,25 @@ export function PlugIcon({ className }: IconProps) {
     </svg>
   );
 }
+
+// Trust-bar badge icons — same thin-stroke currentColor language, no borrowed
+// logos (abstract marks only, per the illustration convention in
+// illustrations/chariot-scene.tsx).
+
+export function PackageIcon({ className }: IconProps) {
+  return (
+    <svg className={className} width="15" height="15" viewBox="0 0 16 16" fill="none">
+      <path d="M8 1.5 14 4.75v6.5L8 14.5l-6-3.25v-6.5Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+      <path d="M2 4.75 8 8l6-3.25M8 8v6.5" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+export function LicenseIcon({ className }: IconProps) {
+  return (
+    <svg className={className} width="15" height="15" viewBox="0 0 16 16" fill="none">
+      <path d="M8 1.5v13M4 4.5h8M2 4.5 4 4l2 4-2 .5a2 2 0 0 1-2-4Zm12 0L12 4l-2 4 2 .5a2 2 0 0 0 2-4Z" stroke="currentColor" strokeWidth="1.15" strokeLinejoin="round" />
+    </svg>
+  );
+}
+

@@ -1,0 +1,8 @@
+```kotlin title="Todo.kt — historical bug, ISS-025 (fixed)"
+// Todo(ownerId: PartitionKey, todoId: ClusteringKey, ...)
+
+todoRepo.deleteById(ownerId)
+// Compiled. Ran without error.
+// Deleted every todo that owner had ever created — the whole partition,
+// not "the one row" the call site looked like it meant.
+```

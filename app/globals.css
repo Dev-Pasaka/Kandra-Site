@@ -1,65 +1,40 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------------- */
-/* Design tokens. Warm paper/ink neutrals, one restrained accent (copper),*/
-/* hairline borders instead of shadow/glow.                                */
+/* Design tokens. Dark-only slate/obsidian neutrals, electric amber as     */
+/* primary accent with cyan as a secondary signal. `data-theme="dark"` is  */
+/* set statically on <html> in app/layout.tsx — there is no light theme    */
+/* and no runtime toggle, so this selector always matches.                 */
 /* ---------------------------------------------------------------------- */
 
-:root {
-  --paper: #f7f4ec;
-  --paper-raised: #efe9db;
-  --paper-sunken: #eee7d4;
-  --ink: #1c1912;
-  --ink-muted: #625c4c;
-  --ink-faint: #8b8471;
-  --border: #ddd4bd;
-  --border-strong: #c9bd9c;
+:root[data-theme="dark"] {
+  --paper: #0a0e14;
+  --paper-raised: #10151d;
+  --paper-sunken: #060809;
+  --ink: #e8edf2;
+  --ink-muted: #8b98a8;
+  --ink-faint: #5c6779;
+  --border: #1c2530;
+  --border-strong: #2c3a4a;
 
-  --accent: #b5551e;
-  --accent-strong: #9a4517;
-  --accent-ink: #fff8ef;
-  --accent-soft: #f0dcc4;
+  --accent: #f5a623;
+  --accent-strong: #ffc857;
+  --accent-ink: #1a1206;
+  --accent-soft: #3d2a0d;
 
-  --note: #3e5c73;
-  --note-soft: #dfe7ec;
-  --tip: #3f6b4a;
-  --tip-soft: #dfeadf;
-  --danger: #a23b2e;
-  --danger-soft: #f3ddd6;
-  --gotcha: #8a5a12;
-  --gotcha-soft: #f1e2c4;
+  --note: #22d3ee;
+  --note-soft: #0d3a42;
+  --tip: #4ade80;
+  --tip-soft: #11331f;
+  --danger: #f87171;
+  --danger-soft: #3a1518;
+  --gotcha: #eab308;
+  --gotcha-soft: #362a08;
 
-  --code-bg: #fbf9f3;
+  --code-bg: #060809;
   --radius-sm: 3px;
   --radius: 6px;
   --radius-lg: 10px;
-}
-
-:root[data-theme="dark"] {
-  --paper: #17140e;
-  --paper-raised: #201c14;
-  --paper-sunken: #100e09;
-  --ink: #ece5d4;
-  --ink-muted: #a89d84;
-  --ink-faint: #746b57;
-  --border: #362f22;
-  --border-strong: #4a4230;
-
-  --accent: #e08a3e;
-  --accent-strong: #f0a35f;
-  --accent-ink: #1b1409;
-  --accent-soft: #3a2917;
-
-  --note: #7fa6c4;
-  --note-soft: #22303a;
-  --tip: #83c092;
-  --tip-soft: #223428;
-  --danger: #e08a75;
-  --danger-soft: #3a241f;
-  --gotcha: #e0b563;
-  --gotcha-soft: #3a2c14;
-
-  --code-bg: #100e09;
 }
 
 @theme inline {
@@ -86,9 +61,9 @@
   --color-gotcha: var(--gotcha);
   --color-gotcha-soft: var(--gotcha-soft);
 
-  --font-sans: var(--font-plex-sans);
-  --font-mono: var(--font-plex-mono);
-  --font-display: var(--font-plex-condensed);
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-jetbrains-mono);
+  --font-display: var(--font-inter-tight);
 
   --radius-sm: var(--radius-sm);
   --radius-md: var(--radius);
@@ -100,10 +75,6 @@
 }
 
 html {
-  color-scheme: light;
-}
-
-html[data-theme="dark"] {
   color-scheme: dark;
 }
 
@@ -113,6 +84,47 @@ body {
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/* Homepage-only exception to the sitewide "hairline borders, no glow" rule (see the design-tokens
+   comment above) — restrained glow on marketing CTAs/active-toggle states only. Docs pages and
+   every other card stay exactly as hairline-bordered as before. */
+.glow-accent:hover,
+.glow-accent:focus-visible {
+  box-shadow: 0 0 24px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.glow-note:hover,
+.glow-note:focus-visible {
+  box-shadow: 0 0 24px color-mix(in srgb, var(--note) 35%, transparent);
+}
+
+/* Real brand marks (components/brand-logo.tsx) stay monochrome (currentColor) at rest, like every
+   hand-drawn icon, and reveal their real brand color only on hover/focus. */
+.brand-logo {
+  transition: color 0.15s ease;
+}
+.brand-logo:hover,
+.brand-logo:focus-visible {
+  color: var(--brand-hex);
+}
+
+/* Cluster-topology background: faint dots at node positions, on a hairline
+   grid — a nod to a partitioned ring, not decoration for its own sake. */
+.cluster-grid {
+  background-image:
+    radial-gradient(circle, var(--border-strong) 1px, transparent 1px),
+    linear-gradient(var(--border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size: 64px 64px, 32px 32px, 32px 32px;
+  background-position: 0 0, 0 0, 0 0;
+  opacity: 1;
+}
+
+:root[data-theme="dark"] .cluster-grid {
+  background-image:
+    radial-gradient(circle, var(--border-strong) 1.2px, transparent 1.2px),
+    linear-gradient(var(--border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border) 1px, transparent 1px);
 }
 
 ::selection {
@@ -347,6 +359,10 @@ html[data-theme="dark"] .kandra-codeblock code[data-theme] span {
 /* ---------------------------------------------------------------------- */
 
 @media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+
   @keyframes wheel-spin {
     to {
       transform: rotate(360deg);
@@ -397,5 +413,17 @@ html[data-theme="dark"] .kandra-codeblock code[data-theme] span {
   }
   .anim-spark {
     animation: spark-rise 2.4s ease-out infinite;
+  }
+
+  /* components/scroll-reveal.tsx — visible by default outside this media query;
+     only animates in for visitors who don't prefer reduced motion. */
+  .reveal {
+    opacity: 0;
+    transform: translateY(14px);
+    transition: opacity 0.5s ease, transform 0.5s ease;
+  }
+  .reveal.is-visible {
+    opacity: 1;
+    transform: none;
   }
 }

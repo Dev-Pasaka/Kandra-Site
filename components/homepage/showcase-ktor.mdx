@@ -1,0 +1,17 @@
+```kotlin title="Application.kt"
+import io.kandra.ktor.*
+
+fun Application.configureDatabase() {
+    install(Kandra) {
+        contactPoints = "localhost:9042"
+        keyspace = "quickstart"
+        localDatacenter = "datacenter1"
+        autoCreateKeyspace = true
+        schemaMode = SchemaMode.AUTO_CREATE
+        register(User::class)
+        register(Todo::class)
+        auth { provider = KandraAuth.static("cassandra", "cassandra") } // local dev only
+    }
+    kandraKoin()
+}
+```

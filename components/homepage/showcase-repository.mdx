@@ -1,0 +1,27 @@
+```kotlin title="routes.kt"
+import io.kandra.runtime.repository.KandraSuspendRepository
+import org.koin.core.qualifier.named
+import org.koin.ktor.ext.inject
+
+fun Route.userRoutes() {
+    val userRepo by inject<KandraSuspendRepository<*>>(named("UserSuspendRepo"))
+
+    post("/users") {
+        val user = call.receive<User>()
+        userRepo.save(user) // primary row + users_by_email, one LOGGED BATCH
+        call.respond(HttpStatusCode.Created)
+    }
+
+    get("/users/by-email/{email}") {
+        val email = call.parameters["email"]!!
+        val user = userRepo.find { UserTable.email eq email }
+        call.respond(user ?: HttpStatusCode.NotFound)
+    }
+}
+
+// Cross-table atomicity that isn't @LookupIndex-shaped: explicit, not implied
+application.kandra.batchBlocking {
+    todoRepo.saveInBatch(todo)
+    todosByAssigneeRepo.saveInBatch(todoByAssignee)
+}
+```

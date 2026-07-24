@@ -1,0 +1,23 @@
+```kotlin title="entities.kt"
+import io.kandra.core.annotations.*
+import java.time.Instant
+import java.util.UUID
+
+@ScyllaTable("users")
+data class User(
+    @PartitionKey val userId: UUID,
+    @LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
+    val email: String,
+    val name: String,
+)
+
+@ScyllaTable("todos")
+@SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted") // 7 days
+data class Todo(
+    @PartitionKey val ownerId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
+    val todoId: UUID,
+    val title: String,
+    val isDeleted: Boolean = false,
+)
+```

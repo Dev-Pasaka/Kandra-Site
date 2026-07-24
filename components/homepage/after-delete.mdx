@@ -1,0 +1,9 @@
+```kotlin title="Todo.kt — today, v0.4.6"
+// Todo(ownerId: PartitionKey, todoId: ClusteringKey, ...)
+
+todoRepo.deleteById(ownerId, todoId) // deletes exactly one row
+
+todoRepo.deleteById(ownerId)
+// Fails at call time: KandraSchemaException, naming the missing
+// clustering-key column — not a silent partition wipe.
+```

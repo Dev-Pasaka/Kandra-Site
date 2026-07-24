@@ -1,0 +1,18 @@
+```kotlin title="User.kt + Application.kt"
+@ScyllaTable("users")
+data class User(
+    @PartitionKey val userId: UUID,
+    @LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
+    val email: String,
+    val name: String,
+)
+
+install(Kandra) {
+    contactPoints = "scylla:9042"
+    keyspace = "app"
+    register(User::class)
+}
+
+// Atomic write: users + the users_by_email lookup table, one LOGGED BATCH
+userRepo.save(User(id, "dev@coinx.co.ke", "Pasaka"))
+```
