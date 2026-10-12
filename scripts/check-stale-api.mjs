@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Sweeps all MDX content for known-stale Kandra API patterns that predate the
 // currently-documented version — e.g. the removed `+`-prefixed query DSL, or
-// KandraBatchScope's pre-rename `save`/`delete` methods. Run in CI on every
-// change so documentation drift is caught, not silently shipped.
+// KandraBatchScope's pre-rename `save`/`delete` methods. Run it before pushing
+// content changes so documentation drift is caught, not silently shipped.
 
 import { readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";

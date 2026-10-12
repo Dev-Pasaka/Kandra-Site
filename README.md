@@ -52,8 +52,9 @@ npm run check-stale-api      # sweeps content for known-stale API patterns (pre-
 npm run check-kandra-version # warns if the pinned Kandra version lags the latest upstream tag
 ```
 
-Both run in CI (`.github/workflows/`); `check-kandra-version` runs on a weekly schedule since it
-depends on upstream state, not just this repo's own changes.
+There is no CI in this repo, so run both before pushing to `main`. `check-kandra-version` depends on
+upstream state (the latest Kandra tag), not just this repo's own changes, so it's also worth running
+whenever Kandra cuts a release.
 
 ## Deployment
 
@@ -62,7 +63,6 @@ own Git integration (Workers Builds), which runs on every push to `main` indepen
 `wrangler.jsonc` (a static-assets Worker, no `main` script) plus a `wrangler deploy` deploy command
 configured in the Cloudflare dashboard is the whole pipeline. Nothing here triggers that deploy.
 
-`.github/workflows/deploy.yml` is validation only — `check-stale-api` + `next build` on every push
-and PR, to catch content/build errors before Cloudflare ever sees them. It doesn't deploy anything.
-The site has no backend, so it would deploy equally well to Vercel, Netlify, or any static host if
+There are no GitHub Actions workflows: Cloudflare's build is the only pipeline, so a build error
+surfaces there. The site has no backend, so it would deploy equally well to Vercel, Netlify, or any static host if
 that ever changes.
