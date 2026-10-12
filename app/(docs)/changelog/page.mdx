@@ -13,6 +13,57 @@ file per version, newest first. Every fix here links to the `docs/issues/ISS-NNN
 the actual root cause — this page summarizes, it doesn't replace those. See
 [`/battle-scars`](/battle-scars) for the narrative version of the bugs below.
 
+## Unreleased (on `main`)
+
+Merged to Kandra's `main` branch since v{KANDRA_VERSION} but **not in a tagged release yet** — nothing
+below is in the artifact you get from Maven Central today. The pages these changes touch carry a
+"Changing in the next release" note. Several of these fix real bugs that v{KANDRA_VERSION} still has.
+
+**Breaking or behavior-changing**
+
+- `findActive(allowFullScan = false)` throws `KandraQueryException` when the soft-delete marker column
+  has no `@SecondaryIndex`, instead of silently running `ALLOW FILTERING`
+  ([#12](https://github.com/Dev-Pasaka/kandra/issues/12)). See [`/recipes/soft-delete`](/recipes/soft-delete).
+- Versioned `update()`/`updateSuspend()` no longer retry on transient errors — the conditional
+  statement runs exactly once ([#19](https://github.com/Dev-Pasaka/kandra/pull/19)). See
+  [`/recipes/optimistic-locking`](/recipes/optimistic-locking).
+- `batch { }` and `batchBlocking { }` get distinct scope types; mixing repository types becomes a
+  compile error ([#99](https://github.com/Dev-Pasaka/kandra/issues/99)).
+- Throttle rejections surface as `KandraThrottledException`
+  ([#103](https://github.com/Dev-Pasaka/kandra/issues/103)); invalid consistency levels for an
+  operation (e.g. `EACH_QUORUM` for a read) are rejected before reaching the driver
+  ([#140](https://github.com/Dev-Pasaka/kandra/issues/140)).
+
+**New**
+
+- `saveAndGet()`, `saveIfNotExistsAndGet()`, `updateAndGet()` return the entity as persisted
+  ([#132](https://github.com/Dev-Pasaka/kandra/issues/132),
+  [#136](https://github.com/Dev-Pasaka/kandra/issues/136),
+  [#138](https://github.com/Dev-Pasaka/kandra/issues/138)).
+- `update()` accepts `serialConsistency` ([#134](https://github.com/Dev-Pasaka/kandra/issues/134)).
+- Consistency Strict Mode for multi-DC deployments ([#24](https://github.com/Dev-Pasaka/kandra/pull/24)).
+- `kandra-codegen` generates typed Koin/Kodein accessors ([#17](https://github.com/Dev-Pasaka/kandra/issues/17)).
+
+**Notable fixes** (all present in v{KANDRA_VERSION})
+
+- Counter columns threw on decode when any counter cell was NULL ([#93](https://github.com/Dev-Pasaka/kandra/issues/93)).
+- `findById()` cache hits, lookup-index reads, and versioned-update lookup writes ignored configured
+  consistency ([#95](https://github.com/Dev-Pasaka/kandra/issues/95),
+  [#96](https://github.com/Dev-Pasaka/kandra/issues/96)).
+- Predicate values skipped codec encoding, breaking `eq`/`gt`/`lt`/`in` on non-primitive columns
+  ([#144](https://github.com/Dev-Pasaka/kandra/issues/144)); `append()`/`remove()` bound the wrong
+  collection type ([#145](https://github.com/Dev-Pasaka/kandra/issues/145)); `IN` on a
+  `@SecondaryIndex` column queried the partition key instead
+  ([#146](https://github.com/Dev-Pasaka/kandra/issues/146)).
+- The `raw()`/`existsQuery` injection guard missed semicolon/comment payloads
+  ([#142](https://github.com/Dev-Pasaka/kandra/issues/142)).
+- `AUTO_MIGRATE` refuses to add a partition/clustering-key column
+  ([#92](https://github.com/Dev-Pasaka/kandra/issues/92)); migration claim and checksum fixes
+  ([#101](https://github.com/Dev-Pasaka/kandra/issues/101),
+  [#102](https://github.com/Dev-Pasaka/kandra/issues/102)).
+
+The full list lives in the <a href={`https://github.com/Dev-Pasaka/kandra/compare/v${KANDRA_VERSION}...main`}>commit history since v{KANDRA_VERSION}</a>.
+
 ## 0.4.6
 
 `@GeneratedUuid(strategy: UuidStrategy = TIME_ORDERED)` auto-populates a `UUID` field on every

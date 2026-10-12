@@ -27,11 +27,12 @@ export function SiteSidebar({ onNavigate }: { onNavigate?: () => void }) {
                     <Link
                       href={item.href}
                       onClick={onNavigate}
-                      className="block rounded-sm px-2 py-1 -ml-2 transition-colors"
+                      aria-current={isActive ? "page" : undefined}
+                      className="block rounded-md px-2.5 py-1.5 -ml-2.5 transition-colors hover:text-ink"
                       style={{
                         color: isActive ? "var(--accent-strong)" : "var(--ink-muted)",
                         background: isActive ? "var(--accent-soft)" : "transparent",
-                        fontWeight: isActive ? 600 : 400,
+                        fontWeight: isActive ? 500 : 400,
                       }}
                     >
                       {item.title}
@@ -59,19 +60,20 @@ function SidebarSection({
   const [open, setOpen] = useState(defaultOpen);
   return (
     <Collapsible.Root open={open} onOpenChange={setOpen} className="mb-5">
-      <Collapsible.Trigger className="flex w-full items-center justify-between text-xs font-display font-semibold uppercase tracking-wide text-ink-faint mb-2 cursor-pointer">
+      <Collapsible.Trigger className="flex w-full items-center justify-between text-[0.8rem] font-semibold text-ink mb-1.5 py-1 cursor-pointer">
         {title}
         <svg
           width="10"
           height="10"
           viewBox="0 0 16 16"
           fill="none"
-          style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}
+          className="chevron text-ink-faint"
+          style={{ transform: open ? "rotate(90deg)" : "none" }}
         >
           <path d="M5 3l6 5-6 5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </Collapsible.Trigger>
-      <Collapsible.Content>{children}</Collapsible.Content>
+      <Collapsible.Content className="disclosure">{children}</Collapsible.Content>
     </Collapsible.Root>
   );
 }

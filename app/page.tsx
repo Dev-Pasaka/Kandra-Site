@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import Link from "next/link";
 import { siKotlin, siApachecassandra, siSpringboot, siScylladb } from "simple-icons";
 import { ChariotScene } from "@/components/illustrations/chariot-scene";
@@ -5,8 +6,8 @@ import { KANDRA_VERSION, KANDRA_REPO_URL } from "@/lib/site-config";
 import { Tabs } from "@/components/tabs";
 import { BrandLogo } from "@/components/brand-logo";
 import { ScrollReveal } from "@/components/scroll-reveal";
-import { PersonaToggle } from "@/components/homepage/persona-toggle";
 import { BeforeAfterToggle } from "@/components/homepage/before-after-toggle";
+import { AzTopologySection } from "@/components/homepage/az-topology-section";
 import {
   LinkChainIcon,
   PartitionDeleteIcon,
@@ -53,10 +54,10 @@ const COMPARISON_ROWS = [
   },
 ];
 
-const SEVERITY_STYLE: Record<string, string> = {
-  P0: "text-danger border-danger/40",
-  P1: "text-gotcha border-gotcha/40",
-  P2: "text-tip border-tip/40",
+const SEVERITY_STYLE: Record<string, { label: string; className: string }> = {
+  P0: { label: "Data loss", className: "text-danger" },
+  P1: { label: "Production risk", className: "text-gotcha" },
+  P2: { label: "Cost", className: "text-tip" },
 };
 
 const PAIN_POINTS = [
@@ -92,7 +93,7 @@ const PAIN_POINTS = [
     q: "Why does this need ALLOW FILTERING, and why is everyone telling me not to use it?",
     problem:
       "Cassandra will let you write a query that triggers a full-cluster scatter-gather scan, and it will degrade a production cluster badly under load. Most ORMs don't stop you.",
-    fix: "Kandra's predicate query DSL (find {} / findAll {}) structurally cannot express ALLOW FILTERING — every predicate resolves through a partition key, @LookupIndex, or @SecondaryIndex, or the query throws at build time. The one exception is findActive() on @SoftDelete entities, which always scans the whole table with ALLOW FILTERING — logged with a WARN naming the cost, not silent, but not something the DSL stops you from reaching for.",
+    fix: "Kandra's predicate query DSL (find {} / findAll {}) structurally cannot express ALLOW FILTERING — every predicate resolves through a partition key, @LookupIndex, or @SecondaryIndex, or the query throws at build time. The one exception is findActive() on @SoftDelete entities, which always scans the whole table with ALLOW FILTERING — logged with a WARN naming the cost. The next release makes that an explicit opt-in too: without a @SecondaryIndex on the marker, findActive() throws unless you pass allowFullScan = true.",
     href: "/foundations",
     icon: ScanBlockedIcon,
   },
@@ -197,170 +198,126 @@ const BATTLE_SCAR_HIGHLIGHTS = [
   },
 ];
 
-function SeverityBadge({ level }: { level: string }) {
+function SeverityLabel({ level }: { level: string }) {
+  const { label, className } = SEVERITY_STYLE[level];
+  return <span className={`text-xs font-semibold ${className}`}>{label}</span>;
+}
+
+function SectionIntro({
+  eyebrow,
+  title,
+  children,
+  center = false,
+}: {
+  eyebrow?: string;
+  title: ReactNode;
+  children?: ReactNode;
+  center?: boolean;
+}) {
   return (
-    <span className={`inline-flex items-center rounded-sm border px-1.5 py-0.5 text-[10px] font-mono font-semibold ${SEVERITY_STYLE[level]}`}>
-      {level}
-    </span>
+    <div className={`max-w-3xl mb-12 md:mb-16 ${center ? "mx-auto text-center" : ""}`}>
+      {eyebrow && <p className="type-eyebrow mb-3">{eyebrow}</p>}
+      <h2 className="type-headline text-balance">{title}</h2>
+      {children && <p className="type-lede mt-5 text-pretty">{children}</p>}
+    </div>
   );
 }
+
+const inlineLink = "text-accent-strong hover:underline underline-offset-4";
 
 export default function HomePage() {
   return (
     <div className="flex-1">
-      {/* Hero — dual-track: Developers panel reuses the site's existing, verified pitch;
-          Teams panel is new, grounded in the same sourced failure modes, no invented stats. */}
-      <section className="cluster-grid relative overflow-hidden border-b border-border">
-        <div className="absolute inset-0 bg-gradient-to-b from-paper/40 via-paper/85 to-paper pointer-events-none" />
-        <div className="relative mx-auto max-w-[1400px] px-4 md:px-6 pt-16 pb-10 md:pt-20 md:pb-12">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <div className="border-l-2 border-accent pl-5">
-              <p className="font-mono text-xs text-accent-strong tracking-wide mb-4">
-                {`v${KANDRA_VERSION} · Apache 2.0 · Kotlin + ScyllaDB/Cassandra`}
-              </p>
-              <h1 className="font-display font-semibold text-3xl md:text-[2.6rem] leading-[1.08] tracking-tight">
-                A Kotlin ORM that doesn&apos;t pretend Cassandra is SQL with extra steps.
-              </h1>
-              <p className="mt-5 text-ink-muted leading-relaxed">
-                Kandra is a Ktor-native ORM for ScyllaDB and Cassandra. It makes partitioning,
-                denormalization, and distributed tradeoffs visible in your entity definitions
-                &mdash; so the query that looks correct actually is.
-              </p>
-              <div className="mt-7 flex flex-wrap items-center gap-3">
-                <Link
-                  href="/getting-started"
-                  className="glow-accent inline-flex items-center rounded-md bg-accent text-accent-ink px-5 py-2.5 text-sm font-medium hover:bg-accent-strong transition-all"
-                >
-                  Get started in 5 minutes &rarr;
-                </Link>
-                <a
-                  href={KANDRA_REPO_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center rounded-md border border-border px-5 py-2.5 text-sm font-medium text-ink hover:border-border-strong transition-colors"
-                >
-                  View on GitHub
-                </a>
-              </div>
-              <div className="hidden lg:block mt-8 w-full min-w-0 max-w-full overflow-hidden text-sm [&_.kandra-codeblock]:shadow-none [&_.kandra-codeblock]:text-xs [&_.kandra-codeblock]:max-w-full [&_.kandra-codeblock_pre]:max-w-full">
-                <HeroCode />
-              </div>
-            </div>
-
-            <div className="border-l-2 border-note pl-5">
-              <p className="font-mono text-xs text-note tracking-wide mb-4">For teams evaluating an ORM</p>
-              <h2 className="font-display font-semibold text-3xl md:text-[2.6rem] leading-[1.08] tracking-tight">
-                The Cassandra mistakes that page your team at 3am &mdash; caught before they ship.
-              </h2>
-              <p className="mt-5 text-ink-muted leading-relaxed">
-                Partition-wide deletes, batches that look atomic and aren&apos;t, tombstone buildup
-                that degrades reads for days &mdash; every one of these is a real, root-caused bug
-                from Kandra&apos;s own development against a live cluster, not a theoretical pitch.
-              </p>
-              <div className="mt-7 flex flex-wrap items-center gap-3">
-                <a
-                  href="#business-case"
-                  className="glow-note inline-flex items-center rounded-md bg-note text-accent-ink px-5 py-2.5 text-sm font-medium transition-all"
-                >
-                  See the business case &darr;
-                </a>
-                <Link href="/battle-scars" className="inline-flex items-center rounded-md border border-border px-5 py-2.5 text-sm font-medium text-ink hover:border-border-strong transition-colors">
-                  Read the battle scars
-                </Link>
-              </div>
-              <p className="mt-6 font-mono text-xs text-ink-faint leading-relaxed max-w-md">
-                Every failure mode on this page is documented with a root cause and a fix &mdash;{" "}
-                <Link href="/battle-scars" className="underline decoration-border-strong hover:decoration-current">
-                  not hypothetical
-                </Link>
-                .
-              </p>
-            </div>
-          </div>
-
-          <div className="mt-10 flex justify-center">
-            <PersonaToggle variant="hero" />
-          </div>
+      {/* Hero: one message, one focal object (the code), nothing moving behind it. */}
+      <section className="mx-auto max-w-[1100px] px-4 md:px-6 pt-16 pb-20 md:pt-28 md:pb-28 text-center">
+        {/* eslint-disable-next-line @next/next/no-img-element -- static export, plain SVG */}
+        <img src="/brand/kandra-octopus.svg" alt="" width={168} height={139} className="mx-auto mb-6 h-28 md:h-36 w-auto" />
+        <p className="type-eyebrow mb-5">Kandra {KANDRA_VERSION}</p>
+        <h1 className="type-hero text-balance mx-auto max-w-4xl">
+          A Kotlin ORM that doesn&apos;t pretend Cassandra is SQL with extra steps.
+        </h1>
+        <p className="type-lede mt-6 mx-auto max-w-2xl text-pretty">
+          A Ktor-native ORM for ScyllaDB and Cassandra. Partitioning, denormalization, and
+          distributed tradeoffs are visible in your entity definitions &mdash; so the query that
+          looks correct actually is.
+        </p>
+        <div className="mt-9 flex flex-wrap items-center justify-center gap-3">
+          <Link href="/getting-started" className="btn btn-primary">
+            Get started
+          </Link>
+          <a href={KANDRA_REPO_URL} target="_blank" rel="noreferrer" className="btn btn-secondary">
+            View on GitHub
+          </a>
+        </div>
+        <ul className="mt-8 flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm text-ink-muted">
+          <li className="inline-flex items-center gap-1.5">
+            <BrandLogo icon={siKotlin} size={14} /> Kotlin 2.1+
+          </li>
+          <li className="inline-flex items-center gap-1.5">
+            <BrandLogo icon={siScylladb} size={14} /> ScyllaDB
+          </li>
+          <li className="inline-flex items-center gap-1.5">
+            <BrandLogo icon={siApachecassandra} size={14} /> Cassandra
+          </li>
+          <li className="inline-flex items-center gap-1.5">
+            <PlugIcon className="w-3.5 h-3.5" /> Ktor plugin
+          </li>
+          <li className="inline-flex items-center gap-1.5">
+            <PackageIcon className="w-3.5 h-3.5" /> Maven Central
+          </li>
+          <li className="inline-flex items-center gap-1.5">
+            <LicenseIcon className="w-3.5 h-3.5" /> Apache 2.0
+          </li>
+        </ul>
+        <div className="hero-code mt-14 md:mt-20 mx-auto max-w-3xl text-left text-sm">
+          <HeroCode />
         </div>
       </section>
 
-      {/* Before/after — the corrected ISS-025 story: a real historical bug, and the real,
-          runtime (not compiler) safeguard that replaced it. */}
-      <ScrollReveal className="mx-auto max-w-[1400px] px-4 md:px-6 py-14 md:py-16">
-        <div className="max-w-2xl mb-6">
-          <h2 className="font-display font-semibold text-2xl tracking-tight">One call site, two eras</h2>
-          <p className="mt-3 text-ink-muted leading-relaxed">
-            This isn&apos;t a hypothetical &mdash; it&apos;s ISS-025, a real data-loss bug caught in
-            Kandra&apos;s own development, and the fix that replaced a silent partition wipe with a
-            loud, named, call-time exception.{" "}
-            <Link href="/battle-scars/clustering-keys-and-lookup-tables" className="underline decoration-border-strong hover:decoration-current">
-              Full writeup &rarr;
-            </Link>
-          </p>
-        </div>
-        <BeforeAfterToggle before={<BeforeDelete />} after={<AfterDelete />} />
-      </ScrollReveal>
-
-      {/* Trust bar — real brand marks only where a real factual claim is being made. */}
-      <section className="border-y border-border">
-        <div className="mx-auto max-w-[1400px] px-4 md:px-6 py-6 flex flex-wrap items-center justify-center gap-x-10 gap-y-4">
-          <span className="inline-flex items-center gap-2 text-xs font-mono text-ink-muted">
-            <PackageIcon className="text-accent-strong shrink-0" /> Maven Central
-          </span>
-          <span className="inline-flex items-center gap-2 text-xs font-mono text-ink-muted">
-            <LicenseIcon className="text-accent-strong shrink-0" /> Apache 2.0
-          </span>
-          <span className="inline-flex items-center gap-2 text-xs font-mono text-ink-muted">
-            <BrandLogo icon={siKotlin} size={16} /> Kotlin 2.1+
-          </span>
-          <span className="inline-flex items-center gap-2 text-xs font-mono text-ink-muted">
-            <BrandLogo icon={siScylladb} size={16} /> ScyllaDB
-          </span>
-          <span className="inline-flex items-center gap-2 text-xs font-mono text-ink-muted">
-            <BrandLogo icon={siApachecassandra} size={16} /> Apache Cassandra
-          </span>
-          <span className="inline-flex items-center gap-2 text-xs font-mono text-ink-muted">
-            <PlugIcon className="text-accent-strong shrink-0" /> Ktor Native
-          </span>
+      {/* Before/after: ISS-025, a real historical bug, and the runtime safeguard that replaced it. */}
+      <section className="bg-paper-raised">
+        <div className="mx-auto max-w-[1100px] px-4 md:px-6 py-20 md:py-28">
+          <ScrollReveal>
+            <SectionIntro eyebrow="ISS-025" title="One call site, two eras.">
+              Not a hypothetical: a real data-loss bug caught in Kandra&apos;s own development, and
+              the fix that turned a silent partition wipe into a loud, named, call-time exception.{" "}
+              <Link href="/battle-scars/clustering-keys-and-lookup-tables" className={inlineLink}>
+                Read the writeup &rsaquo;
+              </Link>
+            </SectionIntro>
+            <div className="card-elevated p-4 md:p-6">
+              <BeforeAfterToggle before={<BeforeDelete />} after={<AfterDelete />} />
+            </div>
+          </ScrollReveal>
         </div>
       </section>
 
-      {/* Severity-tagged incident grid */}
-      <section id="why-kandra" className="mx-auto max-w-[1400px] px-4 md:px-6 py-16 md:py-20 scroll-mt-20">
-        <div className="max-w-2xl mb-12">
-          <h2 className="font-display font-semibold text-2xl md:text-3xl tracking-tight">
-            What it actually feels like to build on Cassandra without this
-          </h2>
-          <p className="mt-4 text-ink-muted leading-relaxed">
-            Every one of these is a real failure mode, not a hypothetical &mdash; several are
-            documented, root-caused bugs from Kandra&apos;s own development, caught against a real
-            cluster. This isn&apos;t Cassandra taught by analogy to SQL: a distributed,
-            partition-oriented, leaderless database needs distributed thinking, and that starts
-            with naming the pain plainly.{" "}
-            <Link href="/why" className="underline decoration-border-strong hover:decoration-current">
-              Read the full argument &rarr;
+      {/* Failure modes, each linked to where it's explained. */}
+      <section id="why-kandra" className="mx-auto max-w-[1100px] px-4 md:px-6 py-20 md:py-28 scroll-mt-20">
+        <ScrollReveal>
+          <SectionIntro title="What building on Cassandra feels like without this.">
+            Every one of these is a real failure mode, and several are root-caused bugs from
+            Kandra&apos;s own development against a real cluster. A partition-oriented, leaderless
+            database needs distributed thinking &mdash; that starts with naming the pain plainly.{" "}
+            <Link href="/why" className={inlineLink}>
+              Read the full argument &rsaquo;
             </Link>
-          </p>
-        </div>
+          </SectionIntro>
+        </ScrollReveal>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          {PAIN_POINTS.map((p, i) => (
-            <ScrollReveal key={p.q} delayMs={(i % 2) * 80}>
-              <Link
-                href={p.href}
-                className="group block h-full rounded-lg border border-border p-5 hover:border-border-strong hover:bg-paper-raised/60 transition-colors"
-              >
-                <div className="flex items-start gap-3 mb-2.5">
-                  <span className="mt-0.5 inline-flex items-center justify-center w-7 h-7 shrink-0 rounded-md border border-border text-accent-strong group-hover:border-border-strong">
-                    <p.icon className="w-[15px] h-[15px]" />
-                  </span>
-                  <h3 className="font-display font-semibold text-base leading-snug flex-1">{p.q}</h3>
-                  <SeverityBadge level={p.severity} />
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-5">
+          {PAIN_POINTS.map((p) => (
+            <ScrollReveal key={p.q}>
+              <Link href={p.href} className="card card-link group flex flex-col h-full p-6 md:p-7">
+                <div className="flex items-center gap-2 mb-3">
+                  <p.icon className="w-4 h-4 text-ink-muted" />
+                  <SeverityLabel level={p.severity} />
                 </div>
-                <p className="text-sm text-ink-muted leading-relaxed mb-3">{p.problem}</p>
-                <p className="text-sm leading-relaxed border-l-2 border-accent pl-3">{p.fix}</p>
-                <span className="mt-3 inline-block text-xs font-mono text-accent-strong opacity-0 group-hover:opacity-100 transition-opacity">
-                  more &rarr;
+                <h3 className="type-title mb-3">{p.q}</h3>
+                <p className="text-[0.95rem] text-ink-muted leading-relaxed mb-4">{p.problem}</p>
+                <p className="text-[0.95rem] leading-relaxed">{p.fix}</p>
+                <span className="mt-auto pt-4 text-sm text-accent-strong group-hover:underline underline-offset-4">
+                  Learn more &rsaquo;
                 </span>
               </Link>
             </ScrollReveal>
@@ -368,204 +325,177 @@ export default function HomePage() {
         </div>
       </section>
 
-      {/* Business case — decision-maker framing, sourced only from the facts above. */}
-      <section id="business-case" className="border-t border-border bg-paper-raised/40 scroll-mt-20">
-        <div className="mx-auto max-w-[1400px] px-4 md:px-6 py-16 md:py-20">
-          <div className="max-w-2xl mb-12">
-            <h2 className="font-display font-semibold text-2xl md:text-3xl tracking-tight">
-              The business case for Kandra
-            </h2>
-            <p className="mt-4 text-ink-muted leading-relaxed">
-              Every card below is backed by a real, linked incident or a real annotation &mdash;
-              insurance, not a features list.
-            </p>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {BUSINESS_CASES.map((c, i) => (
-              <ScrollReveal key={c.title} delayMs={i * 100}>
-                <div className="h-full rounded-lg border border-border p-6">
-                  <c.icon className="text-note mb-3 w-5 h-5" />
-                  <h3 className="font-display font-semibold text-lg mb-2">{c.title}</h3>
-                  <p className="text-sm text-ink leading-relaxed mb-3">{c.business}</p>
-                  <p className="text-sm text-ink-muted leading-relaxed mb-4">{c.technical}</p>
-                  <div className="flex flex-col gap-1.5">
-                    {c.links.map((l) => (
-                      <Link
-                        key={l.href}
-                        href={l.href}
-                        className="text-xs font-mono text-accent-strong hover:underline"
-                      >
-                        {l.label} &rarr;
-                      </Link>
-                    ))}
-                  </div>
+      <AzTopologySection />
+
+      {/* Business case: decision-maker framing, sourced only from the facts above. */}
+      <section id="business-case" className="mx-auto max-w-[1100px] px-4 md:px-6 py-20 md:py-28 scroll-mt-20">
+        <ScrollReveal>
+          <SectionIntro
+            eyebrow="For teams evaluating an ORM"
+            title="The Cassandra mistakes that page your team at 3am, caught before they ship."
+          >
+            Partition-wide deletes, batches that look atomic and aren&apos;t, tombstone buildup that
+            degrades reads for days. Every card below is backed by a real, linked incident or a
+            real annotation.
+          </SectionIntro>
+        </ScrollReveal>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-5">
+          {BUSINESS_CASES.map((c) => (
+            <ScrollReveal key={c.title}>
+              <div className="card h-full p-6 md:p-7 flex flex-col">
+                <c.icon className="text-accent-strong mb-4 w-6 h-6" />
+                <h3 className="type-title mb-3">{c.title}</h3>
+                <p className="text-[0.95rem] leading-relaxed mb-3">{c.business}</p>
+                <p className="text-[0.95rem] text-ink-muted leading-relaxed mb-5">{c.technical}</p>
+                <div className="mt-auto flex flex-col gap-1.5">
+                  {c.links.map((l) => (
+                    <Link key={l.href} href={l.href} className={`text-sm ${inlineLink}`}>
+                      {l.label} &rsaquo;
+                    </Link>
+                  ))}
                 </div>
-              </ScrollReveal>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* Code showcase */}
-      <section id="code-showcase" className="mx-auto max-w-[1400px] px-4 md:px-6 py-16 md:py-20 scroll-mt-20">
-        <div className="max-w-2xl mb-8">
-          <h2 className="font-display font-semibold text-2xl md:text-3xl tracking-tight">
-            The API that respects the database
-          </h2>
-          <p className="mt-4 text-ink-muted leading-relaxed">
-            Three files, one running app: an entity that states its partitioning and lifecycle
-            up front, a repository call site where atomicity is a named method, and a plugin
-            install where the schema and connection settings live in one place.
-          </p>
-        </div>
-        <Tabs
-          items={[
-            { value: "entities", label: "entities.kt", content: <ShowcaseEntities /> },
-            { value: "repository", label: "routes.kt", content: <ShowcaseRepository /> },
-            { value: "ktor", label: "Application.kt", content: <ShowcaseKtor /> },
-          ]}
-        />
-      </section>
-
-      {/* Comparison — 3 columns */}
-      <section id="comparison" className="border-t border-border bg-paper-raised/40 scroll-mt-20">
-        <div className="mx-auto max-w-[1400px] px-4 md:px-6 py-16 md:py-20">
-          <h2 className="font-display font-semibold text-2xl md:text-3xl tracking-tight max-w-2xl">
-            If you want SQL magic, use Spring Data. If you want raw control, use the driver
-            directly. If you want Cassandra-native Kotlin, use Kandra.
-          </h2>
-          <div className="mt-10 overflow-x-auto">
-            <table className="w-full text-sm border-collapse min-w-[720px]">
-              <thead>
-                <tr className="border-b border-border-strong text-left">
-                  <th className="py-3 pr-6 font-display font-semibold text-ink-faint text-xs uppercase tracking-wide">
-                    &nbsp;
-                  </th>
-                  <th className="py-3 pr-6 font-display font-semibold text-ink-faint">Raw DataStax Driver</th>
-                  <th className="py-3 pr-6 font-display font-semibold">
-                    <span className="inline-flex items-center gap-1.5">
-                      <BrandLogo icon={siSpringboot} size={14} /> Spring Data Cassandra
-                    </span>
-                  </th>
-                  <th className="py-3 font-display font-semibold text-accent-strong">Kandra</th>
-                </tr>
-              </thead>
-              <tbody>
-                {COMPARISON_ROWS.map((row) => (
-                  <tr key={row.label} className="border-b border-border">
-                    <td className="py-4 pr-6 text-ink-faint font-mono text-xs align-top whitespace-nowrap">
-                      {row.label}
-                    </td>
-                    <td className="py-4 pr-6 text-ink-faint align-top">{row.raw}</td>
-                    <td className="py-4 pr-6 text-ink-muted align-top">{row.spring}</td>
-                    <td className="py-4 text-ink align-top">{row.kandra}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      {/* Adoption path */}
-      <section className="mx-auto max-w-[1400px] px-4 md:px-6 py-16 md:py-20">
-        <div className="max-w-2xl mb-12">
-          <h2 className="font-display font-semibold text-2xl md:text-3xl tracking-tight">
-            Start small. Scale with confidence.
-          </h2>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {ADOPTION_STEPS.map((s, i) => (
-            <ScrollReveal key={s.step} delayMs={i * 100}>
-              <div className="h-full rounded-lg border border-border p-6">
-                <span className="font-mono text-xs text-note">{`0${i + 1}`}</span>
-                <h3 className="font-display font-semibold text-lg mt-1 mb-2">{s.step}</h3>
-                <p className="text-sm text-ink-muted leading-relaxed">{s.body}</p>
               </div>
             </ScrollReveal>
           ))}
         </div>
       </section>
 
-      {/* Battle-scars pull-through — real, verifiable substance instead of vanity metrics. */}
-      <section className="border-t border-border bg-paper-raised/40">
-        <div className="mx-auto max-w-[1400px] px-4 md:px-6 py-16 md:py-20">
-          <div className="max-w-2xl mb-12">
-            <h2 className="font-display font-semibold text-2xl md:text-3xl tracking-tight">
-              Battle-tested, not theoretical
-            </h2>
-            <p className="mt-4 text-ink-muted leading-relaxed">
-              Every entry is a real bug found in Kandra&apos;s own codebase, with a root cause and
-              a fix &mdash; none of it deleted once it became inconvenient.{" "}
-              <Link href="/battle-scars" className="underline decoration-border-strong hover:decoration-current">
-                See all battle scars &rarr;
-              </Link>
-            </p>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {BATTLE_SCAR_HIGHLIGHTS.map((b, i) => (
-              <ScrollReveal key={b.href} delayMs={i * 100}>
-                <Link href={b.href} className="group block h-full rounded-lg border border-border p-5 hover:border-border-strong transition-colors">
-                  <h3 className="font-display font-semibold text-base mb-2">{b.title}</h3>
-                  <p className="text-sm text-ink-muted leading-relaxed">{b.body}</p>
-                  <span className="mt-3 inline-block text-xs font-mono text-accent-strong opacity-0 group-hover:opacity-100 transition-opacity">
-                    read &rarr;
-                  </span>
-                </Link>
-              </ScrollReveal>
-            ))}
-          </div>
+      {/* Code showcase */}
+      <section id="code-showcase" className="bg-paper-raised scroll-mt-20">
+        <div className="mx-auto max-w-[1100px] px-4 md:px-6 py-20 md:py-28">
+          <ScrollReveal>
+            <SectionIntro eyebrow="For developers" title="An API that respects the database.">
+              Three files, one running app: an entity that states its partitioning and lifecycle up
+              front, a repository call site where atomicity is a named method, and a plugin install
+              where schema and connection settings live in one place.
+            </SectionIntro>
+            <div className="card-elevated p-1.5 md:p-2 [&>div]:my-0">
+              <Tabs
+                items={[
+                  { value: "entities", label: "entities.kt", content: <ShowcaseEntities /> },
+                  { value: "repository", label: "routes.kt", content: <ShowcaseRepository /> },
+                  { value: "ktor", label: "Application.kt", content: <ShowcaseKtor /> },
+                ]}
+              />
+            </div>
+          </ScrollReveal>
         </div>
       </section>
 
-      <div className="hidden md:flex justify-center py-10 text-ink-faint" aria-hidden="true">
-        <ChariotScene className="w-64 h-auto opacity-70" />
-      </div>
+      {/* Comparison */}
+      <section id="comparison" className="mx-auto max-w-[1100px] px-4 md:px-6 py-20 md:py-28 scroll-mt-20">
+        <ScrollReveal>
+          <SectionIntro title="Choose the tool that matches the database.">
+            If you want SQL magic, use Spring Data. If you want raw control, use the driver
+            directly. If you want Cassandra-native Kotlin, use Kandra.
+          </SectionIntro>
+          <div className="overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0">
+            <table className="w-full text-[0.95rem] border-collapse min-w-[720px]">
+              <thead>
+                <tr className="text-left border-b border-border-strong">
+                  <th className="py-3 pr-6 w-40" />
+                  <th className="py-3 pr-6 font-semibold text-ink-muted">DataStax driver</th>
+                  <th className="py-3 pr-6 font-semibold text-ink-muted">
+                    <span className="inline-flex items-center gap-1.5">
+                      <BrandLogo icon={siSpringboot} size={14} /> Spring Data Cassandra
+                    </span>
+                  </th>
+                  <th className="py-3 font-semibold text-accent-strong">Kandra</th>
+                </tr>
+              </thead>
+              <tbody>
+                {COMPARISON_ROWS.map((row) => (
+                  <tr key={row.label} className="border-b border-border">
+                    <th scope="row" className="py-5 pr-6 text-left font-semibold align-top">
+                      {row.label}
+                    </th>
+                    <td className="py-5 pr-6 text-ink-muted align-top">{row.raw}</td>
+                    <td className="py-5 pr-6 text-ink-muted align-top">{row.spring}</td>
+                    <td className="py-5 align-top">{row.kandra}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </ScrollReveal>
+      </section>
 
-      {/* Homepage footer band — dual-track, only real routes/anchors, no mailto, no Discussions. */}
+      {/* Adoption path */}
+      <section className="bg-paper-raised">
+        <div className="mx-auto max-w-[1100px] px-4 md:px-6 py-20 md:py-28">
+          <ScrollReveal>
+            <SectionIntro title="Start small. Scale with confidence." />
+          </ScrollReveal>
+          <ol className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-5">
+            {ADOPTION_STEPS.map((s, i) => (
+              <ScrollReveal key={s.step}>
+                <li className="card-elevated h-full p-6 md:p-7">
+                  <span className="text-sm font-semibold text-accent-strong tabular-nums">Step {i + 1}</span>
+                  <h3 className="type-title mt-1 mb-3">{s.step}</h3>
+                  <p className="text-[0.95rem] text-ink-muted leading-relaxed">{s.body}</p>
+                </li>
+              </ScrollReveal>
+            ))}
+          </ol>
+        </div>
+      </section>
+
+      {/* Battle scars: real, verifiable substance instead of vanity metrics. */}
+      <section className="mx-auto max-w-[1100px] px-4 md:px-6 py-20 md:py-28">
+        <ScrollReveal>
+          <SectionIntro title="Battle-tested, not theoretical.">
+            Every entry is a real bug found in Kandra&apos;s own codebase, with a root cause and a
+            fix &mdash; none of it deleted once it became inconvenient.{" "}
+            <Link href="/battle-scars" className={inlineLink}>
+              See all battle scars &rsaquo;
+            </Link>
+          </SectionIntro>
+        </ScrollReveal>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-5">
+          {BATTLE_SCAR_HIGHLIGHTS.map((b) => (
+            <ScrollReveal key={b.href}>
+              <Link href={b.href} className="card card-link group flex flex-col h-full p-6 md:p-7">
+                <h3 className="type-title mb-3">{b.title}</h3>
+                <p className="text-[0.95rem] text-ink-muted leading-relaxed">{b.body}</p>
+                <span className="mt-auto pt-4 text-sm text-accent-strong group-hover:underline underline-offset-4">
+                  Read &rsaquo;
+                </span>
+              </Link>
+            </ScrollReveal>
+          ))}
+        </div>
+      </section>
+
+      {/* Closing call to action */}
       <section className="border-t border-border">
-        <div className="mx-auto max-w-[1400px] px-4 md:px-6 py-16 md:py-20">
-          <div className="kandra-codeblock max-w-xl mb-10">
-            <div className="px-4 py-1.5 border-b border-border text-xs font-mono text-ink-muted">terminal</div>
-            <pre className="overflow-x-auto px-4 py-3 text-sm font-mono leading-relaxed">
+        <div className="mx-auto max-w-[1100px] px-4 md:px-6 py-20 md:py-28 text-center">
+          <ChariotScene className="w-40 h-auto mx-auto mb-8 text-ink-faint" />
+          <h2 className="type-headline text-balance">Add it to one service. Nothing else changes.</h2>
+          <div className="mt-8 mx-auto max-w-md kandra-codeblock text-left">
+            <pre className="px-5 py-4 text-sm font-mono overflow-x-auto">
               <code>
-                <span className="text-ink-faint">$ </span>
+                <span className="text-ink-faint select-none">$ </span>
                 {`./gradlew dependencies | grep kandra`}
                 {"\n"}
-                {`+--- ke.co.coinx.kandra:kandra-runtime:${KANDRA_VERSION}`}
+                <span className="text-ink-muted">{`+--- ke.co.coinx.kandra:kandra-runtime:${KANDRA_VERSION}`}</span>
               </code>
             </pre>
           </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-10">
-            <div>
-              <div className="font-display font-semibold mb-3 text-accent-strong">For Developers</div>
-              <ul className="space-y-2 text-sm text-ink-muted">
-                <li><Link href="/getting-started" className="hover:text-accent">Get started</Link></li>
-                <li><Link href="/tutorial" className="hover:text-accent">Tutorial</Link></li>
-                <li><a href={KANDRA_REPO_URL} target="_blank" rel="noreferrer" className="hover:text-accent">GitHub</a></li>
-                <li><a href={`${KANDRA_REPO_URL}/issues`} target="_blank" rel="noreferrer" className="hover:text-accent">Report an issue</a></li>
-              </ul>
-            </div>
-            <div>
-              <div className="font-display font-semibold mb-3 text-note">For Teams</div>
-              <ul className="space-y-2 text-sm text-ink-muted">
-                <li><Link href="/battle-scars" className="hover:text-accent">Battle scars</Link></li>
-                <li><Link href="/why" className="hover:text-accent">Why Kandra</Link></li>
-                <li><Link href="/faq" className="hover:text-accent">FAQ</Link></li>
-                <li><a href="#comparison" className="hover:text-accent">See the comparison</a></li>
-              </ul>
-            </div>
-          </div>
-
-          <div className="mt-12">
-            <Link
-              href="/getting-started"
-              className="glow-accent inline-flex items-center rounded-md bg-accent text-accent-ink px-5 py-2.5 text-sm font-medium hover:bg-accent-strong transition-all"
-            >
-              Read the full docs &rarr;
+          <div className="mt-9 flex flex-wrap items-center justify-center gap-3">
+            <Link href="/getting-started" className="btn btn-primary">
+              Read the docs
+            </Link>
+            <Link href="/tutorial" className="btn btn-secondary">
+              Take the tutorial
             </Link>
           </div>
+          <p className="mt-6 text-sm text-ink-muted">
+            <Link href="/faq" className={inlineLink}>FAQ</Link>
+            <span className="mx-2 text-ink-faint">·</span>
+            <a href={`${KANDRA_REPO_URL}/issues`} target="_blank" rel="noreferrer" className={inlineLink}>
+              Report an issue
+            </a>
+          </p>
         </div>
       </section>
     </div>

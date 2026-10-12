@@ -190,6 +190,13 @@ yield, not guaranteed "own properties first." Don't rely on the generated object
 anything; access is always by name.
 </Callout>
 
+<Unreleased issues={[17]}>
+**Typed DI accessors.** When `kandra-koin` or `kandra-kodein` is on the classpath, the processor also
+generates typed accessors that wrap the exact qualifier `kandraKoin()`/`kandraKodein()` bind under —
+for an entity `Foo`, `KoinComponent.fooRepo()`/`fooSuspendRepo()` and `DIAware.fooRepo()`/
+`fooSuspendRepo()` — so call sites stop hand-typing `named(...)`/tag strings.
+</Unreleased>
+
 ## What gets *no* special treatment at all
 
 Tracing `KandraProcessor.kt` line by line yields a genuinely useful negative result: only three

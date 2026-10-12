@@ -120,6 +120,14 @@ loop to the client for now — the same simplification Kandra's own capstone exa
 identical problem.
 </Callout>
 
+<Unreleased issues={[12, 94]}>
+`findActive()` becomes `findActive(allowFullScan: Boolean = false)` — a **breaking change**. If the
+marker column has a `@SecondaryIndex`, it queries that index with no `ALLOW FILTERING`. If it doesn't,
+the call throws `KandraQueryException` unless you pass `allowFullScan = true`. Before upgrading, add
+`@SecondaryIndex` to the marker column or opt in explicitly. Unpaged results are also capped (with a
+WARN) instead of loading an unbounded scan into memory — use `findPage()` for large result sets.
+</Unreleased>
+
 ## The real timeline — not hand-waved
 
 Say a todo is soft-deleted at day 0:

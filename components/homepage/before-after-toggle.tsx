@@ -7,14 +7,12 @@ export function BeforeAfterToggle({ before, after }: { before: ReactNode; after:
 
   return (
     <div>
-      <div className="inline-flex items-center rounded-full border border-border p-0.5 mb-4">
+      <div className="segmented mb-4" role="group" aria-label="Show code from">
         <button
           type="button"
           onClick={() => setActive("before")}
           aria-pressed={active === "before"}
-          className={`rounded-full px-4 py-1.5 text-xs font-mono font-medium transition-colors cursor-pointer ${
-            active === "before" ? "bg-danger text-accent-ink" : "text-ink-muted hover:text-ink"
-          }`}
+          className="cursor-pointer"
         >
           Before
         </button>
@@ -22,9 +20,7 @@ export function BeforeAfterToggle({ before, after }: { before: ReactNode; after:
           type="button"
           onClick={() => setActive("after")}
           aria-pressed={active === "after"}
-          className={`rounded-full px-4 py-1.5 text-xs font-mono font-medium transition-colors cursor-pointer ${
-            active === "after" ? "bg-tip text-accent-ink" : "text-ink-muted hover:text-ink"
-          }`}
+          className="cursor-pointer"
         >
           After (v0.4.6)
         </button>

@@ -18,13 +18,13 @@ export function SideBySide({
   return (
     <div className="not-prose my-6 grid grid-cols-1 md:grid-cols-2 gap-3">
       <div>
-        <div className="mb-1.5 text-xs font-display font-semibold uppercase tracking-wide text-ink-faint">
+        <div className="mb-1.5 text-sm font-semibold text-ink-muted">
           {leftLabel}
         </div>
         {left}
       </div>
       <div>
-        <div className="mb-1.5 text-xs font-display font-semibold uppercase tracking-wide text-ink-faint">
+        <div className="mb-1.5 text-sm font-semibold text-ink-muted">
           {rightLabel}
         </div>
         {right}

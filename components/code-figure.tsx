@@ -29,7 +29,7 @@ export function CodeFigure({ children }: { children?: ReactNode }) {
   return (
     <div className="kandra-codeblock not-prose">
       {filename ? (
-        <div className="flex items-center justify-between border-b border-border px-4 py-1.5 text-xs font-mono text-ink-muted">
+        <div className="flex items-center justify-between px-4 pt-2 -mb-2 text-xs font-mono text-ink-muted">
           <span>{filename}</span>
           <CopyButton copied={copied} onClick={handleCopy} />
         </div>
@@ -50,7 +50,7 @@ function CopyButton({ copied, onClick }: { copied: boolean; onClick: () => void 
     <button
       type="button"
       onClick={onClick}
-      className="inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[0.72rem] font-mono text-ink-faint hover:text-accent hover:bg-paper-raised transition-colors cursor-pointer"
+      className="pressable inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[0.75rem] text-ink-muted hover:text-ink hover:bg-paper transition-colors cursor-pointer"
       aria-label="Copy code"
     >
       {copied ? (

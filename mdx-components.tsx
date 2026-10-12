@@ -4,13 +4,14 @@ import { Callout } from "@/components/callout";
 import { Tabs } from "@/components/tabs";
 import { SideBySide } from "@/components/side-by-side";
 import { VersionNote } from "@/components/version-note";
+import { Unreleased } from "@/components/unreleased";
 
 const components: MDXComponents = {
   figure: (props) => <CodeFigure {...props} />,
   // Wide tables (module lists, consistency-level references) scroll in their own
   // container instead of pushing the page wider than the viewport on mobile.
   table: (props) => (
-    <div className="not-prose my-6 overflow-x-auto rounded-md border border-border">
+    <div className="not-prose my-6 overflow-x-auto">
       <table {...props} className="my-0" />
     </div>
   ),
@@ -18,6 +19,7 @@ const components: MDXComponents = {
   Tabs,
   SideBySide,
   VersionNote,
+  Unreleased,
 };
 
 export function useMDXComponents(otherComponents: MDXComponents): MDXComponents {
