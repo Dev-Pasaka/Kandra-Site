@@ -100,6 +100,14 @@ non-partitioned-for-scale reference table where "all active rows" is a legitimat
 It stops being appropriate the moment the table is meaningfully partitioned by owner/tenant/user,
 which is most Cassandra tables.
 
+<Unreleased issues={[12, 94]}>
+`findActive()` becomes `findActive(allowFullScan: Boolean = false)` — a **breaking change**. If the
+marker column has a `@SecondaryIndex`, it queries that index with no `ALLOW FILTERING`. If it doesn't,
+the call throws `KandraQueryException` unless you pass `allowFullScan = true`. Before upgrading, add
+`@SecondaryIndex` to the marker column or opt in explicitly. Unpaged results are also capped (with a
+WARN) instead of loading an unbounded scan into memory — use `findPage()` for large result sets.
+</Unreleased>
+
 ## `deleteById` used to bypass soft delete entirely
 
 <Callout kind="gotcha" title="ISS-015: one delete path skipped the TTL rewrite completely">

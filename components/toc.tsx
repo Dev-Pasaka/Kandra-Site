@@ -43,7 +43,7 @@ export function Toc() {
 
   return (
     <div className="text-sm">
-      <div className="text-xs font-display font-semibold uppercase tracking-wide text-ink-faint mb-3">
+      <div className="text-[0.8rem] font-semibold text-ink mb-3">
         On this page
       </div>
       <ul className="space-y-2 border-l border-border">
@@ -54,7 +54,7 @@ export function Toc() {
               className="block -ml-px border-l pl-3 py-0.5 transition-colors"
               style={{
                 borderColor: activeId === h.id ? "var(--accent)" : "transparent",
-                color: activeId === h.id ? "var(--accent-strong)" : "var(--ink-faint)",
+                color: activeId === h.id ? "var(--accent-strong)" : "var(--ink-muted)",
               }}
             >
               {h.text}

@@ -124,6 +124,13 @@ independent `LOGGED BATCH` statements. A failure partway through leaves earlier 
 later ones not — `saveAll` is not one atomic operation once it's large enough to chunk.
 </Callout>
 
+<Unreleased issues={[132, 138, 136, 103]}>
+New `saveAndGet()`, `saveIfNotExistsAndGet()` and `updateAndGet()` return the entity **as persisted**
+— generated `@GeneratedUuid`/`@CreatedAt`/`@UpdatedAt` values and the post-update `@Version` included.
+The existing `save()`/`update()` still return `Unit` and discard them. Client-side throttle rejections
+surface as `KandraThrottledException` (never retried) instead of the raw driver exception.
+</Unreleased>
+
 ### Update family
 
 ```kotlin

@@ -105,22 +105,22 @@ export function SearchPalette() {
       <Dialog.Trigger asChild>
         <button
           type="button"
-          className="flex items-center gap-2 rounded-md border border-border bg-paper-raised px-3 py-1.5 text-sm text-ink-faint hover:border-border-strong transition-colors cursor-pointer w-full max-w-56"
+          className="pressable flex items-center gap-2 rounded-full bg-paper-raised px-3.5 py-1.5 text-sm text-ink-muted hover:text-ink transition-colors cursor-pointer w-full max-w-56"
         >
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
             <circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.3" />
             <path d="m11 11 3.5 3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
           </svg>
           <span className="flex-1 text-left">Search docs</span>
-          <kbd className="text-[0.65rem] font-mono border border-border rounded-sm px-1 py-0.5 bg-paper">
+          <kbd className="text-[0.7rem] font-sans text-ink-faint">
             &#8984;K
           </kbd>
         </button>
       </Dialog.Trigger>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/40 z-50" />
+        <Dialog.Overlay className="scrim fixed inset-0 z-50" />
         <Dialog.Content
-          className="fixed left-1/2 top-24 -translate-x-1/2 w-[min(90vw,640px)] z-50 rounded-lg border border-border bg-paper shadow-lg overflow-hidden"
+          className="palette fixed left-1/2 top-20 -translate-x-1/2 w-[min(calc(100vw-2rem),640px)] z-50 rounded-[var(--radius-lg)] bg-paper shadow-[var(--shadow-float)] overflow-hidden"
           onKeyDown={(e) => {
             if (e.key === "ArrowDown") {
               e.preventDefault();
@@ -147,7 +147,7 @@ export function SearchPalette() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search modules, tutorial pages, battle scars..."
-              className="flex-1 bg-transparent outline-none text-sm placeholder:text-ink-faint"
+              className="flex-1 bg-transparent outline-none text-base placeholder:text-ink-faint"
             />
           </div>
           <div className="max-h-96 overflow-y-auto py-1.5">
@@ -165,8 +165,8 @@ export function SearchPalette() {
                 key={hit.url}
                 onClick={() => go(hit.url)}
                 onMouseEnter={() => setActive(i)}
-                className="w-full text-left px-4 py-2.5 cursor-pointer"
-                style={{ background: i === active ? "var(--paper-raised)" : "transparent" }}
+                className="w-[calc(100%-0.75rem)] mx-1.5 rounded-[var(--radius)] text-left px-3 py-2.5 cursor-pointer"
+                style={{ background: i === active ? "var(--accent-soft)" : "transparent" }}
               >
                 <div className="text-sm font-medium text-ink">{hit.title}</div>
                 <div

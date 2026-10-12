@@ -16,6 +16,20 @@ all. Don't expect classes like `MultiDcPolicy` or `DcAwareRouter` — they don't
 module actually adds is a startup-logging convenience, plus the doc comment on `KandraMultiDc.kt`
 that collects the multi-DC guidance in one place.
 
+<Callout kind="gotcha" title="Experimental: not yet validated on a real multi-region cluster">
+Kandra's own README says the multi-DC feature hasn't been tested against a genuine multi-region
+topology yet — every test round so far (Testcontainers, self-hosted, ScyllaDB Cloud) approximated one.
+Treat multi-DC behavior as experimental, and check the
+[multi-DC known-gap notes](https://github.com/Dev-Pasaka/kandra/blob/main/docs/features/multidc.md#known-gap-not-yet-validated-against-a-genuine-multi-region-topology)
+before relying on it in production.
+</Callout>
+
+<Unreleased issues={[24, 98]}>
+**Consistency Strict Mode**: `consistency { strictMode = true }` logs a WARN whenever a query resolves to
+`LOCAL_ONE`/`ONE` in a multi-DC deployment (any non-empty `loadBalancing.allowedRemoteDcs`). It's opt-in
+and WARN-only — it never changes or blocks a query.
+</Unreleased>
+
 ## Why this exists as a separate module
 
 `kandra-multidc` declares `api(project(":kandra-core"))`, `api(project(":kandra-runtime"))`,

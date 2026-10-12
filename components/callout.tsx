@@ -22,21 +22,20 @@ export function Callout({
   return (
     <div
       data-callout={kind}
-      className="not-prose my-6 rounded-md border-l-2 pl-4 pr-4 py-3 text-[0.95rem] leading-relaxed"
+      className="not-prose my-6 rounded-[var(--radius-lg)] px-5 py-4 text-[0.97rem] leading-relaxed"
       style={{
-        borderColor: `var(--${kind})`,
         background: `var(--${kind}-soft)`,
         color: "var(--ink)",
       }}
     >
       <div
-        className="flex items-center gap-1.5 font-display text-xs font-semibold uppercase tracking-wide mb-1.5"
+        className="flex items-center gap-1.5 text-[0.9rem] font-semibold mb-1"
         style={{ color: `var(--${kind})` }}
       >
         {icon}
         {title ?? label}
       </div>
-      <div className="[&>p]:m-0 [&>p+p]:mt-2 [&_a]:underline [&_code]:font-mono [&_code]:text-[0.88em] [&_code]:bg-paper-raised [&_code]:border [&_code]:border-border [&_code]:rounded-sm [&_code]:px-1">
+      <div className="[&>p]:m-0 [&>p+p]:mt-2 [&_a]:underline [&_code]:font-mono [&_code]:text-[0.88em] [&_code]:bg-paper/70 [&_code]:rounded-[var(--radius-sm)] [&_code]:px-1">
         {children}
       </div>
     </div>

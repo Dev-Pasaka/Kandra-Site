@@ -13,21 +13,21 @@ export function Tabs({
   return (
     <RadixTabs.Root
       defaultValue={defaultValue ?? items[0]?.value}
-      className="not-prose my-6 rounded-md border border-border overflow-hidden"
+      className="not-prose my-6 rounded-[var(--radius-lg)] bg-[var(--code-bg)] overflow-hidden"
     >
-      <RadixTabs.List className="flex border-b border-border bg-paper-raised">
+      <RadixTabs.List className="flex gap-1 px-2 pt-2 overflow-x-auto no-scrollbar">
         {items.map((item) => (
           <RadixTabs.Trigger
             key={item.value}
             value={item.value}
-            className="px-4 py-2 text-sm font-mono text-ink-muted border-r border-border last:border-r-0 data-[state=active]:text-ink data-[state=active]:bg-paper cursor-pointer data-[state=active]:border-b-2 data-[state=active]:border-b-accent"
+            className="pressable shrink-0 rounded-full px-3.5 py-1.5 text-[0.8rem] font-mono text-ink-muted hover:text-ink transition-colors data-[state=active]:text-ink data-[state=active]:bg-paper data-[state=active]:shadow-[0_1px_3px_rgba(0,0,0,0.12)] cursor-pointer"
           >
             {item.label}
           </RadixTabs.Trigger>
         ))}
       </RadixTabs.List>
       {items.map((item) => (
-        <RadixTabs.Content key={item.value} value={item.value} className="[&_.kandra-codeblock]:border-0 [&_.kandra-codeblock]:rounded-none">
+        <RadixTabs.Content key={item.value} value={item.value} className="[&_.kandra-codeblock]:rounded-none [&_.kandra-codeblock]:bg-transparent">
           {item.content}
         </RadixTabs.Content>
       ))}
