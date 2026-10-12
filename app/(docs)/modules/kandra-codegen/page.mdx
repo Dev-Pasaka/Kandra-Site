@@ -190,12 +190,12 @@ yield, not guaranteed "own properties first." Don't rely on the generated object
 anything; access is always by name.
 </Callout>
 
-<Unreleased issues={[17]}>
-**Typed DI accessors.** When `kandra-koin` or `kandra-kodein` is on the classpath, the processor also
-generates typed accessors that wrap the exact qualifier `kandraKoin()`/`kandraKodein()` bind under —
-for an entity `Foo`, `KoinComponent.fooRepo()`/`fooSuspendRepo()` and `DIAware.fooRepo()`/
-`fooSuspendRepo()` — so call sites stop hand-typing `named(...)`/tag strings.
-</Unreleased>
+### Typed DI accessors (new in 0.4.7)
+
+When `kandra-koin` or `kandra-kodein` is on the classpath, the processor also generates typed
+accessors that wrap the exact qualifier `kandraKoin()`/`kandraKodein()` bind under — for an entity
+`Foo`, `KoinComponent.fooRepo()`/`fooSuspendRepo()` and `DIAware.fooRepo()`/`fooSuspendRepo()` — a
+compile-checked alternative to hand-typed `named("...")`/tag lookups.
 
 ## What gets *no* special treatment at all
 

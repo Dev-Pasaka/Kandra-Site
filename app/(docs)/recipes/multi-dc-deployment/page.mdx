@@ -30,11 +30,11 @@ Treat multi-DC behavior as experimental, and check the
 before relying on it in production.
 </Callout>
 
-<Unreleased issues={[24, 98]}>
-**Consistency Strict Mode**: `consistency { strictMode = true }` logs a WARN whenever a query resolves to
-`LOCAL_ONE`/`ONE` in a multi-DC deployment (any non-empty `loadBalancing.allowedRemoteDcs`). It's opt-in
-and WARN-only — it never changes or blocks a query.
-</Unreleased>
+<Callout kind="tip" title="New in 0.4.7: Consistency Strict Mode">
+`consistency { strictMode = true }` logs a WARN whenever a query resolves to `LOCAL_ONE`/`ONE` in a
+multi-DC deployment (any non-empty `loadBalancing.allowedRemoteDcs`). It's opt-in and WARN-only — it
+never changes or blocks a query.
+</Callout>
 
 ## The scenario
 

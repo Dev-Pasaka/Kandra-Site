@@ -64,19 +64,26 @@ them; the row's key (and the `true` marker) persists until `gc_grace_seconds` af
 ## `findActive()`: a real query, with a real cost
 
 ```kotlin
-suspend fun findActive(): List<T>
+suspend fun findActive(allowFullScan: Boolean = false): List<T>
 ```
 
-```sql
-SELECT * FROM todos WHERE is_deleted = ? ALLOW FILTERING
-```
+What it runs depends on whether the marker column is indexed:
+
+- **Marker has `@SecondaryIndex`**: `SELECT * FROM todos WHERE is_deleted = ?` through the index.
+  No `ALLOW FILTERING`; `allowFullScan` is irrelevant.
+- **No index, `allowFullScan = false` (the default)**: throws `KandraQueryException` at call time
+  instead of scanning. This changed in 0.4.7 — before that it silently ran the scan below.
+- **No index, `allowFullScan = true`**: `SELECT * FROM todos WHERE is_deleted = ? ALLOW FILTERING`,
+  with a `WARN` naming the cost.
+
+Unpaged results are capped: past the limit Kandra truncates with a `WARN` instead of loading an
+unbounded scan into memory, so use `findPage()` for anything large.
 
 <Callout kind="danger" title="findActive() is a whole-table scan — it is not partition-scoped">
 This is the single most important thing to know about `findActive()`, and it's easy to miss because
-nothing about the method signature warns you: it takes **no predicate at all**. It always runs
-`WHERE <marker> = false ALLOW FILTERING` against the **entire table** — every partition, every
-node, scatter-gather. Kandra logs a `WARN` every time it runs, naming the cost, but the query still
-executes. For `Todo` above, `findActive()` does not mean "this owner's active todos" — it means
+nothing about the method signature warns you: it takes **no predicate at all**. Whether it goes
+through a `@SecondaryIndex` or an opted-in `ALLOW FILTERING` scan, it reads `WHERE <marker> = false`
+across the **entire table** — every partition, every node, scatter-gather. For `Todo` above, `findActive()` does not mean "this owner's active todos" — it means
 *every* owner's active todos, cluster-wide. If what you actually want is "my active rows" on a
 table partitioned by owner, `findActive()` is very likely the wrong tool.
 
@@ -99,14 +106,6 @@ had to do for a per-author feed, and it's the honest, working pattern, not a wor
 non-partitioned-for-scale reference table where "all active rows" is a legitimate, bounded query.
 It stops being appropriate the moment the table is meaningfully partitioned by owner/tenant/user,
 which is most Cassandra tables.
-
-<Unreleased issues={[12, 94]}>
-`findActive()` becomes `findActive(allowFullScan: Boolean = false)` — a **breaking change**. If the
-marker column has a `@SecondaryIndex`, it queries that index with no `ALLOW FILTERING`. If it doesn't,
-the call throws `KandraQueryException` unless you pass `allowFullScan = true`. Before upgrading, add
-`@SecondaryIndex` to the marker column or opt in explicitly. Unpaged results are also capped (with a
-WARN) instead of loading an unbounded scan into memory — use `findPage()` for large result sets.
-</Unreleased>
 
 ## `deleteById` used to bypass soft delete entirely
 

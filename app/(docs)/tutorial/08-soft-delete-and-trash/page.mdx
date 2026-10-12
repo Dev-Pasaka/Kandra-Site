@@ -64,16 +64,18 @@ expired.
 ## `findActive()` — and why it's the wrong tool here anyway
 
 ```kotlin
-fun findActive(entityClass: KClass<T>): List<T>
+fun findActive(allowFullScan: Boolean = false): List<T>
 ```
 
-<Callout kind="danger" title="This is the one place Kandra actually emits ALLOW FILTERING">
-`findActive()` runs `SELECT * FROM todos WHERE is_deleted = ? ALLOW FILTERING`, bound to `false` —
-verified directly from `QueryExecutor.kt`. Every other page on this site, correctly, says Kandra's
+<Callout kind="danger" title="This is the one place Kandra can emit ALLOW FILTERING — and only if you opt in">
+`isDeleted` here has no `@SecondaryIndex`, so as of 0.4.7 a bare `findActive()` throws
+`KandraQueryException` instead of scanning. Only `findActive(allowFullScan = true)` runs
+`SELECT * FROM todos WHERE is_deleted = ? ALLOW FILTERING`, bound to `false` (adding
+`@SecondaryIndex` to the marker makes it query the index instead). Every other page on this site, correctly, says Kandra's
 query DSL has no method that produces `ALLOW FILTERING` — that's still true of `QueryContext`/
 `findAll`/`findPage`/`find`. `findActive()` is hand-written CQL outside that DSL entirely, built
 specifically because there is no partition-scoped way to express "every row where a non-key column
-equals X" — and it logs a `WARN` every call naming exactly that cost ("scans with ALLOW FILTERING
+equals X" — and when you do opt in, it logs a `WARN` every call naming exactly that cost ("scans with ALLOW FILTERING
 ... scatter-gather across all nodes"), the same treatment `@SecondaryIndex` queries get. It's a
 real, deliberate, narrow exception to the "no `ALLOW FILTERING`, ever" rule — not a contradiction of
 it, but worth knowing about precisely rather than assuming the rule is absolute everywhere.
@@ -119,14 +121,6 @@ the next page. A client walking pagination has to keep fetching until it has eno
 loop to the client for now — the same simplification Kandra's own capstone example makes for the
 identical problem.
 </Callout>
-
-<Unreleased issues={[12, 94]}>
-`findActive()` becomes `findActive(allowFullScan: Boolean = false)` — a **breaking change**. If the
-marker column has a `@SecondaryIndex`, it queries that index with no `ALLOW FILTERING`. If it doesn't,
-the call throws `KandraQueryException` unless you pass `allowFullScan = true`. Before upgrading, add
-`@SecondaryIndex` to the marker column or opt in explicitly. Unpaged results are also capped (with a
-WARN) instead of loading an unbounded scan into memory — use `findPage()` for large result sets.
-</Unreleased>
 
 ## The real timeline — not hand-waved
 

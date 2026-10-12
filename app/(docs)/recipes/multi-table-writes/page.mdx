@@ -93,12 +93,12 @@ statements, so there is no working version of this call inside a batch scope, by
 current limitation.
 </Callout>
 
-<Unreleased issues={[99]}>
-The two batch blocks get separate scope types. `batch { }` (suspend, `KandraBatchScope`) only accepts
-`KandraSuspendRepository.saveInBatch`/`deleteInBatch`; `batchBlocking { }` (`KandraBlockingBatchScope`)
-only accepts `KandraRepository`'s. Calling a blocking repository's `saveInBatch` inside a suspend
-`batch { }` — which would block the coroutine's dispatcher thread — becomes a compile error.
-</Unreleased>
+<Callout kind="note" title="Changed in 0.4.7: two scope types">
+`batch { }` (suspend, `KandraBatchScope`) only accepts `KandraSuspendRepository.saveInBatch`/
+`deleteInBatch`; `batchBlocking { }` (`KandraBlockingBatchScope`) only accepts `KandraRepository`'s.
+Calling a blocking repository's `saveInBatch` inside a suspend `batch { }` — which would block the
+coroutine's dispatcher thread — is a compile error rather than a silent foot-gun.
+</Callout>
 
 ## What's inside the atomic guarantee, and what isn't
 

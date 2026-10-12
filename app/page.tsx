@@ -38,7 +38,7 @@ const COMPARISON_ROWS = [
     label: "Dangerous queries",
     raw: "ALLOW FILTERING is a plain query flag — no guardrail",
     spring: "ALLOW FILTERING is one flag away",
-    kandra: "Structurally absent from the predicate DSL — one logged exception (findActive())",
+    kandra: "Structurally absent from the predicate DSL — findActive() needs an explicit opt-in",
   },
   {
     label: "Cross-table writes",
@@ -93,7 +93,7 @@ const PAIN_POINTS = [
     q: "Why does this need ALLOW FILTERING, and why is everyone telling me not to use it?",
     problem:
       "Cassandra will let you write a query that triggers a full-cluster scatter-gather scan, and it will degrade a production cluster badly under load. Most ORMs don't stop you.",
-    fix: "Kandra's predicate query DSL (find {} / findAll {}) structurally cannot express ALLOW FILTERING — every predicate resolves through a partition key, @LookupIndex, or @SecondaryIndex, or the query throws at build time. The one exception is findActive() on @SoftDelete entities, which always scans the whole table with ALLOW FILTERING — logged with a WARN naming the cost. The next release makes that an explicit opt-in too: without a @SecondaryIndex on the marker, findActive() throws unless you pass allowFullScan = true.",
+    fix: "Kandra's predicate query DSL (find {} / findAll {}) structurally cannot express ALLOW FILTERING — every predicate resolves through a partition key, @LookupIndex, or @SecondaryIndex, or the query throws at build time. The one exception is findActive() on @SoftDelete entities without a @SecondaryIndex on the marker: it throws unless you explicitly pass allowFullScan = true, and then logs a WARN naming the cost.",
     href: "/foundations",
     icon: ScanBlockedIcon,
   },

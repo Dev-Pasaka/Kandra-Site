@@ -44,7 +44,7 @@ class KandraRuntime(val session: CqlSession, val batchEngine: BatchEngine, val c
     val inFlightCount: AtomicInteger    // delegates to batchEngine.inFlightCount
 
     @ExperimentalKandraApi suspend fun batch(block: suspend KandraBatchScope.() -> Unit)
-    @ExperimentalKandraApi fun batchBlocking(block: KandraBatchScope.() -> Unit)
+    @ExperimentalKandraApi fun batchBlocking(block: KandraBlockingBatchScope.() -> Unit)
 
     fun <T : Any> repository(entityClass: KClass<T>): KandraRepository<T>
     fun <T : Any> suspendRepository(entityClass: KClass<T>): KandraSuspendRepository<T>
@@ -124,12 +124,13 @@ independent `LOGGED BATCH` statements. A failure partway through leaves earlier 
 later ones not — `saveAll` is not one atomic operation once it's large enough to chunk.
 </Callout>
 
-<Unreleased issues={[132, 138, 136, 103]}>
-New `saveAndGet()`, `saveIfNotExistsAndGet()` and `updateAndGet()` return the entity **as persisted**
-— generated `@GeneratedUuid`/`@CreatedAt`/`@UpdatedAt` values and the post-update `@Version` included.
-The existing `save()`/`update()` still return `Unit` and discard them. Client-side throttle rejections
-surface as `KandraThrottledException` (never retried) instead of the raw driver exception.
-</Unreleased>
+<Callout kind="tip" title="New in 0.4.7: get back what was actually persisted">
+`saveAndGet()`, `saveIfNotExistsAndGet()` and `updateAndGet()` return the entity **as persisted** —
+generated `@GeneratedUuid`/`@CreatedAt`/`@UpdatedAt` values and the post-update `@Version` included.
+`save()`/`update()` still return `Unit` and discard them. Client-side throttle rejections (from the
+opt-in `throttle { }` block) surface as `KandraThrottledException`, never retried, instead of the raw
+driver exception.
+</Callout>
 
 ### Update family
 
@@ -214,7 +215,7 @@ fun findById(vararg idValues: Any, consistency: KandraConsistency? = null): T?
 fun find(block: QueryContext.() -> Unit): T?
 fun findAll(limit: Int? = null, block: QueryContext.() -> Unit): List<T>
 fun findPage(pageSize: Int, pageToken: String? = null, block: QueryContext.() -> Unit = {}): KandraPage<T>
-fun findActive(): List<T>
+fun findActive(allowFullScan: Boolean = false): List<T>
 fun exists(block: QueryContext.() -> Unit): Boolean
 fun raw(cql: String, vararg params: Any?): List<Row>
 fun rawQuery(query: KandraRawQuery): List<Row>

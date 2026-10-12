@@ -22,7 +22,7 @@ export function BeforeAfterToggle({ before, after }: { before: ReactNode; after:
           aria-pressed={active === "after"}
           className="cursor-pointer"
         >
-          After (v0.4.6)
+          After
         </button>
       </div>
       {active === "before" ? before : after}

@@ -100,16 +100,17 @@ specific, deliberate exception you're opting into by adding the annotation. Don'
 every entity by reflex; add it to the ones that actually have concurrent-edit risk.
 </Callout>
 
-<Unreleased issues={[19, 136, 134]}>
-Versioned `update()`/`updateSuspend()` stop retrying on transient errors (`WriteTimeoutException`,
-`ReadTimeoutException`, `NoNodeAvailableException`): the `IF version = ?` statement runs exactly once.
-A retry after a write that already landed server-side would see `[applied] = false` and throw a
-**spurious** `KandraOptimisticLockException`. If you want retry-on-timeout, catch the transient
-exception, re-fetch the entity with `findById()`, and call `update()` again with that fresh copy —
-never re-send the same `(old, new)` pair. Also new: `updateAndGet(old, new)` returns the entity as
-persisted, with its new `version` already set, and `update()` takes a `serialConsistency` parameter
-(default `LOCAL_SERIAL`; pass `SERIAL` when the lock must hold across datacenters).
-</Unreleased>
+<Callout kind="note" title="Changed in 0.4.7: no automatic retry on transient errors">
+Versioned `update()`/`updateSuspend()` run the `IF version = ?` statement exactly once. A transient
+error (`WriteTimeoutException`, `ReadTimeoutException`, `NoNodeAvailableException`) propagates to you
+instead of being retried, because a retry after a write that already landed server-side would see
+`[applied] = false` and throw a **spurious** `KandraOptimisticLockException`. Every other write path
+still retries per `RetryConfig`. If you want retry-on-timeout, catch the transient exception,
+re-fetch the entity with `findById()`, and call `update()` again with that fresh copy — never re-send
+the same `(old, new)` pair. Prefer `updateAndGet(old, new)`, which returns the entity as persisted
+with its new `version` already set, and pass `serialConsistency = KandraConsistency.SERIAL` when the
+lock must hold across datacenters (the default is `LOCAL_SERIAL`).
+</Callout>
 
 ## `updateForce()`: the blind-overwrite escape hatch
 
