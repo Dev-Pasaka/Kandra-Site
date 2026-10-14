@@ -28,7 +28,7 @@
   "vars": {
     // Public OAuth app id (github.com/settings/developers). The secret is set with
     // `npx wrangler secret put GITHUB_CLIENT_SECRET`, never here.
-    "GITHUB_CLIENT_ID": "",
+    "GITHUB_CLIENT_ID": "Ov23liq3zePz6jCmTyLO",
     "ADMIN_GITHUB_LOGINS": "Dev-Pasaka"
   },
   "observability": { "enabled": true }
