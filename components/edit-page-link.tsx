@@ -1,5 +1,6 @@
 "use client";
 
+import { SquarePen } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { SITE_REPO_URL } from "@/lib/site-config";
 
@@ -16,9 +17,7 @@ export function EditPageLink() {
       rel="noreferrer"
       className="inline-flex items-center gap-1.5 text-xs text-ink-faint hover:text-accent transition-colors"
     >
-      <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-        <path d="M11 2 14 5 6 13H3v-3l8-8Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-      </svg>
+      <SquarePen className="w-3.5 h-3.5" strokeWidth={1.8} aria-hidden="true" />
       Edit this page on GitHub
     </a>
   );

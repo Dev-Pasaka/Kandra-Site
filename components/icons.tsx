@@ -1,111 +1,44 @@
-// Small line icons for the home page cards — same thin-stroke, currentColor
-// style as the Callout icons, so nothing here introduces a second visual
-// language.
+import type { LucideIcon } from "lucide-react";
 
-type IconProps = { className?: string };
+// Every icon on the site comes from Lucide (one drawn set, SF Symbols-like 24px grid, round caps)
+// instead of hand-drawn one-offs, so stroke weight, corner radius and optical size always match.
+// Import glyphs from "lucide-react" directly; this file only holds the shared tile treatment.
 
-export function LinkChainIcon({ className }: IconProps) {
+export type { LucideIcon };
+
+export type IconTone = "accent" | "danger" | "gotcha" | "tip" | "neutral";
+
+const TONE: Record<IconTone, { bg: string; fg: string }> = {
+  accent: { bg: "var(--accent-soft)", fg: "var(--accent-strong)" },
+  danger: { bg: "var(--danger-soft)", fg: "var(--danger)" },
+  gotcha: { bg: "var(--gotcha-soft)", fg: "var(--gotcha)" },
+  tip: { bg: "var(--tip-soft)", fg: "var(--tip)" },
+  neutral: { bg: "var(--paper)", fg: "var(--ink-muted)" },
+};
+
+// A glyph on a tinted rounded square, like an app-settings row icon. Sized in rem so it scales
+// with the user's text size.
+export function IconTile({
+  icon: Icon,
+  tone = "accent",
+  size = "md",
+  className,
+}: {
+  icon: LucideIcon;
+  tone?: IconTone;
+  size?: "sm" | "md";
+  className?: string;
+}) {
+  const t = TONE[tone];
+  const box = size === "sm" ? "w-7 h-7 rounded-[8px]" : "w-10 h-10 rounded-[11px]";
+  const glyph = size === "sm" ? "w-4 h-4" : "w-5 h-5";
   return (
-    <svg className={className} width="18" height="18" viewBox="0 0 16 16" fill="none">
-      <rect x="1.5" y="5" width="6" height="6" rx="3" stroke="currentColor" strokeWidth="1.3" />
-      <rect x="8.5" y="5" width="6" height="6" rx="3" stroke="currentColor" strokeWidth="1.3" />
-      <line x1="7" y1="8" x2="9" y2="8" stroke="currentColor" strokeWidth="1.3" />
-    </svg>
+    <span
+      className={`inline-flex shrink-0 items-center justify-center ${box} ${className ?? ""}`}
+      style={{ background: t.bg, color: t.fg }}
+      aria-hidden="true"
+    >
+      <Icon className={glyph} strokeWidth={1.9} />
+    </span>
   );
 }
-
-export function PartitionDeleteIcon({ className }: IconProps) {
-  return (
-    <svg className={className} width="18" height="18" viewBox="0 0 16 16" fill="none">
-      <rect x="2" y="2.5" width="12" height="3" rx="0.6" stroke="currentColor" strokeWidth="1.3" />
-      <rect x="2" y="6.5" width="12" height="3" rx="0.6" stroke="currentColor" strokeWidth="1.2" strokeOpacity="0.35" />
-      <rect x="2" y="10.5" width="12" height="3" rx="0.6" stroke="currentColor" strokeWidth="1.2" strokeOpacity="0.35" />
-      <path d="M5 1.5l6 13M11 1.5l-6 13" stroke="var(--danger)" strokeWidth="1.3" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-export function BatchAtomicIcon({ className }: IconProps) {
-  return (
-    <svg className={className} width="18" height="18" viewBox="0 0 16 16" fill="none">
-      <rect x="2" y="2" width="5" height="5" rx="0.8" stroke="currentColor" strokeWidth="1.3" />
-      <rect x="9" y="2" width="5" height="5" rx="0.8" stroke="currentColor" strokeWidth="1.3" />
-      <rect x="2" y="9" width="5" height="5" rx="0.8" stroke="currentColor" strokeWidth="1.3" />
-      <path d="M9 11.5h5" stroke="var(--accent)" strokeWidth="1.3" strokeLinecap="round" />
-      <path d="M11.5 9v5" stroke="var(--accent)" strokeWidth="1.3" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-export function ScanBlockedIcon({ className }: IconProps) {
-  return (
-    <svg className={className} width="18" height="18" viewBox="0 0 16 16" fill="none">
-      <circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" strokeWidth="1.3" />
-      <path d="m10 10 4 4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-      <path d="M3 3l7 7" stroke="var(--danger)" strokeWidth="1.3" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-export function TombstoneIcon({ className }: IconProps) {
-  return (
-    <svg className={className} width="18" height="18" viewBox="0 0 16 16" fill="none">
-      <path d="M4 14V7a4 4 0 0 1 8 0v7" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-      <line x1="2.5" y1="14" x2="13.5" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-      <line x1="6.5" y1="8.5" x2="9.5" y2="8.5" stroke="currentColor" strokeWidth="1" strokeOpacity="0.5" />
-    </svg>
-  );
-}
-
-export function ScaleCostIcon({ className }: IconProps) {
-  return (
-    <svg className={className} width="18" height="18" viewBox="0 0 16 16" fill="none">
-      <line x1="8" y1="2" x2="8" y2="12.5" stroke="currentColor" strokeWidth="1.3" />
-      <line x1="3" y1="4.5" x2="13" y2="4.5" stroke="currentColor" strokeWidth="1.3" />
-      <path d="M3 4.5 1.3 8.5a2 2 0 0 0 3.4 0z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-      <path d="M13 4.5 11.3 8.5a2 2 0 0 0 3.4 0z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-      <line x1="5.5" y1="14" x2="10.5" y2="14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-export function StartupFlagIcon({ className }: IconProps) {
-  return (
-    <svg className={className} width="18" height="18" viewBox="0 0 16 16" fill="none">
-      <line x1="3" y1="1.5" x2="3" y2="14.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-      <path d="M3 2.5h9l-2.5 3L12 8.5H3" stroke="var(--accent)" strokeWidth="1.3" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-export function PlugIcon({ className }: IconProps) {
-  return (
-    <svg className={className} width="18" height="18" viewBox="0 0 16 16" fill="none">
-      <path d="M6 6V2M10 6V2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-      <path d="M4.5 6h7v2.5a3.5 3.5 0 0 1-7 0Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-      <line x1="8" y1="11.5" x2="8" y2="14.5" stroke="var(--accent)" strokeWidth="1.3" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-// Trust-bar badge icons — same thin-stroke currentColor language, no borrowed
-// logos (abstract marks only, per the illustration convention in
-// illustrations/chariot-scene.tsx).
-
-export function PackageIcon({ className }: IconProps) {
-  return (
-    <svg className={className} width="15" height="15" viewBox="0 0 16 16" fill="none">
-      <path d="M8 1.5 14 4.75v6.5L8 14.5l-6-3.25v-6.5Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-      <path d="M2 4.75 8 8l6-3.25M8 8v6.5" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-export function LicenseIcon({ className }: IconProps) {
-  return (
-    <svg className={className} width="15" height="15" viewBox="0 0 16 16" fill="none">
-      <path d="M8 1.5v13M4 4.5h8M2 4.5 4 4l2 4-2 .5a2 2 0 0 1-2-4Zm12 0L12 4l-2 4 2 .5a2 2 0 0 0 2-4Z" stroke="currentColor" strokeWidth="1.15" strokeLinejoin="round" />
-    </svg>
-  );
-}
-

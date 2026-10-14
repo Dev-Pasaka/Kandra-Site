@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { ChevronRight } from "lucide-react";
 import { usePathname } from "next/navigation";
 import * as Collapsible from "@radix-ui/react-collapsible";
 import { useState } from "react";
@@ -62,16 +63,12 @@ function SidebarSection({
     <Collapsible.Root open={open} onOpenChange={setOpen} className="mb-5">
       <Collapsible.Trigger className="flex w-full items-center justify-between text-[0.8rem] font-semibold text-ink mb-1.5 py-1 cursor-pointer">
         {title}
-        <svg
-          width="10"
-          height="10"
-          viewBox="0 0 16 16"
-          fill="none"
-          className="chevron text-ink-faint"
+        <ChevronRight
+          className="chevron w-3.5 h-3.5 text-ink-faint"
+          strokeWidth={2.2}
+          aria-hidden="true"
           style={{ transform: open ? "rotate(90deg)" : "none" }}
-        >
-          <path d="M5 3l6 5-6 5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
+        />
       </Collapsible.Trigger>
       <Collapsible.Content className="disclosure">{children}</Collapsible.Content>
     </Collapsible.Root>

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { Menu, X } from "lucide-react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
@@ -30,9 +31,7 @@ export function SiteHeader() {
           onClick={() => setMobileOpen(true)}
           aria-label="Open navigation"
         >
-          <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
-            <path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-          </svg>
+          <Menu className="w-5 h-5" strokeWidth={1.8} aria-hidden="true" />
         </button>
 
         <Link href="/" className="pressable flex items-center gap-2 shrink-0">
@@ -87,9 +86,7 @@ export function SiteHeader() {
             <div className="flex items-center justify-between mb-5">
               <span className="font-display font-semibold">Kandra docs</span>
               <Dialog.Close className="pressable inline-flex items-center justify-center w-9 h-9 -mr-2 rounded-full text-ink-muted hover:bg-paper-raised cursor-pointer" aria-label="Close navigation">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                  <path d="M3 3l10 10M13 3 3 13" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-                </svg>
+                <X className="w-5 h-5" strokeWidth={1.8} aria-hidden="true" />
               </Dialog.Close>
             </div>
             <SiteSidebar onNavigate={() => setMobileOpen(false)} />

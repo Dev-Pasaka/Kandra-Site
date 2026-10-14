@@ -1,5 +1,6 @@
 "use client";
 
+import { Check, Copy } from "lucide-react";
 import { Children, cloneElement, isValidElement, useRef, useState, type ReactElement, type ReactNode, type Ref } from "react";
 
 export function CodeFigure({ children }: { children?: ReactNode }) {
@@ -55,30 +56,13 @@ function CopyButton({ copied, onClick }: { copied: boolean; onClick: () => void 
     >
       {copied ? (
         <>
-          <CheckIcon /> Copied
+          <Check className="w-3.5 h-3.5" strokeWidth={2} aria-hidden="true" /> Copied
         </>
       ) : (
         <>
-          <CopyIcon /> Copy
+          <Copy className="w-3.5 h-3.5" strokeWidth={1.8} aria-hidden="true" /> Copy
         </>
       )}
     </button>
-  );
-}
-
-function CopyIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-      <rect x="5.5" y="5.5" width="8.5" height="8.5" rx="1" stroke="currentColor" strokeWidth="1.2" />
-      <path d="M2.5 10.5V3a1 1 0 0 1 1-1h7.5" stroke="currentColor" strokeWidth="1.2" />
-    </svg>
-  );
-}
-
-function CheckIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-      <path d="M3 8.5 6.5 12 13 4.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
   );
 }

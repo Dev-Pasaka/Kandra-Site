@@ -1,25 +1,23 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
-import { siKotlin, siApachecassandra, siSpringboot, siScylladb } from "simple-icons";
-import { ChariotScene } from "@/components/illustrations/chariot-scene";
 import { KANDRA_VERSION, KANDRA_REPO_URL } from "@/lib/site-config";
 import { Tabs } from "@/components/tabs";
-import { BrandLogo } from "@/components/brand-logo";
 import { ScrollReveal } from "@/components/scroll-reveal";
 import { BeforeAfterToggle } from "@/components/homepage/before-after-toggle";
 import { AzTopologySection } from "@/components/homepage/az-topology-section";
 import {
-  LinkChainIcon,
-  PartitionDeleteIcon,
-  BatchAtomicIcon,
-  ScanBlockedIcon,
-  TombstoneIcon,
-  ScaleCostIcon,
-  StartupFlagIcon,
-  PlugIcon,
-  PackageIcon,
-  LicenseIcon,
-} from "@/components/icons";
+  Unlink,
+  Trash2,
+  Layers,
+  SearchX,
+  Hourglass,
+  Coins,
+  ServerCrash,
+  ShieldCheck,
+  GraduationCap,
+  Gauge,
+} from "lucide-react";
+import { IconTile, type IconTone } from "@/components/icons";
 import HeroCode from "@/components/homepage/hero-code.mdx";
 import ShowcaseEntities from "@/components/homepage/showcase-entities.mdx";
 import ShowcaseRepository from "@/components/homepage/showcase-repository.mdx";
@@ -54,10 +52,10 @@ const COMPARISON_ROWS = [
   },
 ];
 
-const SEVERITY_STYLE: Record<string, { label: string; className: string }> = {
-  P0: { label: "Data loss", className: "text-danger" },
-  P1: { label: "Production risk", className: "text-gotcha" },
-  P2: { label: "Cost", className: "text-tip" },
+const SEVERITY_STYLE: Record<string, { label: string; className: string; tone: IconTone }> = {
+  P0: { label: "Data loss", className: "text-danger", tone: "danger" },
+  P1: { label: "Production risk", className: "text-gotcha", tone: "gotcha" },
+  P2: { label: "Cost", className: "text-tip", tone: "tip" },
 };
 
 const PAIN_POINTS = [
@@ -68,7 +66,7 @@ const PAIN_POINTS = [
       "Cassandra has no joins and no foreign keys. Any “find X by Y” query that isn't servable by partition key needs a hand-maintained denormalized table — and a save() that updates the primary table but forgets (or half-fails) the lookup table leaves a user invisible by email, with nothing in the code that looks wrong.",
     fix: "@LookupIndex makes it an annotation, written atomically with the primary row, not a discipline you have to remember in every write path.",
     href: "/philosophy/denormalization",
-    icon: LinkChainIcon,
+    icon: Unlink,
   },
   {
     severity: "P0",
@@ -77,7 +75,7 @@ const PAIN_POINTS = [
       "Relational muscle memory for “delete by ID” doesn't account for clustering keys. DELETE WHERE partition_key = ? on a clustering-keyed table deletes every row in that partition, not the one row you meant — a real data-loss bug, caught the hard way in Kandra's own ISS-025.",
     fix: "deleteById/findById take the full primary key as arguments. Call one with fewer values than the key requires and it fails at call time with KandraSchemaException, naming the missing column — not a silent partition wipe.",
     href: "/battle-scars/clustering-keys-and-lookup-tables",
-    icon: PartitionDeleteIcon,
+    icon: Trash2,
   },
   {
     severity: "P0",
@@ -86,7 +84,7 @@ const PAIN_POINTS = [
       "Cassandra's LOGGED BATCH is the only cross-table atomicity primitive, and it's easy to write code that looks transactional (a few save() calls in a row) while it actually runs as N independent, non-atomic writes.",
     fix: "KandraBatchScope exists specifically for this — and its methods are named saveInBatch, not save, a direct scar from almost shipping an API that silently didn't provide the atomicity it promised.",
     href: "/battle-scars/batch-scope-shadowing",
-    icon: BatchAtomicIcon,
+    icon: Layers,
   },
   {
     severity: "P1",
@@ -95,7 +93,7 @@ const PAIN_POINTS = [
       "Cassandra will let you write a query that triggers a full-cluster scatter-gather scan, and it will degrade a production cluster badly under load. Most ORMs don't stop you.",
     fix: "Kandra's predicate query DSL (find {} / findAll {}) structurally cannot express ALLOW FILTERING — every predicate resolves through a partition key, @LookupIndex, or @SecondaryIndex, or the query throws at build time. The one exception is findActive() on @SoftDelete entities without a @SecondaryIndex on the marker: it throws unless you explicitly pass allowFullScan = true, and then logs a WARN naming the cost.",
     href: "/foundations",
-    icon: ScanBlockedIcon,
+    icon: SearchX,
   },
   {
     severity: "P1",
@@ -104,7 +102,7 @@ const PAIN_POINTS = [
       "Naive DELETE-heavy workloads generate tombstones that degrade read performance until compaction catches up, days later by default. Most relational-background developers have never had to think about this.",
     fix: "@SoftDelete uses a TTL, not a DELETE. And when deleteAll() would actually generate a lot of tombstones, it logs an explicit WARN with the count — before it becomes a 3am page.",
     href: "/recipes/soft-delete",
-    icon: TombstoneIcon,
+    icon: Hourglass,
   },
   {
     severity: "P2",
@@ -113,7 +111,7 @@ const PAIN_POINTS = [
       "Lightweight Transactions (Paxos-based) give you real compare-and-set semantics, but at a real latency cost most relational developers have never had to reason about — SQL transactions don't ask you to.",
     fix: "Plain writes are the default path. @Version and saveIfNotExists are something you opt into deliberately, visible in the entity definition — not hidden behind a @Transactional that quietly does something different per isolation level.",
     href: "/philosophy/consistency",
-    icon: ScaleCostIcon,
+    icon: Coins,
   },
   {
     severity: "P1",
@@ -122,14 +120,14 @@ const PAIN_POINTS = [
       "Partition-scoped design (or its absence) is invisible on a small dev dataset and catastrophic at scale.",
     fix: "Kandra's schema and query validation run at plugin install — startup — not first request. A query that can't be served without a full scan is caught before deploy, not discovered under load.",
     href: "/philosophy/schema-safety",
-    icon: StartupFlagIcon,
+    icon: ServerCrash,
   },
 ];
 
 const BUSINESS_CASES = [
   {
     title: "Prevent costly incidents",
-    icon: PartitionDeleteIcon,
+    icon: ShieldCheck,
     business:
       "A relational-instinct delete or a batch that only looks atomic are exactly the kind of mistake that ships clean, passes review, and pages someone in production. Both are real, root-caused bugs from Kandra's own development, not hypotheticals.",
     technical:
@@ -141,7 +139,7 @@ const BUSINESS_CASES = [
   },
   {
     title: "Onboard engineers faster",
-    icon: LinkChainIcon,
+    icon: GraduationCap,
     business:
       "Cassandra's distributed model is a steep learning curve for anyone coming from a relational background, and that knowledge usually lives in one senior engineer's head. Kandra puts it in the entity definition instead.",
     technical:
@@ -150,7 +148,7 @@ const BUSINESS_CASES = [
   },
   {
     title: "Reduce operational overhead",
-    icon: TombstoneIcon,
+    icon: Gauge,
     business:
       "Tombstone buildup and unbudgeted LWT cost are the kind of gradual, hard-to-diagnose problems that eat on-call time without ever being one clean incident to point at.",
     technical:
@@ -249,25 +247,13 @@ export default function HomePage() {
             View on GitHub
           </a>
         </div>
-        <ul className="mt-8 flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm text-ink-muted">
-          <li className="inline-flex items-center gap-1.5">
-            <BrandLogo icon={siKotlin} size={14} /> Kotlin 2.1+
-          </li>
-          <li className="inline-flex items-center gap-1.5">
-            <BrandLogo icon={siScylladb} size={14} /> ScyllaDB
-          </li>
-          <li className="inline-flex items-center gap-1.5">
-            <BrandLogo icon={siApachecassandra} size={14} /> Cassandra
-          </li>
-          <li className="inline-flex items-center gap-1.5">
-            <PlugIcon className="w-3.5 h-3.5" /> Ktor plugin
-          </li>
-          <li className="inline-flex items-center gap-1.5">
-            <PackageIcon className="w-3.5 h-3.5" /> Maven Central
-          </li>
-          <li className="inline-flex items-center gap-1.5">
-            <LicenseIcon className="w-3.5 h-3.5" /> Apache 2.0
-          </li>
+        <ul className="mt-8 flex flex-wrap items-center justify-center gap-y-2 text-sm text-ink-muted">
+          {["Kotlin 2.1+", "ScyllaDB", "Cassandra", "Ktor plugin", "Maven Central", "Apache 2.0"].map((t, i) => (
+            <li key={t} className="inline-flex items-center">
+              {i > 0 && <span aria-hidden="true" className="mx-3 text-ink-faint">&middot;</span>}
+              {t}
+            </li>
+          ))}
         </ul>
         <div className="hero-code mt-14 md:mt-20 mx-auto max-w-3xl text-left text-sm">
           <HeroCode />
@@ -309,8 +295,8 @@ export default function HomePage() {
           {PAIN_POINTS.map((p) => (
             <ScrollReveal key={p.q}>
               <Link href={p.href} className="card card-link group flex flex-col h-full p-6 md:p-7">
-                <div className="flex items-center gap-2 mb-3">
-                  <p.icon className="w-4 h-4 text-ink-muted" />
+                <div className="flex items-center gap-2.5 mb-4">
+                  <IconTile icon={p.icon} tone={SEVERITY_STYLE[p.severity].tone} size="sm" />
                   <SeverityLabel level={p.severity} />
                 </div>
                 <h3 className="type-title mb-3">{p.q}</h3>
@@ -343,7 +329,7 @@ export default function HomePage() {
           {BUSINESS_CASES.map((c) => (
             <ScrollReveal key={c.title}>
               <div className="card h-full p-6 md:p-7 flex flex-col">
-                <c.icon className="text-accent-strong mb-4 w-6 h-6" />
+                <IconTile icon={c.icon} className="mb-5" />
                 <h3 className="type-title mb-3">{c.title}</h3>
                 <p className="text-[0.95rem] leading-relaxed mb-3">{c.business}</p>
                 <p className="text-[0.95rem] text-ink-muted leading-relaxed mb-5">{c.technical}</p>
@@ -396,9 +382,7 @@ export default function HomePage() {
                   <th className="py-3 pr-6 w-40" />
                   <th className="py-3 pr-6 font-semibold text-ink-muted">DataStax driver</th>
                   <th className="py-3 pr-6 font-semibold text-ink-muted">
-                    <span className="inline-flex items-center gap-1.5">
-                      <BrandLogo icon={siSpringboot} size={14} /> Spring Data Cassandra
-                    </span>
+                    Spring Data Cassandra
                   </th>
                   <th className="py-3 font-semibold text-accent-strong">Kandra</th>
                 </tr>
@@ -469,7 +453,6 @@ export default function HomePage() {
       {/* Closing call to action */}
       <section className="border-t border-border">
         <div className="mx-auto max-w-[1100px] px-4 md:px-6 py-20 md:py-28 text-center">
-          <ChariotScene className="w-40 h-auto mx-auto mb-8 text-ink-faint" />
           <h2 className="type-headline text-balance">Add it to one service. Nothing else changes.</h2>
           <div className="mt-8 mx-auto max-w-md kandra-codeblock text-left">
             <pre className="px-5 py-4 text-sm font-mono overflow-x-auto">

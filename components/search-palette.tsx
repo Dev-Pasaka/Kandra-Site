@@ -1,5 +1,6 @@
 "use client";
 
+import { Search } from "lucide-react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
@@ -107,10 +108,7 @@ export function SearchPalette() {
           type="button"
           className="pressable flex items-center gap-2 rounded-full bg-paper-raised px-3.5 py-1.5 text-sm text-ink-muted hover:text-ink transition-colors cursor-pointer w-full max-w-56"
         >
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
-            <circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.3" />
-            <path d="m11 11 3.5 3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-          </svg>
+          <Search className="w-3.5 h-3.5" strokeWidth={2} aria-hidden="true" />
           <span className="flex-1 text-left">Search docs</span>
           <kbd className="text-[0.7rem] font-sans text-ink-faint">
             &#8984;K
@@ -138,10 +136,7 @@ export function SearchPalette() {
             Search the Kandra documentation site
           </Dialog.Description>
           <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" className="text-ink-faint shrink-0">
-              <circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.3" />
-              <path d="m11 11 3.5 3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-            </svg>
+            <Search className="w-4 h-4 text-ink-faint shrink-0" strokeWidth={2} aria-hidden="true" />
             <input
               ref={inputRef}
               value={query}
