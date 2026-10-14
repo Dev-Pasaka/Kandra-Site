@@ -1,5 +1,3 @@
-import { dokkaModuleUrl } from "@/lib/dokka";
-
 export const metadata = {
   title: "kandra-bom",
   description:
@@ -80,4 +78,5 @@ you a build with no Kandra classes on the classpath at all, no error pointing at
 (constrain) other project modules under Gradle's `java-platform` plugin — without it, a Java
 platform is normally not allowed to declare dependencies on non-platform modules at all.
 
-<a href={dokkaModuleUrl("kandra-bom")} target="_blank" rel="noreferrer">Full Dokka module reference →</a>
+The BOM has no Kotlin sources, so Dokka doesn't generate a page for it. The version constraints
+above are its whole API.

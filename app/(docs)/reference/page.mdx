@@ -45,7 +45,7 @@ source — the latest tag on `main` in the Kandra repo). The published Dokka sit
       <tr key={m}>
         <td><code>{m}</code></td>
         <td><a href={`/modules/${m}`}>/modules/{m}</a></td>
-        <td><a href={dokkaModuleUrl(m)} target="_blank" rel="noreferrer">Dokka &rarr;</a></td>
+        <td>{m === "kandra-bom" ? "No sources" : <a href={dokkaModuleUrl(m)} target="_blank" rel="noreferrer">Dokka &rarr;</a>}</td>
       </tr>
     ))}
   </tbody>

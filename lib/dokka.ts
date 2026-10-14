@@ -14,6 +14,14 @@ function dokkaSlug(identifier: string): string {
   return `-${kebab}`;
 }
 
+/**
+ * Top-level functions get a page without the leading dash, as a plain
+ * `.html` file: `bindKandraRepository` → `bind-kandra-repository.html`.
+ */
+export function dokkaFunctionUrl(module: string, pkg: string, fn: string): string {
+  return `${DOKKA_BASE_URL}/v${DOKKA_PUBLISHED_VERSION}/${module}/${pkg}/${dokkaSlug(fn).slice(1)}.html`;
+}
+
 export function dokkaModuleUrl(module: string): string {
   return `${DOKKA_BASE_URL}/v${DOKKA_PUBLISHED_VERSION}/${module}/index.html`;
 }

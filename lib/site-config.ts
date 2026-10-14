@@ -9,13 +9,12 @@ export const KANDRA_REPO_URL = "https://github.com/Dev-Pasaka/kandra";
 // This documentation site's own repo, for "Edit this page" links.
 export const SITE_REPO_URL = "https://github.com/Dev-Pasaka/Kandra-Site";
 
-// Dokka publishes at this base. Checked live on 2026-10-12, the day v0.4.7 was tagged: the site
-// still redirects "/" to v0.4.6, so Dokka is one release behind KANDRA_VERSION. Dokka publishing is
-// a separate step from tagging a release; re-check the live site and bump this when it catches up.
-// Module reference pages surface the gap explicitly instead of silently linking to docs for
-// behavior that may have changed.
+// Dokka publishes at this base. Checked live on 2026-10-14: "/" redirects to v0.4.7, matching
+// KANDRA_VERSION. Dokka publishing is a separate step from tagging a release, so this can lag
+// again; re-check the live site on each release and bump it when Dokka catches up. Module
+// reference pages surface any gap explicitly instead of silently linking to stale docs.
 export const DOKKA_BASE_URL = "https://dev-pasaka.github.io/kandra";
-export const DOKKA_PUBLISHED_VERSION = "0.4.6";
+export const DOKKA_PUBLISHED_VERSION = "0.4.7";
 
 export const KANDRA_MODULES = [
   "kandra-bom",

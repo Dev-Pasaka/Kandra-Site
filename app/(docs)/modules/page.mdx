@@ -72,7 +72,7 @@ migrations, multi-DC logging, Bean Validation, or Testcontainers-backed tests, r
 
 Every module page above links to its own Dokka module page inline; the module-level entry points are
 also listed here: {" "}
-{["kandra-bom", "kandra-core", "kandra-runtime", "kandra-codegen", "kandra-ktor", "kandra-koin", "kandra-kodein", "kandra-migrate", "kandra-multidc", "kandra-jakarta", "kandra-test"].map((m, i, arr) => (
+{["kandra-core", "kandra-runtime", "kandra-codegen", "kandra-ktor", "kandra-koin", "kandra-kodein", "kandra-migrate", "kandra-multidc", "kandra-jakarta", "kandra-test"].map((m, i, arr) => (
   <span key={m}>
     <a href={dokkaModuleUrl(m)} target="_blank" rel="noreferrer"><code>{m}</code></a>
     {i < arr.length - 1 ? " · " : ""}
