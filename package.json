@@ -28,6 +28,7 @@
     "gray-matter": "^4.0.3",
     "hono": "4.13.11",
     "lucide-react": "1.49.0",
+    "markdown-it": "14.3.2",
     "next": "16.2.11",
     "react": "19.2.4",
     "react-dom": "19.2.4",
@@ -41,6 +42,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260929.1",
     "@tailwindcss/postcss": "^4",
+    "@types/markdown-it": "14.2.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

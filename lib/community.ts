@@ -40,6 +40,39 @@ export interface Me {
   role: "member" | "moderator" | "admin";
 }
 
+export interface CommunityPost {
+  id: number;
+  slug: string;
+  title: string;
+  summary: string;
+  status: "draft" | "pending" | "approved" | "rejected";
+  rejectReason: string | null;
+  canonicalUrl: string | null;
+  createdAt: string;
+  updatedAt: string;
+  publishedAt: string | null;
+  readingMinutes: number;
+  tags: string[];
+  author: Author;
+  body?: string;
+}
+
+export const MEDIA_ACCEPT = "image/png,image/jpeg,image/gif,image/webp,image/avif,video/mp4,video/webm";
+
+/** Uploads one image or video; the server checks the real type from the file's bytes. */
+export async function uploadMedia(file: File): Promise<{ url: string; kind: "image" | "video" }> {
+  if (file.size > 50 * 1024 * 1024) throw new ApiError(413, `${file.name} is larger than 50 MB`);
+  let res: Response;
+  try {
+    res = await fetch("/api/media", { method: "PUT", credentials: "same-origin", body: file });
+  } catch {
+    throw new ApiError(0, "Upload failed. Check your connection and try again.");
+  }
+  const data = (await res.json().catch(() => ({ error: "Upload failed" }))) as { url: string; kind: "image" | "video"; error?: string };
+  if (!res.ok) throw new ApiError(res.status, data.error ?? "Upload failed");
+  return data;
+}
+
 export const RESOURCE_TYPES = [
   { value: "library", label: "Library" },
   { value: "sample", label: "Sample app" },

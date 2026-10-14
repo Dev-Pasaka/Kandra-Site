@@ -17,6 +17,7 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   routes.add("/community");
   routes.add("/resources");
   routes.add("/community/guidelines");
+  routes.add("/community/posts");
   for (const t of await getTags()) routes.add(`/blog/tags/${t.slug}`);
 
   const posts = await getPosts();

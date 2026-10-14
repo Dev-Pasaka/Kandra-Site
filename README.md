@@ -65,9 +65,18 @@ get `/blog/<slug>`, tag pages, the RSS feed at `/blog/rss.xml` and sitemap entri
 
 ## Community API (Worker + D1)
 
-`/community` (links to people's own writing) and `/resources` (libraries, samples, tools) are
-static pages that call a small JSON API in `worker/` (Hono on Cloudflare Workers, SQLite via D1,
-schema in `migrations/`). Only `/api/*` runs the Worker; every other path is served from `out/`.
+`/community` (links to people's own writing), `/community/posts` (posts written here) and
+`/resources` (libraries, samples, tools) call a small backend in `worker/` (Hono on Cloudflare
+Workers, SQLite via D1 with the schema in `migrations/`, uploads in the R2 bucket `kandra-media`).
+Only `/api/*`, `/media/*` and `/community/p/*` run the Worker; every other path is served from `out/`.
+
+- **Community posts:** Markdown written in the editor at `/community/write`, rendered and sanitized
+  in the Worker (`worker/markdown.ts`: no raw HTML, images only from this site's uploads). Post
+  pages (`/community/p/<slug>`) are the static shell from `app/community/p` with the post streamed
+  in by HTMLRewriter, so they have real HTML, titles and Open Graph tags.
+- **Uploads:** images up to 5 MB (PNG, JPEG, GIF, WebP, AVIF) and videos up to 50 MB (MP4, WebM),
+  with the type checked from the file's bytes; 30 files or 200 MB per member per day. A file is
+  public only while an approved post uses it; until then only its uploader and moderators can load it.
 
 - **Sign-in:** GitHub OAuth, public profile only, with an opaque session id in an HttpOnly cookie.
 - **Moderation:** new submissions are pending until a moderator approves them at `/admin`. After
@@ -88,7 +97,7 @@ npm run preview                      # build + wrangler dev on http://localhost:
 One-time production setup:
 
 1. `npx wrangler login`, then `npx wrangler d1 create kandra-site` and put the returned
-   `database_id` in `wrangler.jsonc`.
+   `database_id` in `wrangler.jsonc`, and `npx wrangler r2 bucket create kandra-media`.
 2. `npm run db:migrate:remote`.
 3. Create a GitHub OAuth app (github.com/settings/developers) with callback URL
    `https://kandraorm.com/api/auth/callback`. Put its client id in

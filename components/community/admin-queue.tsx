@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { api, RESOURCE_TYPES, relativeTime, signInHref, useMe, type Submission } from "@/lib/community";
+import { api, RESOURCE_TYPES, relativeTime, signInHref, useMe, type CommunityPost, type Submission } from "@/lib/community";
 import { AccountBar } from "./account-bar";
 import { Avatar } from "./avatar";
 
@@ -20,14 +20,16 @@ export function AdminQueue() {
   const { me, loaded, refresh } = useMe();
   const [pending, setPending] = useState<Submission[] | null>(null);
   const [reports, setReports] = useState<Report[]>([]);
+  const [posts, setPosts] = useState<CommunityPost[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [rejecting, setRejecting] = useState<number | null>(null);
   const [reason, setReason] = useState("");
 
   const load = useCallback(async () => {
     try {
-      const r = await api<{ pending: Submission[]; reports: Report[] }>("/admin/queue");
+      const r = await api<{ pending: Submission[]; reports: Report[]; posts: CommunityPost[] }>("/admin/queue");
       setPending(r.pending);
+      setPosts(r.posts);
       setReports(r.reports);
       setError(null);
     } catch (e) {
@@ -65,7 +67,52 @@ export function AdminQueue() {
       </div>
       {error && <p className="mb-6 rounded-[var(--radius)] bg-danger-soft text-danger px-4 py-3 text-sm" role="alert">{error}</p>}
 
-      <h2 className="type-title mb-4">Waiting for review {pending && <span className="text-ink-muted font-normal">({pending.length})</span>}</h2>
+      <h2 className="type-title mb-4">Posts waiting for review <span className="text-ink-muted font-normal">({posts.length})</span></h2>
+      {posts.length === 0 && <p className="text-ink-muted mb-10">No posts waiting.</p>}
+      <ul className="divide-y divide-border border-y border-border mb-14">
+        {posts.map((p) => (
+          <li key={p.id} className="py-5">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-ink-muted">
+              <span className="inline-flex items-center gap-1"><Avatar user={p.author} size={16} /> {p.author.login}</span>
+              <span>&middot; updated {relativeTime(p.updatedAt)}</span>
+              <span>&middot; {p.readingMinutes} min read</span>
+            </div>
+            <a href={`/community/p/${p.slug}`} target="_blank" rel="noopener" className="mt-1 block font-semibold hover:text-accent-strong">
+              {p.title} &rsaquo;
+            </a>
+            <p className="mt-1 text-sm text-ink-muted">{p.summary}</p>
+            {rejecting === -p.id ? (
+              <form
+                className="mt-3 flex flex-col sm:flex-row gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void act(`/admin/posts/${p.id}`, { action: "reject", reason: reason || undefined });
+                  setRejecting(null);
+                  setReason("");
+                }}
+              >
+                <input className="field !py-2 !text-sm" placeholder="What should the author change? (optional)" value={reason} onChange={(e) => setReason(e.target.value)} maxLength={300} />
+                <button type="submit" className="btn btn-sm cursor-pointer bg-danger text-white shrink-0">Reject</button>
+                <button type="button" className="btn btn-secondary btn-sm cursor-pointer shrink-0" onClick={() => setRejecting(null)}>Cancel</button>
+              </form>
+            ) : (
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button type="button" className="btn btn-primary btn-sm cursor-pointer" onClick={() => act(`/admin/posts/${p.id}`, { action: "approve" })}>
+                  Approve
+                </button>
+                <button type="button" className="btn btn-secondary btn-sm cursor-pointer" onClick={() => setRejecting(-p.id)}>
+                  Reject…
+                </button>
+                <button type="button" className="btn btn-plain btn-sm cursor-pointer !text-danger" onClick={() => act(`/admin/users/${p.author.id}/ban`)}>
+                  Ban {p.author.login}
+                </button>
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+
+      <h2 className="type-title mb-4">Links and resources waiting {pending && <span className="text-ink-muted font-normal">({pending.length})</span>}</h2>
       {pending?.length === 0 && <p className="text-ink-muted mb-10">Queue is empty.</p>}
       <ul className="divide-y divide-border border-y border-border mb-14">
         {pending?.map((s) => (

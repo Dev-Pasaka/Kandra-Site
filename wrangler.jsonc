@@ -7,14 +7,15 @@
   // routes the build through `opennextjs-cloudflare`, which expects a server build a static export
   // never produces (the ENOENT on deploy).
   //
-  // worker/index.ts is a small JSON API for community links and resources. Only /api/* runs it
+  // worker/index.ts is the community backend: the /api JSON API, uploaded media under /media,
+  // and server-rendered community posts under /community/p. Only those paths run it
   // (`run_worker_first`); every other path is served straight from `out/` as before.
   "main": "worker/index.ts",
   "assets": {
     "directory": "./out",
     "binding": "ASSETS",
     "not_found_handling": "404-page",
-    "run_worker_first": ["/api/*"]
+    "run_worker_first": ["/api/*", "/media/*", "/community/p/*"]
   },
   "d1_databases": [
     {
@@ -24,6 +25,10 @@
       "database_id": "22c92432-8813-48b6-8e30-e100cfa91df6",
       "migrations_dir": "migrations"
     }
+  ],
+  "r2_buckets": [
+    // Images and videos uploaded for community posts (worker/media.ts).
+    { "binding": "MEDIA", "bucket_name": "kandra-media" }
   ],
   "vars": {
     // Public OAuth app id (github.com/settings/developers). The secret is set with

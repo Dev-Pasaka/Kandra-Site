@@ -112,6 +112,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { title: "FAQ", href: "/faq" },
       { title: "Blog", href: "/blog" },
       { title: "Community", href: "/community" },
+      { title: "Community posts", href: "/community/posts" },
       { title: "Resources", href: "/resources" },
     ],
   },

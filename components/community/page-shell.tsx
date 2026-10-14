@@ -16,7 +16,8 @@ export function PageShell({
     <main className={`mx-auto w-full ${wide ? "max-w-[860px]" : "max-w-[680px]"} px-4 md:px-6 py-16 md:py-24`}>
       <header className="mb-10">
         <nav aria-label="Community" className="type-eyebrow mb-3 flex gap-4">
-          <Link href="/community" className="hover:underline underline-offset-4">Community</Link>
+          <Link href="/community" className="hover:underline underline-offset-4">Links</Link>
+          <Link href="/community/posts" className="hover:underline underline-offset-4">Posts</Link>
           <Link href="/resources" className="hover:underline underline-offset-4">Resources</Link>
         </nav>
         <h1 className="type-headline text-balance">{title}</h1>

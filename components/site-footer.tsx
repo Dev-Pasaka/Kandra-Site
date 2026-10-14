@@ -32,6 +32,7 @@ export function SiteFooter() {
             <li><Link href="/changelog" className="hover:text-ink transition-colors">Changelog</Link></li>
             <li><Link href="/blog" className="hover:text-ink transition-colors">Blog</Link></li>
             <li><Link href="/community" className="hover:text-ink transition-colors">Community</Link></li>
+            <li><Link href="/community/posts" className="hover:text-ink transition-colors">Community posts</Link></li>
             <li><Link href="/resources" className="hover:text-ink transition-colors">Resources</Link></li>
             <li><Link href="/faq" className="hover:text-ink transition-colors">FAQ</Link></li>
           </ul>
