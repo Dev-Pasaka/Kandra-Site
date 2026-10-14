@@ -103,8 +103,9 @@ import java.util.UUID
 @ScyllaTable("todos")
 data class Todo(
     @PartitionKey val ownerId: UUID,
-    @ClusteringKey(order = ClusteringOrder.DESC)
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0)
     val createdAt: Instant,
+    @ClusteringKey(index = 1)
     val todoId: UUID,
     val title: String,
     val assigneeId: UUID?,
@@ -138,9 +139,9 @@ silently overwrote the `createdAt` you passed in with a fresh `Instant.now()` co
 `save()`, there would be no way for the calling code to learn what value actually landed in the
 database — `save()` hands nothing back. For a plain audit column, that's fine; nobody needs to know
 the exact stamped value to use it later. For `Todo.createdAt`, it's disqualifying: this app looks up
-one specific todo with `findById(ownerId, createdAt)` in every route from
+one specific todo with `findById(ownerId, createdAt, todoId)` in every route from
 [page 05](/tutorial/05-routes) onward — including the read-before-write step in
-[page 07](/tutorial/07-concurrency)'s own `PATCH /todos/{id}/done` handler — and every one of those
+[page 07](/tutorial/07-concurrency)'s own `PATCH /todos/{createdAt}/{todoId}/done` handler — and every one of those
 calls needs the *exact* clustering-key value that was actually written. Relying on `@CreatedAt`'s
 save()-time stamp would mean the caller's own copy of `createdAt` (captured before `save()`) could,
 in principle, never match what Kandra silently substituted in, with no way to detect the mismatch
@@ -154,12 +155,15 @@ This is the resolution the rest of this tutorial builds on: **`Todo.createdAt` c
 `@ClusteringKey(order = ClusteringOrder.DESC)` only, has no default value, and is always supplied by
 the caller** — not `@CreatedAt`, and not two separate timestamp properties.
 
-- **`val todoId: UUID`** — a stable, application-generated ID carried on every todo, useful for
-  clients (a permalink, an idempotency key, something to log) — but deliberately **not** a key or a
-  `@LookupIndex` column. Page 01's access-pattern list never asked for "find a todo by `todoId`
-  alone," so this entity doesn't build infrastructure for a query nobody needs yet. If that pattern
-  ever shows up for real, the fix is the same tool `User.email` already uses —
-  `@LookupIndex(tableSuffix = "by_id")` — not a redesign.
+- **`@ClusteringKey(index = 1) val todoId: UUID`** — a random, application-generated ID, and the
+  second clustering column. It's there to make the key unique. `createdAt` is stored as a CQL
+  `timestamp`, which has millisecond precision, so two todos from the same owner created in the same
+  millisecond (a double-submitted form, a bulk import) would have the same `(ownerId, createdAt)`
+  key. In Cassandra a second insert with an existing key is an upsert: it silently overwrites the
+  first todo, with no error. Adding `todoId` after `createdAt` keeps the newest-first sort and makes
+  every key unique. It's still not a lookup key on its own: page 01's access patterns never asked for
+  "find a todo by `todoId` alone," and if that ever comes up, the fix is a
+  `@LookupIndex(tableSuffix = "by_id")`, not a redesign.
 - **`val assigneeId: UUID?`** — nullable: most todos aren't assigned to anyone else. This is the
   column [page 06](/tutorial/06-denormalization) picks up directly — it's on the entity now because
   the product needs it, even though nothing can query by it efficiently yet.
@@ -173,8 +177,9 @@ the caller** — not `@CreatedAt`, and not two separate timestamp properties.
 @ScyllaTable("todos")
 data class Todo(
     @PartitionKey val ownerId: UUID,
-    @ClusteringKey(order = ClusteringOrder.DESC)
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0)
     val createdAt: Instant,
+    @ClusteringKey(index = 1)
     val todoId: UUID,
     val title: String,
     val assigneeId: UUID?,
@@ -193,19 +198,20 @@ CREATE TABLE IF NOT EXISTS todos (
     title TEXT,
     assignee_id UUID,
     done BOOLEAN,
-    PRIMARY KEY (owner_id, created_at)
+    PRIMARY KEY (owner_id, created_at, todo_id)
 )
-WITH CLUSTERING ORDER BY (created_at DESC);
+WITH CLUSTERING ORDER BY (created_at DESC, todo_id ASC);
 ```
 
 </div>
 </SideBySide>
 
-`PRIMARY KEY (owner_id, created_at)` — a single-column partition key followed by the clustering key,
-no double-parenthesis wrapping (that only happens for a *composite* partition key, more than one
-`@PartitionKey` column — not this table's shape). `WITH CLUSTERING ORDER BY (created_at DESC)` is
-the one and only reason `findPage`/`findAll` against one `ownerId` come back newest-first without an
-`ORDER BY` anywhere in application code.
+`PRIMARY KEY (owner_id, created_at, todo_id)` — a single-column partition key followed by the two
+clustering columns in `index` order, no double-parenthesis wrapping (that only happens for a
+*composite* partition key, more than one `@PartitionKey` column — not this table's shape).
+`WITH CLUSTERING ORDER BY (created_at DESC, todo_id ASC)` is the one and only reason
+`findPage`/`findAll` against one `ownerId` come back newest-first without an `ORDER BY` anywhere in
+application code; `todo_id` only matters for the rare rows that share a `created_at`.
 
 ## Making them JSON-serializable
 

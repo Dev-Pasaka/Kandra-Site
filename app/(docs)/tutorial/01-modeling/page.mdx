@@ -69,15 +69,16 @@ results in?"**
   the storage layer, not at query time. Ask for a user's partition and the rows come back
   pre-sorted, because that's how they're physically laid out on disk.
 
-So: `Todo` is partitioned by `ownerId`, clustered by `createdAt DESC`. That single decision, made
+So: `Todo` is partitioned by `ownerId`, clustered by `createdAt DESC` (with `todoId` as a
+tie-breaker, explained on page 03). That single decision, made
 from one sentence of product requirement, is what page 03 turns into `@PartitionKey`/`@ClusteringKey`
 — not "because `ownerId` felt like the identifying column."
 
 <Callout kind="tip" title="This also answers 'what identifies one todo,' just not the way you'd expect">
-There is no single "the primary key" column here the way a relational reader expects — the pair
-`(ownerId, createdAt)` together is what identifies one row. A todo's own random ID, if it has one,
-is not automatically the thing you look a todo up by. Page 05 runs into this directly when it has to
-decide what `PATCH /todos/{id}/done` actually needs in its URL to find the right row.
+There is no single "the primary key" column here the way a relational reader expects. The full key
+`(ownerId, createdAt, todoId)` together is what identifies one row, and a todo's own random ID alone
+isn't enough to look it up. Page 05 runs into this directly when it has to decide what
+`PATCH /todos/{createdAt}/{todoId}/done` actually needs in its URL to find the right row.
 </Callout>
 
 ## Pattern 3: "mark this todo done" needs the same key

@@ -1,7 +1,7 @@
 ```kotlin title="Todo.kt — today"
-// Todo(ownerId: PartitionKey, todoId: ClusteringKey, ...)
+// Todo(ownerId: PartitionKey, createdAt + todoId: ClusteringKey, ...)
 
-todoRepo.deleteById(ownerId, todoId) // deletes exactly one row
+todoRepo.deleteById(ownerId, createdAt, todoId) // deletes exactly one row
 
 todoRepo.deleteById(ownerId)
 // Fails at call time: KandraSchemaException, naming the missing

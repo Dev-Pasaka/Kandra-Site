@@ -83,8 +83,8 @@ it must be unique across every migration this app ever defines, and migrations a
 @SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted")
 data class Todo(
     @PartitionKey val ownerId: UUID,
-    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
-    val todoId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: Instant,
+    @ClusteringKey(index = 1) val todoId: UUID,
     val priority: Int? = null,
     val title: String,
     val assigneeId: UUID?,

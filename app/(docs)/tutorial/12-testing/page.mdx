@@ -146,12 +146,13 @@ class TodoOptimisticLockIntegrationTest {
     fun `updating from a stale snapshot throws KandraOptimisticLockException`() = runTest {
         val ownerId = UUID.randomUUID()
         val createdAt = Instant.now()
-        val todo = Todo(ownerId, createdAt, UUID.randomUUID(), "Ship the release", null)
+        val todoId = UUID.randomUUID()
+        val todo = Todo(ownerId, createdAt, todoId, "Ship the release", null)
         todoRepo.save(todo)
 
         // Two "concurrent" readers both load the same version-1 snapshot.
-        val readerA = todoRepo.findById(ownerId, createdAt)!!
-        val readerB = todoRepo.findById(ownerId, createdAt)!!
+        val readerA = todoRepo.findById(ownerId, createdAt, todoId)!!
+        val readerB = todoRepo.findById(ownerId, createdAt, todoId)!!
 
         todoRepo.update(readerA, readerA.copy(title = "Ship the release (edited by A)"))  // wins, version -> 2
 
@@ -183,13 +184,14 @@ class TodoSoftDeleteIntegrationTest {
     fun `delete rewrites the row with a TTL marker instead of a real DELETE`() = runTest {
         val ownerId = UUID.randomUUID()
         val createdAt = Instant.now()
-        val todo = Todo(ownerId, createdAt, UUID.randomUUID(), "Renew passport", null)
+        val todoId = UUID.randomUUID()
+        val todo = Todo(ownerId, createdAt, todoId, "Renew passport", null)
         todoRepo.save(todo)
 
         todoRepo.delete(todo)   // @SoftDelete: UPDATE ... USING TTL 604800, not DELETE
 
         // A real DELETE would make this null immediately. It doesn't, here.
-        val afterDelete = todoRepo.findById(ownerId, createdAt)
+        val afterDelete = todoRepo.findById(ownerId, createdAt, todoId)
         assertNotNull(afterDelete)
         assertTrue(afterDelete!!.isDeleted)
         assertEquals("Renew passport", afterDelete.title)   // whole row rewritten with a fresh TTL, not just a marker column
@@ -230,8 +232,8 @@ class DenormalizedWriteAtomicityIntegrationTest {
             byAssigneeRepo.saveInBatch(TodoByAssignee(assigneeId, createdAt, todoId, ownerId, "Review PR"))
         }
 
-        assertEquals(todoId, todoRepo.findById(ownerId, createdAt)?.todoId)
-        assertEquals(todoId, byAssigneeRepo.findById(assigneeId, createdAt)?.todoId)
+        assertEquals(todoId, todoRepo.findById(ownerId, createdAt, todoId)?.todoId)
+        assertEquals(todoId, byAssigneeRepo.findById(assigneeId, createdAt, todoId)?.todoId)
     }
 }
 ```

@@ -108,22 +108,24 @@ fun Route.todoRoutes() {
         call.respond(TodoPage(page.items, page.nextPageToken, page.hasMore))
     }
 
-    patch("/todos/{id}/done") {
+    patch("/todos/{createdAt}/{todoId}/done") {
         val ownerId = call.ownerIdOrRespondBadRequest() ?: return@patch
-        val createdAt = Instant.parse(call.parameters["id"]!!)
+        val createdAt = Instant.parse(call.parameters["createdAt"]!!)
+        val todoId = UUID.fromString(call.parameters["todoId"]!!)
 
-        val existing = todoRepo.findById(ownerId, createdAt)
+        val existing = todoRepo.findById(ownerId, createdAt, todoId)
             ?: return@patch call.respond(HttpStatusCode.NotFound)
 
         todoRepo.update(existing, existing.copy(done = true))
         call.respond(existing.copy(done = true))
     }
 
-    delete("/todos/{id}") {
+    delete("/todos/{createdAt}/{todoId}") {
         val ownerId = call.ownerIdOrRespondBadRequest() ?: return@delete
-        val createdAt = Instant.parse(call.parameters["id"]!!)
+        val createdAt = Instant.parse(call.parameters["createdAt"]!!)
+        val todoId = UUID.fromString(call.parameters["todoId"]!!)
 
-        val existing = todoRepo.findById(ownerId, createdAt)
+        val existing = todoRepo.findById(ownerId, createdAt, todoId)
             ?: return@delete call.respond(HttpStatusCode.NotFound)
 
         todoRepo.delete(existing)
@@ -158,23 +160,22 @@ exactly the query shape `Todo`'s partition/clustering design in
 logic in this handler, because `@ClusteringKey(order = DESC)` already baked that ordering into the
 table.
 
-## `PATCH /todos/{id}/done` and `DELETE /todos/{id}` — what "`{id}`" actually is
+## `PATCH /todos/{createdAt}/{todoId}/done` and `DELETE /todos/{createdAt}/{todoId}` — why the URL carries the key
 
 <Callout kind="tip" title="Ties back to page 01: there's no single 'the primary key'">
-`Todo` has no synthetic single-column ID a route could look it up by directly — `todoId` exists (per
-[page 03](/tutorial/03-entities)) but isn't a key or a `@LookupIndex`, so there's no way to find a
-row by `todoId` alone without a full scan Kandra won't build. What actually identifies one todo
-within its owner's partition is the pair `(ownerId, createdAt)` — the owner comes from the
-`X-User-Id` header on every route in this app, and `{id}` in the URL is the ISO-8601
-`createdAt` value, parsed with `Instant.parse(...)`. It reads like a normal REST resource ID; under
-the hood it's literally the clustering key.
+`Todo` has no single-column ID a route could look it up by directly. `todoId` is part of the key
+(per [page 03](/tutorial/03-entities)) but only after `createdAt`, so there's no way to find a row
+by `todoId` alone without a full scan Kandra won't build. What identifies one todo is the full key
+`(ownerId, createdAt, todoId)`: the owner comes from the `X-User-Id` header on every route in this
+app, and the URL carries the two clustering columns, `createdAt` as ISO-8601 (parsed with
+`Instant.parse(...)`) and `todoId` as a UUID. Both come straight from the create response.
 </Callout>
 
-Both handlers do the same two-step: `findById(ownerId, createdAt)` to load the exact row (a single-
+Both handlers do the same two-step: `findById(ownerId, createdAt, todoId)` to load the exact row (a single-
 row point lookup, not a scan — `findById` requires the *full* key, partition then clustering, in
 schema order, or it throws rather than guessing), then act on the loaded entity.
 
-**`PATCH /todos/{id}/done`** calls `todoRepo.update(existing, existing.copy(done = true))`. Right
+**`PATCH /todos/{createdAt}/{todoId}/done`** calls `todoRepo.update(existing, existing.copy(done = true))`. Right
 now, with no `@Version` column on `Todo` yet, `update(old, new)` performs a blind full-row overwrite
 — no concurrency check of any kind. If two requests race to mark the same todo done at nearly the
 same instant, both succeed, and whichever's write lands last simply wins; nothing detects the race.
@@ -182,15 +183,15 @@ That's a real gap, left deliberately unfixed here — [page 07](/tutorial/07-con
 `@Version` to `Todo` and this exact call site starts enforcing a real compare-and-set, with no other
 code in this handler changing.
 
-**`DELETE /todos/{id}`** calls `todoRepo.delete(existing)` — a genuine, permanent `DELETE` right now,
+**`DELETE /todos/{createdAt}/{todoId}`** calls `todoRepo.delete(existing)` — a genuine, permanent `DELETE` right now,
 since `Todo` has no `@SoftDelete` yet. [Page 08](/tutorial/08-soft-delete-and-trash) adds a 7-day
 undo window; this same `delete()` call is what changes behavior once that annotation lands, again
 with no route code changing.
 
 <Callout kind="tip">
 Verify the checkpoint: `POST /todos` with a title, `GET /todos/mine` with the same `X-User-Id`
-should return it, `PATCH /todos/{id}/done` (using the `createdAt` from the create response) should
-flip `done`, and `DELETE /todos/{id}` should make it disappear from `GET /todos/mine`.
+should return it, `PATCH /todos/{createdAt}/{todoId}/done` (using the `createdAt` and `todoId` from the create response) should
+flip `done`, and `DELETE /todos/{createdAt}/{todoId}` should make it disappear from `GET /todos/mine`.
 </Callout>
 
 Next: [page 06](/tutorial/06-denormalization) — the app now needs "todos assigned to me," which this

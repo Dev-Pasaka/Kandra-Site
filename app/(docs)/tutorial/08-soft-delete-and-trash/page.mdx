@@ -6,7 +6,7 @@ export const metadata = {
 
 # 08. Soft delete and undo
 
-`DELETE /todos/{id}` from [page 05](/tutorial/05-routes) is permanent right now. The product wants a
+`DELETE /todos/{createdAt}/{todoId}` from [page 05](/tutorial/05-routes) is permanent right now. The product wants a
 real, common feature instead: delete a todo, but let the user recover it for a week before it's
 really gone. This page builds that, and it's worth being precise about the actual timeline — "delete,
 but recoverable for a while" is not the same thing as a relational soft-delete flag, because
@@ -19,8 +19,8 @@ Cassandra doesn't have a free, silent `DELETE` to fall back on once the window c
 @SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted")
 data class Todo(
     @PartitionKey val ownerId: UUID,
-    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
-    val todoId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: Instant,
+    @ClusteringKey(index = 1) val todoId: UUID,
     val title: String,
     val assigneeId: UUID?,
     val done: Boolean = false,
@@ -46,11 +46,11 @@ tell a soft-deleted row apart from a live one before its TTL expires, and `findA
 -- 1. Every non-key, non-marker column, rewritten with a fresh 7-day TTL
 UPDATE todos USING TTL 604800
 SET title = ?, assignee_id = ?, done = ?, version = ?, updated_at = ?
-WHERE owner_id = ? AND created_at = ?
+WHERE owner_id = ? AND created_at = ? AND todo_id = ?
 
 -- 2. The marker, in a separate statement, with NO TTL
 UPDATE todos SET is_deleted = ?
-WHERE owner_id = ? AND created_at = ?
+WHERE owner_id = ? AND created_at = ? AND todo_id = ?
 ```
 
 Both statements bind `true` conceptually for "deleted," but only the second one sets `is_deleted`.
@@ -128,7 +128,7 @@ identical problem.
 
 Say a todo is soft-deleted at day 0:
 
-- **Day 0–7**: the row is fully intact — `findById(ownerId, createdAt)` returns every field with its
+- **Day 0–7**: the row is fully intact — `findById(ownerId, createdAt, todoId)` returns every field with its
   real value, `isDeleted = true`. This *is* the undo window: the data hasn't gone anywhere, only the
   marker changed, immediately and without a TTL.
 - **Day 7**: the TTL on `title`/`assigneeId`/`done`/`version`/`updatedAt` fires. Those columns don't
@@ -181,13 +181,13 @@ bug tracked and fixed as
 [`ISS-015`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-015-delete-by-id-bypasses-soft-delete.md).
 Current source confirms the fix: `deleteById` now looks the entity up first and delegates to the
 same soft-delete-aware `BatchEngine.delete` path every other delete call uses, invalidating the
-cache too. If you ever reach for `deleteById(ownerId, createdAt)` directly on a `@SoftDelete` entity
+cache too. If you ever reach for `deleteById(ownerId, createdAt, todoId)` directly on a `@SoftDelete` entity
 instead of the find-then-`delete()` pattern this tutorial uses, this is the history of why that used
 to be a trap.
 </Callout>
 
 <Callout kind="tip">
-Verify the checkpoint: `DELETE /todos/{id}`, then `GET /todos/mine` (gone) and `GET /todos/trash`
+Verify the checkpoint: `DELETE /todos/{createdAt}/{todoId}`, then `GET /todos/mine` (gone) and `GET /todos/trash`
 (present, with its real title intact) using the same `X-User-Id`. Nothing in this app builds a
 "restore from trash" route — per [`@SoftDelete`](/recipes/soft-delete)'s own mechanics, restoring
 before the TTL fires would mean rewriting the row with `is_deleted = false` and fresh values via a

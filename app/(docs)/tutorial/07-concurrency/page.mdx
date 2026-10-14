@@ -35,8 +35,8 @@ finishes last simply overwrites, unconditionally.
 @ScyllaTable("todos")
 data class Todo(
     @PartitionKey val ownerId: UUID,
-    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
-    val todoId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: Instant,
+    @ClusteringKey(index = 1) val todoId: UUID,
     val title: String,
     val assigneeId: UUID?,
     val done: Boolean = false,
@@ -66,7 +66,7 @@ With `@Version` present, this stops being a blind overwrite and becomes:
 
 ```sql
 UPDATE todos SET title = ?, updated_at = ?, version = ?
-WHERE owner_id = ? AND created_at = ?
+WHERE owner_id = ? AND created_at = ? AND todo_id = ?
 IF version = ?
 ```
 
@@ -96,11 +96,12 @@ lock must hold across datacenters (the default is `LOCAL_SERIAL`).
 ```kotlin title="routes/TodoRoutes.kt" {1,7-13}
 import io.kandra.core.exception.KandraOptimisticLockException
 
-patch("/todos/{id}/done") {
+patch("/todos/{createdAt}/{todoId}/done") {
     val ownerId = call.ownerIdOrRespondBadRequest() ?: return@patch
-    val createdAt = Instant.parse(call.parameters["id"]!!)
+    val createdAt = Instant.parse(call.parameters["createdAt"]!!)
+    val todoId = UUID.fromString(call.parameters["todoId"]!!)
 
-    val existing = todoRepo.findById(ownerId, createdAt)
+    val existing = todoRepo.findById(ownerId, createdAt, todoId)
         ?: return@patch call.respond(HttpStatusCode.NotFound)
 
     try {
@@ -116,14 +117,14 @@ patch("/todos/{id}/done") {
 but the state it was based on is stale. There's no good automatic recovery at this layer — retrying
 the exact same request would race the same way against whatever won the first conflict — so the
 response tells the client to re-fetch the current state and decide what to do, rather than Kandra
-(or this route) silently picking a winner. `findById(ownerId, createdAt)` right before this call is
+(or this route) silently picking a winner. `findById(ownerId, createdAt, todoId)` right before this call is
 what supplies `old` — the same read-before-write step [page 10](/tutorial/10-caching) later points
 out is exactly what benefits from `@CacheResult`.
 
 <Callout kind="tip" title="This same protection now covers title edits too, with no new code">
 Nothing about `update(old, new)`'s LWT check is specific to the `done` field — it's a whole-row
 compare-and-set gated on `version`, so any field this app later lets a client edit (title, via a
-`PATCH /todos/{id}` route, if this tutorial built one) gets the identical protection the moment
+`PATCH /todos/{createdAt}/{todoId}` route, if this tutorial built one) gets the identical protection the moment
 `@Version` exists on the entity. The race described at the top of this page — two clients editing
 `title` concurrently — is caught by exactly the code above; `done` was just the field this tutorial
 already had a route for.
@@ -146,5 +147,5 @@ collaborator's todo edit silently erasing another's. Add `@Version` to `User` if
 shows up that needs it (an admin editing a user record the user is simultaneously editing, say) —
 don't add it by reflex to every table because `Todo` needed it.
 
-Next: [page 08](/tutorial/08-soft-delete-and-trash) — `DELETE /todos/{id}` right now is permanent.
+Next: [page 08](/tutorial/08-soft-delete-and-trash) — `DELETE /todos/{createdAt}/{todoId}` right now is permanent.
 The product wants a week to change your mind.

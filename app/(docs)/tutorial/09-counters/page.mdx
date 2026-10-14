@@ -143,7 +143,7 @@ statsRepo.increment(CompletionStats::completedCount, mapOf("userId" to ownerId))
 ## Wiring it into the "mark done" route
 
 The natural place to bump the counter is [page 07](/tutorial/07-concurrency)'s
-`PATCH /todos/{id}/done` handler — but only on the `false → true` transition, so re-marking an
+`PATCH /todos/{createdAt}/{todoId}/done` handler — but only on the `false → true` transition, so re-marking an
 already-done todo (or a retried request) doesn't double-count:
 
 ```kotlin title="routes/TodoRoutes.kt" {1-2,12-13}
@@ -153,11 +153,12 @@ fun Route.todoRoutes() {
 
     // ...existing routes from pages 05-08...
 
-    patch("/todos/{id}/done") {
+    patch("/todos/{createdAt}/{todoId}/done") {
         val ownerId = call.request.headers["X-User-Id"]!!.let(UUID::fromString)
-        val createdAt = /* parse from request, per page 07 */ Instant.now()
+        val createdAt = Instant.parse(call.parameters["createdAt"]!!)
+        val todoId = UUID.fromString(call.parameters["todoId"]!!)
 
-        val existing = todoRepo.findById(ownerId, createdAt) ?: return@patch call.respond(HttpStatusCode.NotFound)
+        val existing = todoRepo.findById(ownerId, createdAt, todoId) ?: return@patch call.respond(HttpStatusCode.NotFound)
         val wasAlreadyDone = existing.done
         val updated = existing.copy(done = true)
         todoRepo.update(existing, updated)   // LWT IF version=?, per page 07
@@ -235,7 +236,7 @@ the same way it creates every other registered table — nothing special about a
 DDL-generation time beyond the `COUNTER` column type itself.
 
 <Callout kind="tip">
-Verify it end to end: `PATCH /todos/{id}/done` on a fresh todo, then `GET /users/{id}/stats` —
+Verify it end to end: `PATCH /todos/{createdAt}/{todoId}/done` on a fresh todo, then `GET /users/{id}/stats` —
 `completedCount` should read `1`. Mark the same todo done again and re-check: it should still read
 `1`, because the `wasAlreadyDone` guard above skips the second increment.
 </Callout>

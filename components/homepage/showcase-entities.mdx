@@ -16,8 +16,8 @@ data class User(
 @SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted") // 7 days
 data class Todo(
     @PartitionKey val ownerId: UUID,
-    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
-    val todoId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: Instant,
+    @ClusteringKey(index = 1) val todoId: UUID,
     val title: String,
     val isDeleted: Boolean = false,
 )

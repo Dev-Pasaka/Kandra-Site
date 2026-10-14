@@ -1,5 +1,5 @@
 ```kotlin title="Todo.kt — historical bug, ISS-025 (fixed)"
-// Todo(ownerId: PartitionKey, todoId: ClusteringKey, ...)
+// Todo(ownerId: PartitionKey, createdAt + todoId: ClusteringKey, ...)
 
 todoRepo.deleteById(ownerId)
 // Compiled. Ran without error.

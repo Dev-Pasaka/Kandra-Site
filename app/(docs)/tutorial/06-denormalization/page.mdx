@@ -84,8 +84,9 @@ data class TodoByAssignee(
     @Serializable(with = UUIDSerializer::class)
     @PartitionKey val assigneeId: UUID,
     @Serializable(with = InstantSerializer::class)
-    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
-    @Serializable(with = UUIDSerializer::class) val todoId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: Instant,
+    @Serializable(with = UUIDSerializer::class)
+    @ClusteringKey(index = 1) val todoId: UUID,
     @Serializable(with = UUIDSerializer::class) val ownerId: UUID,
     val title: String,
     val done: Boolean = false,
@@ -97,8 +98,10 @@ time, not derived — for the same reason [page 03](/tutorial/03-entities) kept 
 `Todo`: the clustering key value has to be something the application controls exactly, not something
 stamped independently in two different places that could drift apart by a few milliseconds.
 `ownerId` and `todoId` are carried along so a client reading this table has enough to act on a row
-(recall from [page 05](/tutorial/05-routes): finding a specific todo needs `ownerId` and
-`createdAt`, both present right here).
+(recall from [page 05](/tutorial/05-routes): finding a specific todo needs `ownerId`, `createdAt`
+and `todoId`, all present right here). `todoId` is also this table's second clustering column, for
+the same reason as on `Todo`: two todos assigned to the same person in the same millisecond must not
+overwrite each other.
 
 <SideBySide leftLabel="Entity" rightLabel="Generated DDL">
 <div>
@@ -107,8 +110,9 @@ stamped independently in two different places that could drift apart by a few mi
 @ScyllaTable("todos_by_assignee")
 data class TodoByAssignee(
     @PartitionKey val assigneeId: UUID,
-    @ClusteringKey(order = ClusteringOrder.DESC)
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0)
     val createdAt: Instant,
+    @ClusteringKey(index = 1)
     val todoId: UUID,
     val ownerId: UUID,
     val title: String,
@@ -127,9 +131,9 @@ CREATE TABLE IF NOT EXISTS todos_by_assignee (
     owner_id UUID,
     title TEXT,
     done BOOLEAN,
-    PRIMARY KEY (assignee_id, created_at)
+    PRIMARY KEY (assignee_id, created_at, todo_id)
 )
-WITH CLUSTERING ORDER BY (created_at DESC);
+WITH CLUSTERING ORDER BY (created_at DESC, todo_id ASC);
 ```
 
 </div>

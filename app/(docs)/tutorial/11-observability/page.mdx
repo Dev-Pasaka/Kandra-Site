@@ -26,12 +26,12 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 
 private val logger = KotlinLogging.logger {}
 
-patch("/todos/{id}/done") {
+patch("/todos/{createdAt}/{todoId}/done") {
     // ...
-    logger.info { "Todo marked done: ownerId=$ownerId createdAt=$createdAt" }
+    logger.info { "Todo marked done: ownerId=$ownerId createdAt=$createdAt todoId=$todoId" }
     // ...
     catch (e: KandraOptimisticLockException) {
-        logger.warn { "Optimistic lock conflict marking todo done: ownerId=$ownerId createdAt=$createdAt" }
+        logger.warn { "Optimistic lock conflict marking todo done: ownerId=$ownerId createdAt=$createdAt todoId=$todoId" }
         call.respond(HttpStatusCode.Conflict)
     }
 }

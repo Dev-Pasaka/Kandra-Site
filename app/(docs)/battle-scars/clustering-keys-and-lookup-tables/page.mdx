@@ -30,7 +30,8 @@ key, the consequences split three ways:
 - `deleteById` didn't crash either. It silently deleted the entire partition.
 
 <Callout kind="danger" title="This was a real data-loss bug">
-Take a `Todo` entity keyed by `(ownerId: PartitionKey, todoId: ClusteringKey)`. Before this fix,
+Take the tutorial's `Todo`, keyed by `ownerId` (partition key) and `createdAt` + `todoId`
+(clustering keys). Before this fix,
 `todoRepo.deleteById(ownerId)` — called expecting to delete one todo — compiled, ran without error,
 and deleted **every todo that owner had ever created**, because the generated `DELETE` statement
 only ever named `ownerId` in its `WHERE` clause. Nothing about the call site looked wrong. The bug
@@ -53,9 +54,9 @@ the missing columns — if fewer key values are supplied than the full key requi
 silently truncating. `findById`/`deleteById` on a clustering-keyed entity now require the full key:
 
 ```kotlin
-// Todo(ownerId: PartitionKey, todoId: ClusteringKey, ...)
-todoRepo.findById(ownerId, todoId)   // correct — full key
-todoRepo.deleteById(ownerId, todoId) // deletes exactly one row
+// Todo(ownerId: PartitionKey, createdAt + todoId: ClusteringKey, ...)
+todoRepo.findById(ownerId, createdAt, todoId)   // correct — full key
+todoRepo.deleteById(ownerId, createdAt, todoId) // deletes exactly one row
 
 todoRepo.findById(ownerId)   // throws KandraSchemaException, not "some row"
 todoRepo.deleteById(ownerId) // throws KandraSchemaException, not "the whole partition"

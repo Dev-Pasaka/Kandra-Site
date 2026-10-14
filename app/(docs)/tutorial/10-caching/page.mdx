@@ -24,9 +24,9 @@ exact key," which is what `findById` already is.
 <Callout kind="note" title="This matters for this app specifically">
 `GET /todos/mine` is built on `findPage` (page 05), scoped by partition key with no clustering-key
 predicate — a range read over "everything this owner has." `@CacheResult` on `Todo` does **not**
-cache that call. What it caches is repeated `findById(ownerId, createdAt)` lookups against one
+cache that call. What it caches is repeated `findById(ownerId, createdAt, todoId)` lookups against one
 specific todo — which this app already does, in the read-before-write step of
-[page 07](/tutorial/07-concurrency)'s `PATCH /todos/{id}/done` handler. If your hot path were
+[page 07](/tutorial/07-concurrency)'s `PATCH /todos/{createdAt}/{todoId}/done` handler. If your hot path were
 purely "list my todos" with no repeated single-todo fetches, `@CacheResult` here would do nothing
 useful — know which read pattern you're actually optimizing before reaching for it.
 </Callout>
@@ -43,8 +43,8 @@ serve from memory instead of a round trip to ScyllaDB.
 @SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted")
 data class Todo(
     @PartitionKey val ownerId: UUID,
-    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
-    val todoId: UUID,
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: Instant,
+    @ClusteringKey(index = 1) val todoId: UUID,
     val title: String,
     val assigneeId: UUID?,
     val done: Boolean = false,
@@ -86,8 +86,8 @@ needed) and `@CacheResult` does real work. Skip it, and `@CacheResult(ttlSeconds
 
 ```kotlin
 val todoRepo = application.kandra.suspendRepository<Todo>()
-val todo = todoRepo.findById(ownerId, createdAt)   // cache miss → query → cache.put(key, todo)
-val same = todoRepo.findById(ownerId, createdAt)   // cache hit → no query
+val todo = todoRepo.findById(ownerId, createdAt, todoId)   // cache miss → query → cache.put(key, todo)
+val same = todoRepo.findById(ownerId, createdAt, todoId)   // cache hit → no query
 ```
 
 Invalidation is wired into `save`, `saveIfNotExists` (only when it actually applied),
@@ -107,7 +107,7 @@ not a hypothetical.
 
 `findById`'s cache key isn't always "the ID." For a single-partition-key entity like `User`, it's a
 bare `UUID`. For `Todo` — partition key **and** clustering key — the full primary key is two
-values, so `findById`'s real cache key is an ordered `List(ownerId, createdAt)`, not `ownerId`
+values, so `findById`'s real cache key is an ordered `List(ownerId, createdAt, todoId)`, not `ownerId`
 alone. That distinction is exactly where the bug lived: the invalidation helper used to derive its
 key from `partitionKeyOf(entity)` — partition key only, a bare `ownerId` — while `findById`'s
 actual cache key for the same row was the two-element `List`. A bare `UUID` and a two-element
@@ -115,12 +115,12 @@ actual cache key for the same row was the two-element `List`. A bare `UUID` and 
 silently missed the real cache entry:
 
 <Callout kind="danger" title="Stale read after update — the exact failure mode">
-1. `findById(ownerId, createdAt)` — cache miss, queries ScyllaDB, caches the row under key
-   `[ownerId, createdAt]`.
+1. `findById(ownerId, createdAt, todoId)` — cache miss, queries ScyllaDB, caches the row under key
+   `[ownerId, createdAt, todoId]`.
 2. Someone calls `todoRepo.update(old, new)` to mark it done. The write succeeds. Invalidation runs
    — but (in the buggy version) it computes the key as bare `ownerId`, which was never the key any
    entry was stored under. The invalidation call executes, "succeeds," and does nothing.
-3. `findById(ownerId, createdAt)` again — cache **hit**, on the pre-update row. The caller sees
+3. `findById(ownerId, createdAt, todoId)` again — cache **hit**, on the pre-update row. The caller sees
    `done: false` for up to `ttlSeconds` (30s here) after the update genuinely committed to
    ScyllaDB. No exception, no log line pointing at the cache — the write looks like it worked, and
    the very next read looks like it didn't.
@@ -142,10 +142,10 @@ supposed to agree. "Supposed to agree" is exactly how this one drifted.
 ## Verifying it
 
 ```kotlin
-val existing = todoRepo.findById(ownerId, createdAt)!!         // populates cache
+val existing = todoRepo.findById(ownerId, createdAt, todoId)!!         // populates cache
 val updated = existing.copy(title = "Buy milk (urgent)")
 todoRepo.update(existing, updated)                              // invalidates the SAME key
-val reread = todoRepo.findById(ownerId, createdAt)!!            // cache miss again, fresh row
+val reread = todoRepo.findById(ownerId, createdAt, todoId)!!            // cache miss again, fresh row
 check(reread.title == "Buy milk (urgent)")                      // passes on current Kandra
 ```
 

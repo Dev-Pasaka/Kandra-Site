@@ -27,8 +27,8 @@ import java.util.UUID
 @SoftDelete(ttlSeconds = 604_800, markerProperty = "isDeleted") // 7 days
 data class Todo(
     @PartitionKey val ownerId: UUID,
-    @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: java.time.Instant,
-    val todoId: UUID?,   // nullable: expires with the TTL (see "Expired rows" below)
+    @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: java.time.Instant,
+    @ClusteringKey(index = 1) val todoId: UUID,
     val title: String?,  // nullable: expires with the TTL
     val isDeleted: Boolean = false,
 )
@@ -46,10 +46,10 @@ Call `todoRepo.delete(todo)` on a `@SoftDelete` entity and `BatchEngine` does no
 
 ```sql
 -- 1. All non-key, non-marker columns, TTL'd
-UPDATE todos USING TTL 604800 SET title = ? WHERE owner_id = ? AND created_at = ?
+UPDATE todos USING TTL 604800 SET title = ? WHERE owner_id = ? AND created_at = ? AND todo_id = ?
 
 -- 2. The marker column, no TTL
-UPDATE todos SET is_deleted = ? WHERE owner_id = ? AND created_at = ?
+UPDATE todos SET is_deleted = ? WHERE owner_id = ? AND created_at = ? AND todo_id = ?
 ```
 
 <Callout kind="note" title="Why the marker column has no TTL">
