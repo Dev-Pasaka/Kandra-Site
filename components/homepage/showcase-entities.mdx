@@ -8,7 +8,8 @@ data class User(
     @PartitionKey val userId: UUID,
     @LookupIndex(tableSuffix = "by_email", consistency = LookupConsistency.BATCH)
     val email: String,
-    val name: String,
+    val displayName: String,
+    @CreatedAt val createdAt: Instant = Instant.EPOCH,
 )
 
 @ScyllaTable("todos")

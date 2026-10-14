@@ -40,13 +40,22 @@ without a version of its own — resolves to whatever version the BOM pins, all 
 
 ```kotlin title="build.gradle.kts"
 dependencies {
-    implementation(platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__"))
+    val kandraBom = platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__")
+    implementation(kandraBom)
+    ksp(kandraBom)                                        // the ksp configuration needs it too
 
-    implementation("ke.co.coinx.kandra:kandra-ktor")     // no version string
-    implementation("ke.co.coinx.kandra:kandra-koin")     // no version string
+    implementation("ke.co.coinx.kandra:kandra-core")      // no version string
+    implementation("ke.co.coinx.kandra:kandra-runtime")   // no version string
+    implementation("ke.co.coinx.kandra:kandra-ktor")      // no version string
     ksp("ke.co.coinx.kandra:kandra-codegen")              // no version string
 }
 ```
+
+A platform only applies to the configuration it's added to. `kandra-codegen` is resolved through
+`ksp`, not `implementation`, so without `ksp(kandraBom)` Gradle fails with
+`Could not find ke.co.coinx.kandra:kandra-codegen:.`. `kandra-core` and `kandra-runtime` are listed
+because the integration modules don't expose them at compile time yet
+([kandra#152](https://github.com/Dev-Pasaka/kandra/issues/152)).
 
 ## Why this exists as a separate module
 

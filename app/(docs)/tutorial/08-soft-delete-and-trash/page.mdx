@@ -64,7 +64,9 @@ expired.
 ## `findActive()` — and why it's the wrong tool here anyway
 
 ```kotlin
-fun findActive(allowFullScan: Boolean = false): List<T>
+// KandraSuspendRepository, which this app uses
+suspend fun findActive(allowFullScan: Boolean = false): List<T>
+// KandraRepository (blocking) has the same signature without `suspend`
 ```
 
 <Callout kind="danger" title="This is the one place Kandra can emit ALLOW FILTERING — and only if you opt in">
@@ -150,8 +152,10 @@ throws — verbatim: `"Column 'title' is NULL in Scylla but property 'title' is 
 (kotlin.String). Mark the property nullable or ensure the column always has a value."` That means
 any read that touches this row **after day 7** — `findById`, or a `findPage` scan of that owner's
 partition that happens to include it — throws `KandraQueryException`, not "returns a mostly-empty
-todo." For `GET /todos/mine`/`GET /todos/trash`, a single expired-but-not-yet-compacted row in a
-partition would break that entire page of results, not just the one row, until it's dealt with.
+todo." For `GET /todos/mine`/`GET /todos/trash`, a single expired row in a partition would break that
+entire page of results, not just the one row. Compaction doesn't fix it: the husk's cells stay
+`NULL`, so the row keeps throwing until something hard-deletes it. Kandra may turn this into a
+startup error instead ([kandra#153](https://github.com/Dev-Pasaka/kandra/issues/153)).
 </Callout>
 
 This isn't a corner case worth glossing over — it's the actual, source-verified consequence of

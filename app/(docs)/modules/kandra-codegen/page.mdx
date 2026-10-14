@@ -25,6 +25,9 @@ declares it distinctly from the libraries the compiled code depends on:
 
 ```kotlin title="build.gradle.kts"
 dependencies {
+    val kandraBom = platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__")
+    implementation(kandraBom)
+    ksp(kandraBom)                             // versions for the ksp configuration
     implementation("ke.co.coinx.kandra:kandra-runtime")
     ksp("ke.co.coinx.kandra:kandra-codegen")   // build-time only — never on the runtime classpath
 }

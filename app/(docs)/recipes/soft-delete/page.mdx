@@ -10,7 +10,10 @@ export const metadata = {
 later" — a todo marked done, a message someone unsent, a listing taken down. A real Cassandra
 `DELETE` writes a tombstone that every read has to page past until `gc_grace_seconds` (ten days by
 default) elapses — a workload that does this constantly accumulates tombstones and degrades read
-latency on that table. `@SoftDelete` reframes "delete" as a TTL'd write instead.
+latency on that table. `@SoftDelete` reframes "delete" as a TTL'd write instead: no row tombstone
+at delete time, and an undo window for free. It doesn't make tombstones go away, though. The
+expiring cells still become tombstones when the TTL fires, and a small key-plus-marker row stays
+behind for good. Both are covered below.
 
 ## The scenario
 
@@ -25,14 +28,16 @@ import java.util.UUID
 data class Todo(
     @PartitionKey val ownerId: UUID,
     @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: java.time.Instant,
-    val todoId: UUID,
-    val title: String,
+    val todoId: UUID?,   // nullable: expires with the TTL (see "Expired rows" below)
+    val title: String?,  // nullable: expires with the TTL
     val isDeleted: Boolean = false,
 )
 ```
 
 `@SoftDelete(ttlSeconds, markerProperty)` is a class-level annotation. `markerProperty` names a
 `Boolean` property on the entity — required if you want `findActive()` to work at all (more below).
+Every other non-key property is nullable on purpose: once the TTL fires, those columns read back as
+`NULL`.
 
 ## What `delete()` actually does — TTL write, not DELETE
 
@@ -57,14 +62,45 @@ just-deleted row from a live one at all. The marker column is the only thing mak
 possible.
 </Callout>
 
-The row's primary key itself is never touched — no tombstone is written by a `@SoftDelete`'s
-`delete()`. What eventually disappears is the *value* of the non-key columns, when ScyllaDB expires
-them; the row's key (and the `true` marker) persists until `gc_grace_seconds` after that.
+The row's primary key itself is never touched, and no row tombstone is written by `delete()`. Here
+is what happens over time:
+
+- **Until `ttlSeconds`:** the row is fully intact with `isDeleted = true`. This is the undo window.
+- **At `ttlSeconds`:** the TTL'd columns expire. Each expired cell becomes a cell-level tombstone that
+  reads have to skip until compaction removes it, `gc_grace_seconds` (10 days by default) later.
+- **After that, forever:** the primary key and the `true` marker remain. The marker has no TTL and
+  nothing ever deletes the row, so every soft-deleted row leaves a small husk behind for good. On a
+  delete-heavy table those husks keep growing partitions. Kandra may give the marker a TTL in a
+  future release ([kandra#154](https://github.com/Dev-Pasaka/kandra/issues/154)); until then, hard-delete
+  rows you don't need to keep (see below).
+
+## Expired rows break non-nullable entities
+
+<Callout kind="danger" title="Reading an expired row throws if any expiring property is non-nullable">
+After the TTL fires, the expired columns are `NULL`. `KandraCodec` refuses to put `NULL` into a
+non-nullable Kotlin property and throws `KandraQueryException`: `Column 'title' is NULL in Scylla but
+property 'title' is non-nullable`. Any read that reaches such a row fails, including a partition-scoped
+`findPage` that happens to include one old deleted todo, so one row can break a whole page. This
+doesn't stop after compaction; the husk's cells stay `NULL`.
+
+Two ways to avoid it:
+
+1. **Make every non-key, non-marker property nullable**, as in the example above, and handle `null`
+   in readers.
+2. **Hard-delete before the TTL fires.** A scheduled job finds rows with `isDeleted = true` older than
+   the undo window and hard-deletes them, so no expired row ever exists. This also removes the husk.
+
+Kandra doesn't check this at startup yet ([kandra#153](https://github.com/Dev-Pasaka/kandra/issues/153)).
+[Tutorial page 08](/tutorial/08-soft-delete-and-trash) walks through the same failure in the todo app.
+</Callout>
 
 ## `findActive()`: a real query, with a real cost
 
 ```kotlin
+// KandraSuspendRepository
 suspend fun findActive(allowFullScan: Boolean = false): List<T>
+// KandraRepository (blocking)
+fun findActive(allowFullScan: Boolean = false): List<T>
 ```
 
 What it runs depends on whether the marker column is indexed:
@@ -150,10 +186,11 @@ way you'd filter a partition-scoped page.
 
 | | Hard `delete()` | `@SoftDelete` |
 |---|---|---|
-| Tombstone written immediately | Yes — every key column, right away | No — TTL'd `UPDATE`, not a `DELETE` |
-| Data physically gone | After `gc_grace_seconds` (default 10 days) | After `ttlSeconds`, then the marker/key persists until `gc_grace_seconds` after *that* |
+| Tombstone written immediately | Yes — a row tombstone, right away | No — TTL'd `UPDATE`, not a `DELETE` |
+| Tombstones later | Removed after `gc_grace_seconds` (default 10 days) | Cell tombstones when `ttlSeconds` fires, removed `gc_grace_seconds` later |
+| Row physically gone | After `gc_grace_seconds` | Never: the key and marker stay as a husk unless you hard-delete |
 | Undo window | None | Exactly `ttlSeconds`, and undo means writing the row back before it expires |
-| Read cost while "deleted" | N/A — row's gone | Row still occupies storage (marker + expiring columns) until TTL, still counted in partition size |
+| Read cost while "deleted" | N/A — row's gone | Full row until the TTL, then a husk that reads still return; counted in partition size |
 | Right for | Rare, deliberate deletes; queue/session-store cleanup you actually want gone fast | Undo flows, "trash" semantics, anything a user expects to recover |
 
 <Callout kind="gotcha" title="deleteAll() still warns about tombstones — soft delete doesn't change that call">

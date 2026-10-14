@@ -18,6 +18,7 @@ Package root for everything from here on: `com.example.todos`.
 ```kotlin title="build.gradle.kts"
 plugins {
     kotlin("jvm") version "2.1.21"
+    kotlin("plugin.serialization") version "2.1.21"
     id("com.google.devtools.ksp") version "2.1.21-2.0.1"
     application
 }
@@ -32,11 +33,18 @@ repositories {
 
 dependencies {
     // Kandra
-    implementation(platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__"))
+    val kandraBom = platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__")
+    implementation(kandraBom)
+    ksp(kandraBom)
+    implementation("ke.co.coinx.kandra:kandra-core")
+    implementation("ke.co.coinx.kandra:kandra-runtime")
     implementation("ke.co.coinx.kandra:kandra-ktor")
     implementation("ke.co.coinx.kandra:kandra-koin")
     ksp("ke.co.coinx.kandra:kandra-codegen")
     testImplementation("ke.co.coinx.kandra:kandra-test")
+
+    // Koin's Ktor plugin, used directly in Application.kt (page 04)
+    implementation("io.insert-koin:koin-ktor:3.5.6")
 
     // Caffeine — see the note below on why this is split runtimeOnly/testImplementation
     runtimeOnly("com.github.ben-manes.caffeine:caffeine:3.1.8")
@@ -59,20 +67,41 @@ Kotlin/KSP versions here (`2.1.21` / `2.1.21-2.0.1`) match what Kandra itself is
 against. KSP processor versions are tied tightly to the Kotlin compiler version that built them —
 mismatch them and you get a cryptic KSP resolution failure at build time, not a clear "wrong
 version" error. Pinning to the same numbers Kandra ships with is the least-surprising choice.
+
+The same goes for Ktor and the JDK: Kandra is built and tested against Ktor 2.3 and compiled for
+Java 21, so you need JDK 21 or newer. Ktor 3 hasn't been tested with Kandra yet
+([kandra#155](https://github.com/Dev-Pasaka/kandra/issues/155)), so stay on 2.3.x for now.
 </Callout>
 
 ### `kandra-bom` — one version string, not five
 
 ```kotlin
-implementation(platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__"))
+val kandraBom = platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__")
+implementation(kandraBom)
+ksp(kandraBom)
 ```
 
-Every other `ke.co.coinx.kandra:*` dependency below omits its version entirely — the BOM
-(`java-platform`) pins all of them to `{KANDRA_VERSION}` as version *constraints*, so `kandra-ktor`,
-`kandra-koin`, and `kandra-codegen` are guaranteed to be from the same release without you repeating
-the version string four times and risking one of them drifting out of sync on the next upgrade. This is the same
+Every other `ke.co.coinx.kandra:*` dependency below omits its version entirely. The BOM
+(`java-platform`) pins all of them to v{KANDRA_VERSION} as version *constraints*, so every Kandra
+module is guaranteed to come from the same release without you repeating the version string and
+risking one of them drifting out of sync on the next upgrade.
+
+A platform only applies to the Gradle configuration you add it to. `implementation(kandraBom)`
+covers the `implementation` and `testImplementation` lines, but `kandra-codegen` is resolved through
+the separate `ksp` configuration, so the BOM is added there too. Without `ksp(kandraBom)`, the
+build fails with `Could not find ke.co.coinx.kandra:kandra-codegen:.`. This is the same
 pattern as Spring Boot's BOM or the Kotlin BOM — nothing Kandra-specific about the mechanism, just
 applied to Kandra's own module set.
+
+### `kandra-core` and `kandra-runtime` — the API your code imports
+
+Your entities import annotations from `kandra-core` (`io.kandra.core.annotations`), and your routes
+use repositories from `kandra-runtime` (`io.kandra.runtime`). In v{KANDRA_VERSION}, `kandra-ktor`
+depends on both but only exposes them at runtime, not on your compile classpath, so they're declared
+here explicitly. Without them the build fails with `Unresolved reference 'core'`. This is tracked as
+[kandra#152](https://github.com/Dev-Pasaka/kandra/issues/152); the two lines become optional once
+it's fixed. For the same reason, `koin-ktor` is declared directly because `Application.kt` uses
+Koin's own `install(Koin)`.
 
 ### `kandra-ktor` — the plugin itself
 

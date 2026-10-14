@@ -100,7 +100,7 @@ const PAIN_POINTS = [
     q: "Tombstones are eating my cluster and nobody told me.",
     problem:
       "Naive DELETE-heavy workloads generate tombstones that degrade read performance until compaction catches up, days later by default. Most relational-background developers have never had to think about this.",
-    fix: "@SoftDelete uses a TTL, not a DELETE. And when deleteAll() would actually generate a lot of tombstones, it logs an explicit WARN with the count — before it becomes a 3am page.",
+    fix: "deleteAll() logs an explicit WARN with the count when a bulk delete would generate a lot of tombstones — before it becomes a 3am page. For undo-style deletes, @SoftDelete writes a TTL instead of a DELETE, deferring the tombstones and giving you a recovery window; the recipe spells out what it leaves behind.",
     href: "/recipes/soft-delete",
     icon: Hourglass,
   },
@@ -152,7 +152,7 @@ const BUSINESS_CASES = [
     business:
       "Tombstone buildup and unbudgeted LWT cost are the kind of gradual, hard-to-diagnose problems that eat on-call time without ever being one clean incident to point at.",
     technical:
-      "@SoftDelete uses a TTL instead of a DELETE and warns before a bulk delete would generate real tombstone volume. @Version/saveIfNotExists (LWT) stay opt-in and visible in the entity, never a hidden default you're paying for on every write.",
+      "deleteAll() warns before a bulk delete would generate real tombstone volume, and @SoftDelete trades an immediate DELETE for a TTL with an undo window. @Version/saveIfNotExists (LWT) stay opt-in and visible in the entity, never a hidden default you're paying for on every write.",
     links: [
       { href: "/recipes/soft-delete", label: "@SoftDelete recipe" },
       { href: "/philosophy/consistency", label: "Consistency & LWT cost" },
@@ -164,7 +164,7 @@ const ADOPTION_STEPS = [
   {
     step: "Evaluate",
     body:
-      "Read /foundations and /battle-scars before writing code — the distributed-systems tradeoffs and the real bugs they came from are the actual pitch, not a features list. Drop kandra-runtime + kandra-ktor into one service; nothing else has to change.",
+      "Read /foundations and /battle-scars before writing code — the distributed-systems tradeoffs and the real bugs they came from are the actual pitch, not a features list. Add Kandra to one service with the build file from Getting started; nothing else has to change.",
   },
   {
     step: "Pilot",

@@ -31,7 +31,7 @@ data class User(
     val email: String,
     @LookupIndex(tableSuffix = "by_ticket_ref", consistency = LookupConsistency.EVENTUAL)
     val ticketRef: String,
-    val name: String,
+    val displayName: String,
 )
 ```
 
@@ -47,7 +47,7 @@ data class User(
         consistency = LookupConsistency.BATCH,
     )
     val email: String,
-    val name: String,
+    val displayName: String,
 )
 ```
 
@@ -58,7 +58,7 @@ data class User(
 CREATE TABLE users (
     user_id uuid PRIMARY KEY,
     email text,
-    name text
+    display_name text
 );
 
 CREATE TABLE users_by_email (
