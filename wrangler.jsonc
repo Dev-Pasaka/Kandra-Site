@@ -20,8 +20,8 @@
     {
       "binding": "DB",
       "database_name": "kandra-site",
-      // From `npx wrangler d1 create kandra-site`. Local dev (`wrangler dev`) works with any value.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      // Created with `npx wrangler d1 create kandra-site` (region EEUR).
+      "database_id": "22c92432-8813-48b6-8e30-e100cfa91df6",
       "migrations_dir": "migrations"
     }
   ],
