@@ -109,8 +109,8 @@ export function SearchPalette() {
           className="pressable flex items-center gap-2 rounded-full bg-paper-raised px-3.5 py-1.5 text-sm text-ink-muted hover:text-ink transition-colors cursor-pointer w-full max-w-56"
         >
           <Search className="w-3.5 h-3.5" strokeWidth={2} aria-hidden="true" />
-          <span className="flex-1 text-left">Search docs</span>
-          <kbd className="text-[0.7rem] font-sans text-ink-faint">
+          <span className="flex-1 text-left whitespace-nowrap">Search docs</span>
+          <kbd className="hidden sm:inline text-[0.7rem] font-sans text-ink-faint">
             &#8984;K
           </kbd>
         </button>

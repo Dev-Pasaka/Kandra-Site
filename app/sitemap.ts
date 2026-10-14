@@ -1,11 +1,11 @@
 import type { MetadataRoute } from "next";
 import { PAGINATION_ORDER } from "@/lib/nav";
+import { getPosts, getTags } from "@/lib/blog";
+import { SITE_URL } from "@/lib/site-config";
 
 export const dynamic = "force-static";
 
-const SITE_URL = "https://dev-pasaka.github.io/kandra-docs";
-
-export default function sitemap(): MetadataRoute.Sitemap {
+export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   const routes = new Set(PAGINATION_ORDER.map((item) => item.href));
   routes.add("/");
   routes.add("/modules");
@@ -13,9 +13,15 @@ export default function sitemap(): MetadataRoute.Sitemap {
   routes.add("/philosophy");
   routes.add("/battle-scars");
   routes.add("/reference");
+  routes.add("/blog");
+  for (const t of await getTags()) routes.add(`/blog/tags/${t.slug}`);
+
+  const posts = await getPosts();
+  const postDates = new Map(posts.map((p) => [`/blog/${p.slug}`, new Date(`${p.date}T00:00:00Z`)]));
+  for (const path of postDates.keys()) routes.add(path);
 
   return Array.from(routes).map((path) => ({
     url: `${SITE_URL}${path}`,
-    lastModified: new Date(),
+    lastModified: postDates.get(path) ?? new Date(),
   }));
 }

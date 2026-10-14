@@ -6,6 +6,10 @@ export const KANDRA_VERSION = "0.4.7";
 // The Kandra library repo (source of truth for behavior/claims on this site).
 export const KANDRA_REPO_URL = "https://github.com/Dev-Pasaka/kandra";
 
+// Where this site is served (Cloudflare Workers). Used for absolute URLs: sitemap, robots, RSS,
+// canonical/Open Graph tags.
+export const SITE_URL = "https://kandra-site.dev-pasaka.workers.dev";
+
 // This documentation site's own repo, for "Edit this page" links.
 export const SITE_REPO_URL = "https://github.com/Dev-Pasaka/Kandra-Site";
 

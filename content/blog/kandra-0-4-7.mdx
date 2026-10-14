@@ -1,0 +1,86 @@
+export const post = {
+  title: "Kandra 0.4.7: making quiet failures loud",
+  date: "2026-10-12",
+  summary:
+    "66 pull requests, three adversarial review rounds, and one theme: every place Kandra used to guess, fall back, or retry silently now either does the right thing or fails with a named exception.",
+  tags: ["Release", "Correctness"],
+  author: "Kandra maintainers",
+};
+
+Kandra 0.4.7 is the largest release so far. No version was cut between 0.4.6 in July and this one,
+so it brings together 66 pull requests from three rounds of adversarial review. Each round tried to
+break what the previous round had fixed, and several fixes in this release correct regressions
+introduced by an earlier fix in the same cycle.
+
+Read the [changelog](/changelog#047) for the full list. This post covers the theme behind it and
+what you need to check before upgrading.
+
+## The theme: no silent fallbacks
+
+A partition-oriented database punishes you later, not now. A query that scans the whole cluster
+works fine on a laptop. A retry that re-applies a conditional write looks like resilience until two
+writers both "win". Most of 0.4.7 removes places where Kandra quietly did something reasonable
+instead of telling you that what you asked for has a cost.
+
+## Behavior changes to check before upgrading
+
+- **`findActive()` no longer falls back to `ALLOW FILTERING`.** If the soft-delete marker column
+  has no `@SecondaryIndex`, it throws `KandraQueryException` unless you pass
+  `allowFullScan = true`. The [soft-delete recipe](/recipes/soft-delete) shows both options.
+- **Suspend and blocking batches have separate scope types.** `batch { }` gives you
+  `KandraBatchScope` and `batchBlocking { }` gives you `KandraBlockingBatchScope`, so using a
+  blocking repository inside a suspend batch is now a compile error. See
+  [multi-table writes](/recipes/multi-table-writes).
+- **Versioned `update()` runs exactly once.** It used to retry on transient errors, which could
+  re-apply a lightweight-transaction write that had already succeeded. See
+  [optimistic locking](/recipes/optimistic-locking).
+- **Invalid consistency levels are rejected up front.** `EACH_QUORUM` for reads and
+  `SERIAL`/`LOCAL_SERIAL` for writes throw before they reach the driver.
+- **`AUTO_MIGRATE` won't add a missing key column.** Adding a partition or clustering column with
+  `ALTER TABLE` would silently change row identity, so it throws `KandraSchemaException` instead.
+
+<Callout kind="gotcha" title="Run your test suite against a real cluster">
+Most of these changes turn a silent problem into an exception. Code that "worked" on 0.4.6 can
+start throwing on 0.4.7, and that is the point. `KandraTestcontainers` catches these before
+production. `FakeKandraSession` can't, because it doesn't model the
+[data-plane semantics](/philosophy/testing) involved.
+</Callout>
+
+## New APIs
+
+- `saveAndGet()`, `saveIfNotExistsAndGet()` and `updateAndGet()` return the entity as it was
+  persisted, so you don't need a second read.
+- `throttle { }` adds opt-in admission control, and rejected requests surface as
+  `KandraThrottledException`. `PoolConfig` now sets local and remote connection-pool sizes.
+- Consistency Strict Mode for [multi-DC deployments](/recipes/multi-dc-deployment).
+- `kandra-codegen` generates [typed Koin and Kodein accessors](/modules/kandra-codegen).
+- `debug { rawQueryStrictMode = true }` makes the `raw()` injection guard throw instead of warn.
+
+## Fixes worth upgrading for
+
+- Predicate values now go through codecs, so `eq`, `gt`, `lt` and `in` work on non-primitive
+  columns. `append()` and `remove()` work on `Set<T>` columns again.
+- Cache hits, lookup-index reads and versioned-update lookup writes respect your configured
+  consistency, and an invalidate-after-write race that could pin a stale cached value is closed.
+- SSL settings are enforced, and the TLS minimum version fails closed.
+- Unbounded `findActive()` calls and unpaged reads are capped instead of risking running out of
+  memory.
+
+Multi-DC support is now documented as **experimental**. It hasn't been validated against a real
+multi-region topology yet.
+
+## Upgrading
+
+Bump the BOM and every Kandra module follows:
+
+```kotlin title="build.gradle.kts"
+dependencies {
+    implementation(platform("ke.co.coinx.kandra:kandra-bom:0.4.7"))
+    implementation("ke.co.coinx.kandra:kandra-runtime")
+    implementation("ke.co.coinx.kandra:kandra-ktor")
+}
+```
+
+Then search your code for `findActive(`, `batch {` and versioned `update(` calls, and run your
+integration tests against a real cluster. If something now throws, the message names the entity,
+the column and the reason.

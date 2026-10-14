@@ -110,6 +110,7 @@ export const NAV_SECTIONS: NavSection[] = [
     items: [
       { title: "Changelog", href: "/changelog" },
       { title: "FAQ", href: "/faq" },
+      { title: "Blog", href: "/blog" },
     ],
   },
 ];

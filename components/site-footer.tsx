@@ -30,6 +30,7 @@ export function SiteFooter() {
           <ul className="space-y-2 text-ink-muted">
             <li><Link href="/battle-scars" className="hover:text-ink transition-colors">Battle scars</Link></li>
             <li><Link href="/changelog" className="hover:text-ink transition-colors">Changelog</Link></li>
+            <li><Link href="/blog" className="hover:text-ink transition-colors">Blog</Link></li>
             <li><Link href="/faq" className="hover:text-ink transition-colors">FAQ</Link></li>
           </ul>
         </div>

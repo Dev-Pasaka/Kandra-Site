@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Scans all MDX/TSX content for internal links (href="/...", Link href="/...",
 // markdown [text](/...)) and verifies a matching route actually exists under
-// app/(docs) or app/. Catches an agent linking to a plausible-but-nonexistent slug.
+// app/(docs) or app/ (blog posts: content/blog/<slug>.mdx). Catches an agent linking to a plausible-but-nonexistent slug.
 
 import { readdir, readFile, access } from "node:fs/promises";
 import { join, relative } from "node:path";
@@ -45,20 +45,34 @@ async function routeExists(route) {
       }
     }
   }
-  const dir = join(DOCS_DIR, route);
-  for (const candidate of ["page.mdx", "page.tsx"]) {
+  for (const base of [DOCS_DIR, APP_DIR]) {
+    for (const candidate of ["page.mdx", "page.tsx", "route.ts"]) {
+      try {
+        await access(join(base, route, candidate));
+        return true;
+      } catch {
+        /* keep checking */
+      }
+    }
+  }
+  const post = route.match(/^\/blog\/([^/]+)$/);
+  if (post) {
     try {
-      await access(join(dir, candidate));
+      await access(join(ROOT, "content", "blog", `${post[1]}.mdx`));
       return true;
     } catch {
-      /* keep checking */
+      /* fall through */
     }
   }
   return false;
 }
 
 async function main() {
-  const files = await walk(APP_DIR, [".mdx", ".tsx"]);
+  const files = [
+    ...(await walk(APP_DIR, [".mdx", ".tsx"])),
+    ...(await walk(join(ROOT, "content"), [".mdx"])),
+    ...(await walk(join(ROOT, "components"), [".mdx", ".tsx"])),
+  ];
   const found = new Map(); // route -> [{file, }]
 
   for (const file of files) {

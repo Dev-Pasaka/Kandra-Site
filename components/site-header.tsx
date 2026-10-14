@@ -53,6 +53,7 @@ export function SiteHeader() {
             <Link href="/tutorial" className="hover:text-ink transition-colors">Tutorial</Link>
             <Link href="/modules" className="hover:text-ink transition-colors">Modules</Link>
             <Link href="/battle-scars" className="hover:text-ink transition-colors">Battle scars</Link>
+            <Link href="/blog" className="hover:text-ink transition-colors">Blog</Link>
           </nav>
           <span className="hidden lg:inline font-mono text-xs text-ink-faint">v{KANDRA_VERSION}</span>
           <a
