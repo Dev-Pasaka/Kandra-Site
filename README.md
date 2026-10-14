@@ -91,7 +91,7 @@ One-time production setup:
    `database_id` in `wrangler.jsonc`.
 2. `npm run db:migrate:remote`.
 3. Create a GitHub OAuth app (github.com/settings/developers) with callback URL
-   `https://kandra-site.dev-pasaka.workers.dev/api/auth/callback`. Put its client id in
+   `https://kandraorm.com/api/auth/callback`. Put its client id in
    `wrangler.jsonc` `vars.GITHUB_CLIENT_ID` and run `npx wrangler secret put GITHUB_CLIENT_SECRET`.
 4. Optional: create a Turnstile widget, set `NEXT_PUBLIC_TURNSTILE_SITE_KEY` as a build variable
    in the Cloudflare dashboard, and run `npx wrangler secret put TURNSTILE_SECRET_KEY`.

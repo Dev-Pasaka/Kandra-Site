@@ -204,7 +204,7 @@ submissions.post("/unfurl", async (c) => {
     res = await fetch(url, {
       redirect: "follow",
       signal: AbortSignal.timeout(5000),
-      headers: { "User-Agent": "kandra-site-unfurl (+https://kandra-site.dev-pasaka.workers.dev/community)", Accept: "text/html" },
+      headers: { "User-Agent": "kandra-site-unfurl (+https://kandraorm.com/community)", Accept: "text/html" },
     });
   } catch {
     throw new HttpError(502, "Couldn't reach that page");
