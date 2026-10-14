@@ -2,14 +2,34 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "kandra-site",
   "compatibility_date": "2026-07-23",
-  // This is a fully static export (`output: "export"` in next.config.ts) — no
-  // Worker script, no OpenNext/SSR adapter. Deploy `out/` as static assets
-  // only. Without this file, Cloudflare's Next.js framework auto-detection
-  // routes the build through `opennextjs-cloudflare`, which expects a full
-  // server build (`.next/standalone/...`) that a static export never
-  // produces — that mismatch is what causes the ENOENT on deploy.
+  // The site is a fully static export (`output: "export"` in next.config.ts) served from `out/` —
+  // no OpenNext/SSR adapter. Keep this file: without it, Cloudflare's Next.js auto-detection
+  // routes the build through `opennextjs-cloudflare`, which expects a server build a static export
+  // never produces (the ENOENT on deploy).
+  //
+  // worker/index.ts is a small JSON API for community links and resources. Only /api/* runs it
+  // (`run_worker_first`); every other path is served straight from `out/` as before.
+  "main": "worker/index.ts",
   "assets": {
     "directory": "./out",
-    "not_found_handling": "404-page"
-  }
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "kandra-site",
+      // From `npx wrangler d1 create kandra-site`. Local dev (`wrangler dev`) works with any value.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    // Public OAuth app id (github.com/settings/developers). The secret is set with
+    // `npx wrangler secret put GITHUB_CLIENT_SECRET`, never here.
+    "GITHUB_CLIENT_ID": "",
+    "ADMIN_GITHUB_LOGINS": "Dev-Pasaka"
+  },
+  "observability": { "enabled": true }
 }

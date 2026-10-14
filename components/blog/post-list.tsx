@@ -6,9 +6,7 @@ export function TagChip({ tag, active = false }: { tag: string; active?: boolean
     <Link
       href={`/blog/tags/${tagSlug(tag)}`}
       aria-current={active ? "page" : undefined}
-      className={`pressable inline-flex items-center rounded-full px-3 py-1 text-[0.8rem] transition-colors ${
-        active ? "bg-ink text-paper" : "bg-paper-raised text-ink-muted hover:text-ink"
-      }`}
+      className="pressable chip"
     >
       {tag}
     </Link>

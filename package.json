@@ -9,7 +9,11 @@
     "start": "next start",
     "lint": "eslint",
     "check-stale-api": "node scripts/check-stale-api.mjs",
-    "check-kandra-version": "node scripts/check-kandra-version.mjs"
+    "check-kandra-version": "node scripts/check-kandra-version.mjs",
+    "preview": "npm run build && wrangler dev",
+    "db:migrate:local": "wrangler d1 migrations apply kandra-site --local",
+    "db:migrate:remote": "wrangler d1 migrations apply kandra-site --remote",
+    "typecheck:worker": "tsc -p worker"
   },
   "dependencies": {
     "@mdx-js/loader": "^3.1.1",
@@ -22,6 +26,7 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "gray-matter": "^4.0.3",
+    "hono": "4.13.11",
     "lucide-react": "1.49.0",
     "next": "16.2.11",
     "react": "19.2.4",
@@ -34,6 +39,7 @@
     "tailwind-merge": "^3.6.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "5.20260929.1",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
@@ -42,6 +48,7 @@
     "eslint-config-next": "16.2.11",
     "pagefind": "^1.5.2",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "4.144.0"
   }
 }

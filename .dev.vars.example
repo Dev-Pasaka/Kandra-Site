@@ -1,0 +1,9 @@
+# Copy to .dev.vars for `npm run preview` (wrangler dev). .dev.vars is gitignored.
+# Lets you sign in locally at /api/auth/dev-login?login=alice without a GitHub OAuth app.
+# Only works on localhost, and must never be set in production.
+DEV_LOGIN=1
+# Optional: real GitHub sign-in locally (OAuth app callback: http://localhost:8787/api/auth/callback)
+# GITHUB_CLIENT_ID=
+# GITHUB_CLIENT_SECRET=
+# Optional: Turnstile. Unset = challenge skipped.
+# TURNSTILE_SECRET_KEY=

@@ -749,3 +749,65 @@ body {
     transform: none;
   }
 }
+
+/* Forms and filter chips (community pages). */
+@layer components {
+  .field {
+    display: block;
+    width: 100%;
+    border-radius: var(--radius);
+    background: var(--paper-raised);
+    border: 1px solid transparent;
+    padding: 0.65rem 0.85rem;
+    font-size: 1rem;
+    line-height: 1.4;
+    color: var(--ink);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+  }
+  .field::placeholder {
+    color: var(--ink-faint);
+  }
+  .field:focus {
+    outline: none;
+    background: var(--paper);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .field-label {
+    display: block;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+  }
+  .field-hint {
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+    margin-top: 0.35rem;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3em;
+    border-radius: 999px;
+    padding: 0.3rem 0.8rem;
+    font-size: 0.8rem;
+    background: var(--paper-raised);
+    color: var(--ink-muted);
+    transition: background-color 0.2s ease, color 0.2s ease;
+    cursor: pointer;
+  }
+  .chip:hover {
+    color: var(--ink);
+  }
+  .chip[aria-pressed="true"],
+  .chip[aria-current="page"] {
+    background: var(--ink);
+    color: var(--paper);
+  }
+}
+
+@media (prefers-contrast: more) {
+  .field {
+    border-color: var(--border-strong);
+  }
+}

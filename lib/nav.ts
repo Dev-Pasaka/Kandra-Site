@@ -111,6 +111,8 @@ export const NAV_SECTIONS: NavSection[] = [
       { title: "Changelog", href: "/changelog" },
       { title: "FAQ", href: "/faq" },
       { title: "Blog", href: "/blog" },
+      { title: "Community", href: "/community" },
+      { title: "Resources", href: "/resources" },
     ],
   },
 ];
