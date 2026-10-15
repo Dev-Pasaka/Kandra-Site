@@ -45,7 +45,7 @@ data class Todo(
     @PartitionKey val ownerId: UUID,
     @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: Instant,
     @ClusteringKey(index = 1) val todoId: UUID,
-    val title: String,
+    val title: String = "",
     val assigneeId: UUID?,
     val done: Boolean = false,
     @Version val version: Long = 1L,
@@ -53,6 +53,9 @@ data class Todo(
     val isDeleted: Boolean = false,
 )
 ```
+
+`title` needs that default (not a bare `val title: String`) because of `@SoftDelete`, not
+`@CacheResult` — see [page 08](/tutorial/08-soft-delete-and-trash) for why Kandra requires it.
 
 `@CacheResult` is its own class-level annotation, independent of `@ScyllaTable` — it just populates
 `TableSchema.cacheConfig`, which `KandraRepository`/`KandraSuspendRepository` read when they build

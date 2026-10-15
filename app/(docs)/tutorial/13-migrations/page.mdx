@@ -86,7 +86,7 @@ data class Todo(
     @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: Instant,
     @ClusteringKey(index = 1) val todoId: UUID,
     val priority: Int? = null,
-    val title: String,
+    val title: String = "",
     val assigneeId: UUID?,
     val done: Boolean = false,
     @Version val version: Long = 1L,

@@ -1,5 +1,3 @@
-import { KANDRA_VERSION } from "@/lib/site-config";
-
 export const metadata = {
   title: "Getting started",
   description: "Install Kandra, define one entity, run one query — five minutes, against a real ScyllaDB instance.",
@@ -55,8 +53,6 @@ dependencies {
     val kandraBom = platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__")
     implementation(kandraBom)
     ksp(kandraBom)
-    implementation("ke.co.coinx.kandra:kandra-core")
-    implementation("ke.co.coinx.kandra:kandra-runtime")
     implementation("ke.co.coinx.kandra:kandra-ktor")
     ksp("ke.co.coinx.kandra:kandra-codegen")
 
@@ -71,13 +67,15 @@ dependencies {
 - **The BOM** pins every Kandra module to one version. It has to be added to `ksp` as well as
   `implementation`: Gradle applies a platform per configuration, so without `ksp(kandraBom)` the
   versionless `kandra-codegen` line can't be resolved.
-- **`kandra-core` and `kandra-runtime` are listed explicitly.** Your code imports the annotations
-  from `kandra-core` and the repositories from `kandra-runtime`, and in {`v${KANDRA_VERSION}`}
-  `kandra-ktor` only brings them in at runtime, not at compile time
-  ([kandra#152](https://github.com/Dev-Pasaka/kandra/issues/152)).
+- **`kandra-core` and `kandra-runtime` don't need to be listed explicitly** — `kandra-ktor` brings
+  both in at compile time (not just at runtime), so your code can import the annotations from
+  `kandra-core` and the repositories from `kandra-runtime` with no extra dependency line. Versions
+  before 0.4.8 needed both listed explicitly; see
+  [kandra#152](https://github.com/Dev-Pasaka/kandra/issues/152) if you're pinned to an older one.
 - **`kandra-codegen`** runs at build time through KSP and generates a type-safe `UserTable` for the
   query DSL.
-- **Ktor 2.3.x.** Kandra is built and tested against Ktor 2.3. Ktor 3 hasn't been tested with it yet.
+- **Ktor 2.3.x.** Kandra is built and tested against Ktor 2.3. Ktor 3 hasn't been tested with it yet
+  ([kandra#160](https://github.com/Dev-Pasaka/kandra/issues/160) tracks real CI coverage for 3.x).
 
 [`/tutorial/02-project-setup`](/tutorial/02-project-setup) explains each dependency in depth,
 including the dependency-injection modules (`kandra-koin`, `kandra-kodein`).

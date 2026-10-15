@@ -33,10 +33,13 @@ data class Post(
     @PartitionKey val authorId: UUID,
     @ClusteringKey(order = ClusteringOrder.DESC) val createdAt: Instant,
     @LookupIndex(tableSuffix = "by_id", consistency = LookupConsistency.BATCH) val postId: UUID,
-    val content: String,
+    val content: String = "",
     val tags: Set<String> = emptySet(),
     val isDeleted: Boolean = false,
 )
+// content has a default, not a bare `String`, because of @SoftDelete -- see
+// /recipes/soft-delete for why Kandra requires every non-key, non-marker column to be
+// nullable or defaulted on a @SoftDelete entity.
 
 @ScyllaTable(name = "post_like_counters")
 data class PostLikeCounter(

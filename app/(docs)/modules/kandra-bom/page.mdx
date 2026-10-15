@@ -44,8 +44,6 @@ dependencies {
     implementation(kandraBom)
     ksp(kandraBom)                                        // the ksp configuration needs it too
 
-    implementation("ke.co.coinx.kandra:kandra-core")      // no version string
-    implementation("ke.co.coinx.kandra:kandra-runtime")   // no version string
     implementation("ke.co.coinx.kandra:kandra-ktor")      // no version string
     ksp("ke.co.coinx.kandra:kandra-codegen")              // no version string
 }
@@ -53,8 +51,9 @@ dependencies {
 
 A platform only applies to the configuration it's added to. `kandra-codegen` is resolved through
 `ksp`, not `implementation`, so without `ksp(kandraBom)` Gradle fails with
-`Could not find ke.co.coinx.kandra:kandra-codegen:.`. `kandra-core` and `kandra-runtime` are listed
-because the integration modules don't expose them at compile time yet
+`Could not find ke.co.coinx.kandra:kandra-codegen:.`. `kandra-core`/`kandra-runtime` don't need
+listing separately — `kandra-ktor` brings both in at compile time. That wasn't always true: before
+0.4.8 the integration modules only exposed them at runtime, so both had to be listed explicitly
 ([kandra#152](https://github.com/Dev-Pasaka/kandra/issues/152)).
 
 ## Why this exists as a separate module

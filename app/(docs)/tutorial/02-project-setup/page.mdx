@@ -36,8 +36,6 @@ dependencies {
     val kandraBom = platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__")
     implementation(kandraBom)
     ksp(kandraBom)
-    implementation("ke.co.coinx.kandra:kandra-core")
-    implementation("ke.co.coinx.kandra:kandra-runtime")
     implementation("ke.co.coinx.kandra:kandra-ktor")
     implementation("ke.co.coinx.kandra:kandra-koin")
     ksp("ke.co.coinx.kandra:kandra-codegen")
@@ -93,15 +91,16 @@ build fails with `Could not find ke.co.coinx.kandra:kandra-codegen:.`. This is t
 pattern as Spring Boot's BOM or the Kotlin BOM — nothing Kandra-specific about the mechanism, just
 applied to Kandra's own module set.
 
-### `kandra-core` and `kandra-runtime` — the API your code imports
+### `kandra-core` and `kandra-runtime` — the API your code imports, with no extra dependency line
 
 Your entities import annotations from `kandra-core` (`io.kandra.core.annotations`), and your routes
-use repositories from `kandra-runtime` (`io.kandra.runtime`). In v{KANDRA_VERSION}, `kandra-ktor`
-depends on both but only exposes them at runtime, not on your compile classpath, so they're declared
-here explicitly. Without them the build fails with `Unresolved reference 'core'`. This is tracked as
-[kandra#152](https://github.com/Dev-Pasaka/kandra/issues/152); the two lines become optional once
-it's fixed. For the same reason, `koin-ktor` is declared directly because `Application.kt` uses
-Koin's own `install(Koin)`.
+use repositories from `kandra-runtime` (`io.kandra.runtime`) — neither needs declaring explicitly
+above, because `kandra-ktor` brings both in at compile time, not just at runtime. That wasn't always
+true: versions before 0.4.8 only exposed them at runtime, so the build failed with `Unresolved
+reference 'core'` unless both were listed by hand (see
+[kandra#152](https://github.com/Dev-Pasaka/kandra/issues/152) if you're pinned to an older version).
+`koin-ktor` is still declared directly above, for an unrelated reason: `Application.kt` uses Koin's
+own `install(Koin)` directly, which `kandra-koin` doesn't re-export.
 
 ### `kandra-ktor` — the plugin itself
 

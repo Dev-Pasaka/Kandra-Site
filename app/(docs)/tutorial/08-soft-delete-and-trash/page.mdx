@@ -1,7 +1,7 @@
 export const metadata = {
   title: "08. Soft delete and undo",
   description:
-    "A 7-day trash window for deleted todos — @SoftDelete's real TTL-driven lifecycle, why findActive() is the wrong tool for 'my non-deleted todos,' and a genuine landmine around non-nullable columns after the TTL fires.",
+    "A 7-day trash window for deleted todos — @SoftDelete's real TTL-driven lifecycle, why findActive() is the wrong tool for 'my non-deleted todos,' and the startup-time guard that catches non-nullable columns before the TTL ever fires.",
 };
 
 # 08. Soft delete and undo
@@ -21,7 +21,7 @@ data class Todo(
     @PartitionKey val ownerId: UUID,
     @ClusteringKey(order = ClusteringOrder.DESC, index = 0) val createdAt: Instant,
     @ClusteringKey(index = 1) val todoId: UUID,
-    val title: String,
+    val title: String = "",
     val assigneeId: UUID?,
     val done: Boolean = false,
     @Version val version: Long = 1L,
@@ -38,6 +38,14 @@ tell a soft-deleted row apart from a live one before its TTL expires, and `findA
 `delete()` call site changes — `todoRepo.delete(existing)`, already used since
 [page 05](/tutorial/05-routes), starts behaving differently the moment this annotation exists.
 
+<Callout kind="note" title="The default on title above isn't decoration — Kandra enforces it">
+`@SoftDelete` requires every non-key, non-marker column to be nullable or have a constructor
+default — `title` is the only property on `Todo` that was neither before this default was added.
+Leave it as a bare `val title: String` and the app refuses to even start:
+`SchemaRegistry.register()` throws `KandraSchemaException` naming the property, at startup, before
+any route runs. See the callout further down for why this check exists.
+</Callout>
+
 ## What `delete()` actually does now — two separate writes, not one
 
 <Callout kind="note" title="Verified directly from BatchEngine, not the annotation's doc comment">
@@ -48,17 +56,20 @@ UPDATE todos USING TTL 604800
 SET title = ?, assignee_id = ?, done = ?, version = ?, updated_at = ?
 WHERE owner_id = ? AND created_at = ? AND todo_id = ?
 
--- 2. The marker, in a separate statement, with NO TTL
-UPDATE todos SET is_deleted = ?
-WHERE owner_id = ? AND created_at = ? AND todo_id = ?
+-- 2. The marker, in a separate statement — an INSERT, not an UPDATE, under its own longer TTL
+INSERT INTO todos (owner_id, created_at, todo_id, is_deleted)
+VALUES (?, ?, ?, ?)
+USING TTL 1468800
 ```
 
-Both statements bind `true` conceptually for "deleted," but only the second one sets `is_deleted`.
-The first rewrites every other column with its *current* value, just now carrying a TTL — the whole
-row's data, not a single flag, is what expires. The marker is deliberately excluded from the TTL'd
-statement and written separately, with none, so it outlives the data it's marking: `findActive()`
-still needs to be able to tell "deleted" from "live" after the other columns' TTL has already
-expired.
+Both statements set the deleted state conceptually, but only the second one touches `is_deleted`.
+The first rewrites every other column with its *current* value, just now carrying a 7-day TTL — the
+whole row's data, not a single flag, is what expires first. The marker gets a separate, much longer
+TTL (`ttlSeconds + gcGraceSeconds` by default — 7 days + the 10-day `gc_grace_seconds` default
+mentioned below, 1,468,800 seconds — tunable via `@SoftDelete(markerTtlSeconds = ...)`) so
+`findActive()` can still tell "deleted" from "live" for the whole window after the data columns
+expire, while the row still eventually disappears completely instead of becoming a permanent husk —
+see the timeline below for exactly why this is an `INSERT`, not a second `UPDATE`.
 </Callout>
 
 ## `findActive()` — and why it's the wrong tool here anyway
@@ -70,7 +81,7 @@ suspend fun findActive(allowFullScan: Boolean = false): List<T>
 ```
 
 <Callout kind="danger" title="This is the one place Kandra can emit ALLOW FILTERING — and only if you opt in">
-`isDeleted` here has no `@SecondaryIndex`, so as of 0.4.7 a bare `findActive()` throws
+`isDeleted` here has no `@SecondaryIndex`, so as of 0.4.8 a bare `findActive()` throws
 `KandraQueryException` instead of scanning. Only `findActive(allowFullScan = true)` runs
 `SELECT * FROM todos WHERE is_deleted = ? ALLOW FILTERING`, bound to `false` (adding
 `@SecondaryIndex` to the marker makes it query the index instead). Every other page on this site, correctly, says Kandra's
@@ -130,48 +141,52 @@ Say a todo is soft-deleted at day 0:
 
 - **Day 0–7**: the row is fully intact — `findById(ownerId, createdAt, todoId)` returns every field with its
   real value, `isDeleted = true`. This *is* the undo window: the data hasn't gone anywhere, only the
-  marker changed, immediately and without a TTL.
+  marker changed, immediately.
 - **Day 7**: the TTL on `title`/`assigneeId`/`done`/`version`/`updatedAt` fires. Those columns don't
-  vanish instantly and cleanly — each becomes, individually, a cell-level tombstone. `is_deleted`,
-  never TTL'd, is untouched and still reads `true`.
-- **Day 7 → day 7 + `gc_grace_seconds`** (10 days by default —
-  [`/foundations`](/foundations#tombstones-what-delete-actually-does)): the tombstones for those
-  cells persist, need to be read past on any query touching this partition, and haven't yet been
-  physically removed by compaction.
-- **After that**: compaction clears the tombstoned cells. The row itself — its partition key,
-  clustering key, and the never-TTL'd `is_deleted = true` marker — does **not** disappear. It's not
-  a row-level tombstone, only a set of cell-level ones; nothing in `@SoftDelete` ever issues a real
-  `DELETE` on the row's key. Left alone, this todo exists forever as a key-plus-marker husk.
+  vanish instantly and cleanly — each becomes, individually, a cell-level tombstone. `is_deleted` is
+  untouched and still reads `true` — its own, much longer TTL (day 7 + 17 more days, by default;
+  see below) hasn't fired yet.
+- **Day 7 → day 24 (`ttlSeconds` + the default `markerTtlSeconds`)**: the data columns' tombstones
+  persist and get read past on any query touching this partition, same as any other TTL'd column —
+  [`/foundations`](/foundations#tombstones-what-delete-actually-does) covers that mechanism in
+  general. `is_deleted` still reads `true` throughout this whole window, so `findActive()` keeps
+  correctly excluding the row.
+- **Day 24**: `is_deleted` itself finally expires. Kandra writes that marker as a fresh `INSERT`
+  under its own TTL (not an `UPDATE`) specifically so this moment fully retires the row — the
+  original `save()`'s `INSERT` set a permanent "this partition has a row here" marker of its own,
+  separate from any column, that an `UPDATE` can never touch; only a later `INSERT` with a real TTL
+  can supersede it. Past day 24, the partition has no live cells and no live row-marker left at
+  all — it's gone, not a key-plus-marker husk. Nothing this app does, or needs to do, differs from
+  what `delete()` already does on day 0.
 
-<Callout kind="danger" title="A genuine landmine: non-nullable columns and the TTL window, verified from KandraCodec">
-Once those columns' TTL fires, they read back as CQL `NULL` — not "gone," `NULL`, at the storage
-layer, regardless of what type Kandra declared for them. `Todo.title`, `.done`, `.version`, and
-`.updatedAt` are all **non-nullable** Kotlin types. `KandraCodec.decode()` checks exactly this case:
-if a column is `NULL` in Scylla and the corresponding Kotlin property isn't marked nullable, it
-throws — verbatim: `"Column 'title' is NULL in Scylla but property 'title' is non-nullable
-(kotlin.String). Mark the property nullable or ensure the column always has a value."` That means
-any read that touches this row **after day 7** — `findById`, or a `findPage` scan of that owner's
-partition that happens to include it — throws `KandraQueryException`, not "returns a mostly-empty
-todo." For `GET /todos/mine`/`GET /todos/trash`, a single expired row in a partition would break that
-entire page of results, not just the one row. Compaction doesn't fix it: the husk's cells stay
-`NULL`, so the row keeps throwing until something hard-deletes it. Kandra may turn this into a
-startup error instead ([kandra#153](https://github.com/Dev-Pasaka/kandra/issues/153)).
+<Callout kind="tip" title="Why the data columns need to be nullable (or defaulted) *now*, not eventually">
+Between day 7 and day 24, `title`/`assigneeId`/`done`/`version`/`updatedAt` read back as CQL
+`NULL` — at the storage layer, regardless of what type Kandra declared for them. `KandraCodec.decode()`
+checks exactly this case: a `NULL` column backing a non-nullable Kotlin property throws
+`KandraQueryException`, verbatim: `"Column 'title' is NULL in Scylla but property 'title' is
+non-nullable (kotlin.String). Mark the property nullable or ensure the column always has a value."`
+
+A todo soft-deleted for over a week used to hit exactly that the moment any read reached it — `findById`,
+or a `findPage` scan of that owner's partition that happened to include one. For `GET /todos/mine`/
+`GET /todos/trash`, a single expired row in a page would break the *entire* page, not just that row.
+
+Kandra now catches this far earlier: `SchemaRegistry.register()` rejects a `@SoftDelete` entity with
+any non-key, non-marker property that's non-nullable with no constructor default — at app startup,
+before any route runs, naming the property. That's why `title` above has `= ""` rather than being a
+bare `val title: String`: without it, this app wouldn't start at all (see
+[kandra#153](https://github.com/Dev-Pasaka/kandra/issues/153)). `assigneeId` is already nullable;
+`done`/`version`/`updatedAt` already had defaults.
 </Callout>
 
-This isn't a corner case worth glossing over — it's the actual, source-verified consequence of
-pairing `@SoftDelete`'s TTL with an entity whose columns were modeled as non-nullable (a completely
-reasonable, idiomatic choice for a `Todo` that's supposed to always have a title). Two honest ways
-to actually close this gap, neither of which this app builds out fully here (the same kind of
-deliberate, named scope cut as [page 05](/tutorial/05-routes)'s missing auth):
-
-1. **Hard-delete proactively, before the TTL fires** — a scheduled job that finds `isDeleted = true`
-   rows older than, say, 6 days and calls a real `deleteById`/`delete()` on them, so no row this app
-   ever reads is allowed to reach the expired-but-not-compacted state at all. This is the safer of
-   the two, and the one to actually build for a real deployment.
-2. **Model the fields as nullable** and accept that "a soft-deleted todo past its window might read
-   back with `null` fields" is part of the type, not an exception path — more honest to the data's
-   real lifecycle, but pushes null-handling into every reader of `Todo`, including the routes this
-   tutorial already wrote.
+A default (`title: String = ""`) rather than making `title` nullable is a real trade-off, not a
+free choice — `title: String?` would be more honest to the data's actual lifecycle (a soft-deleted
+todo past day 7 genuinely has no title), but it pushes null-handling into every reader of `Todo`,
+including [page 05](/tutorial/05-routes)'s and [page 06](/tutorial/06-denormalization)'s routes,
+which already treat `.title` as always present. For a field that's only ever read on an
+already-`isDeleted = true` row past its data TTL — exactly the window `GET /todos/trash` returns —
+a default that reads as "no title" is close enough to not be worth the ripple. A field your app
+actually displays or acts on after that window would be a better candidate for the nullable route
+instead of a default.
 
 <Callout kind="note" title="A related, now-fixed bug worth knowing about if you reach for deleteById directly">
 This app never calls `deleteById` (every delete route in this tutorial loads the entity via

@@ -350,24 +350,40 @@ collision-resistant, not a counter or lock that needs external coordination.
 
 ```kotlin
 @Target(AnnotationTarget.CLASS)
-annotation class SoftDelete(val ttlSeconds: Int = 86400, val markerProperty: String = "")
+annotation class SoftDelete(
+    val ttlSeconds: Int = 86400,
+    val markerProperty: String = "",
+    val markerTtlSeconds: Int = -1
+)
 ```
 
 Sets `TableSchema.isSoftDelete = true` / `softDeleteTtlSeconds`. `kandra-core` only records these
 flags — the "TTL instead of DELETE" write behavior lives in `kandra-runtime`.
-`markerProperty`, if non-blank, names a `Boolean` property on the entity that permanently records
-deletion state (`true` = deleted) — validated to exist and be `Boolean`-typed at registration,
-resolved into `TableSchema.softDeleteMarkerColumn`. This marker is what makes `findActive()`
-possible: without it there is no CQL predicate that can distinguish a soft-deleted row from a live
-one before its TTL expires, since every *other* column on a soft-deleted row is written with a TTL
-and eventually disappears.
+`markerProperty`, if non-blank, names a `Boolean` property on the entity that records deletion
+state (`true` = deleted) for `markerTtlSeconds` — validated to exist and be `Boolean`-typed at
+registration, resolved into `TableSchema.softDeleteMarkerColumn`. This marker is what makes
+`findActive()` possible: without it there is no CQL predicate that can distinguish a soft-deleted
+row from a live one once the data columns' TTL has expired.
+
+`markerTtlSeconds`, left at its `-1` sentinel, resolves to `ttlSeconds + gcGraceSeconds` (falling
+back to Cassandra/Scylla's real `864000`s default when `gcGraceSeconds` is itself left at `-1`) —
+resolved onto `TableSchema.softDeleteMarkerTtlSeconds`, and validated to be strictly greater than
+`ttlSeconds` (see check 11 below). The marker outliving the data columns is what makes
+`findActive()` able to tell "deleted" from "live" during that window, and it eventually expiring
+too is what makes the row fully disappear instead of leaving a permanent husk — see
+[`/recipes/soft-delete`](/recipes/soft-delete) for the full mechanics, including why the marker is
+written as an `INSERT`, not an `UPDATE`.
+
+Every non-key, non-marker, non-counter property must be nullable or have a constructor default
+(see check 12 below) — it reads back `NULL` once `ttlSeconds` expires, and a non-nullable property
+has nothing legal to decode into there.
 
 ```kotlin
 @SoftDelete(ttlSeconds = 2_592_000, markerProperty = "isDeleted")
 @ScyllaTable("todos")
 data class Todo(
     @PartitionKey val todoId: UUID,
-    val title: String,
+    val title: String = "", // not a bare String -- @SoftDelete requires a default or nullable
     val isDeleted: Boolean = false,
 )
 ```
@@ -513,6 +529,14 @@ file. The checks run top-to-bottom, so if an entity violates several at once, th
 9. `@Version` column typed as neither `Long` nor `Instant`.
 10. `@SoftDelete(markerProperty = "...")` naming a property that doesn't exist, or that isn't
     `Boolean`-typed.
+11. `@SoftDelete(markerTtlSeconds = ...)` set to a value not strictly greater than `ttlSeconds` —
+    the marker has to outlive the data columns, or `findActive()` couldn't tell a soft-deleted row
+    apart from a live one (see [`/recipes/soft-delete`](/recipes/soft-delete)).
+12. A `@SoftDelete` entity with any non-key, non-marker, non-counter property that's non-nullable
+    with no constructor default — that column reads back `NULL` once `ttlSeconds` expires, and a
+    non-nullable property has nothing legal to decode into there
+    ([kandra#153](https://github.com/Dev-Pasaka/kandra/issues/153)). Applies even with no
+    `markerProperty` configured at all.
 
 <Callout kind="gotcha" title="camelToSnake has no acronym handling">
 ```kotlin

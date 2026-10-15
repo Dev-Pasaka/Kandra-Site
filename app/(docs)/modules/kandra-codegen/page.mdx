@@ -79,13 +79,15 @@ data class User(
     @ClusteringKey(order = ClusteringOrder.DESC)
     val createdAt: Instant,
     @LookupIndex(tableSuffix = "by_email")
-    val email: String,
+    val email: String = "",
     @Column(name = "display_name")
-    val displayName: String,
-    @Sensitive val passwordHash: String,
-    @Version val version: Long,
+    val displayName: String = "",
+    @Sensitive val passwordHash: String = "",
+    @Version val version: Long = 0L,
     @Transient val sessionToken: String? = null,
 )
+// email/displayName/passwordHash/version all need defaults (not bare types) because of
+// @SoftDelete -- see /recipes/soft-delete for why.
 ```
 
 </div>
