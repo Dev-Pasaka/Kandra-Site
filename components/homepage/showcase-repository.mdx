@@ -1,10 +1,6 @@
 ```kotlin title="routes.kt"
-import io.kandra.runtime.repository.KandraSuspendRepository
-import org.koin.core.qualifier.named
-import org.koin.ktor.ext.inject
-
 fun Route.userRoutes() {
-    val userRepo by inject<KandraSuspendRepository<*>>(named("UserSuspendRepo"))
+    val userRepo = application.kandra.suspendRepository<User>()   // typed: KandraSuspendRepository<User>
 
     post("/users") {
         val user = call.receive<User>()
@@ -20,7 +16,7 @@ fun Route.userRoutes() {
 }
 
 // Cross-table atomicity that isn't @LookupIndex-shaped: explicit, not implied
-application.kandra.batchBlocking {
+application.kandra.batch {
     todoRepo.saveInBatch(todo)
     todosByAssigneeRepo.saveInBatch(todoByAssignee)
 }
