@@ -32,6 +32,12 @@ means production code never accidentally pulls in JUnit, Testcontainers, or a fa
 implementation — `kandra-test` is meant to be a `testImplementation`, never an `implementation`,
 dependency.
 
+<Unreleased issues={[179, 180, 181]}>
+`kandra-test` on `main` adds `KandraTestUtils.reset()` and `KandraRuntime.closeAndReset()` (clear the schema registry without an internal-API opt-in),
+`FakeKandraSession.capturedStatementViews()`/`capturedBatchViews()` returning a public `CapturedStatement(cql, values)` (with `isUnset(i)`), and makes the DataStax
+driver an `api` dependency of `kandra-test`, `kandra-runtime` and `kandra-ktor`. None of this is in v0.5.0.
+</Unreleased>
+
 ## `FakeKandraSession`
 
 ```kotlin
