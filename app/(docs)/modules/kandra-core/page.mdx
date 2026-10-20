@@ -750,9 +750,16 @@ enqueue instead.
 
 ```kotlin
 fun interface KandraMetrics {
-    fun record(tableName: String, operation: String, durationMs: Long)
+    fun record(tableName: String, operation: String, durationMs: Long)                    // the single abstract method
+    fun record(tableName: String, operation: String, durationMs: Long, attempts: Int)      // default: delegates to the 3-arg record
+    fun recordFailure(tableName: String, operation: String, durationMs: Long, attempts: Int, exceptionType: String) {}  // default: no-op
 }
 ```
+
+The two extra methods have defaults, so existing lambdas keep compiling unchanged. Override the 4-argument `record` to see how
+many attempts a successful query needed, and `recordFailure` to count queries that ultimately failed — retry exhaustion, a
+non-retryable exception, a non-idempotent statement, or rejection during shutdown (`durationMs` and `attempts` are `0` for a shutdown
+rejection). `exceptionType` is the fully-qualified exception class name.
 
 SAM interface, **not** gated by `@ExperimentalKandraApi` (unlike the two above). Called after every
 query execution on both blocking and suspend paths, once wired via `kandra-ktor`'s
@@ -827,6 +834,7 @@ open class KandraException(message: String, cause: Throwable? = null) : RuntimeE
 class KandraSchemaException(message: String) : KandraException(message)
 class KandraQueryException(message: String, cause: Throwable? = null) : KandraException(message, cause)
 class KandraAuthException(message: String, cause: Throwable? = null) : KandraException(message, cause)
+class KandraThrottledException(message: String, cause: Throwable? = null) : KandraException(message, cause)
 class KandraOptimisticLockException(
     message: String,
     val entityClass: KClass<*>,
@@ -834,6 +842,11 @@ class KandraOptimisticLockException(
 ) : KandraException(message)
 class KandraMigrationException(message: String, cause: Throwable? = null) : KandraException(message, cause)
 ```
+
+`KandraThrottledException` wraps the driver's `RequestThrottlingException`: it is what callers see when
+`kandra-ktor`'s [`throttle { }`](/modules/kandra-ktor) block rejects a request because `maxQueueSize` is
+exceeded. It is **never retried** by `RetryConfig`, whatever `retryOn` contains — retrying
+immediately would only add load to an already-overloaded throttler. Shed load or back off instead.
 
 ```kotlin
 try {

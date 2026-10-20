@@ -3,7 +3,7 @@ import { dokkaClassUrl, dokkaModuleUrl, dokkaPackageUrl } from "@/lib/dokka";
 export const metadata = {
   title: "kandra-ktor",
   description:
-    "The Kandra Ktor ApplicationPlugin — install(Kandra) { ... }, KandraConfig and every nested config block, SchemaMode, and the exact install-lifecycle order of operations.",
+    "The Kandra Ktor ApplicationPlugin — install(Kandra) { ... }, KandraConfig and every nested config block (including throttle and extra keyspaces), SchemaMode, and the exact install-lifecycle order of operations.",
 };
 
 # kandra-ktor
@@ -110,14 +110,15 @@ errors later. Grep logs for "type mismatch" after any entity field type change i
 `runtime.isHealthy()` → `SELECT release_version FROM system.local`. Success: `200 OK`,
 `{"status":"UP"}`. Any exception: `503 Service Unavailable`, `{"status":"DOWN"}` — the exception
 itself is only logged at WARN, never included in the response body, so don't rely on curling this
-endpoint for diagnostics.
+endpoint for diagnostics. The result is cached for `healthCheckCacheTtlMs` (default `500` ms) so a probe storm
+becomes at most one cluster query per window instead of one per request; set it to `0` to query every time.
 
 ## `KandraConfig` — top-level properties
 
 ```kotlin
 class KandraConfig {
     var contactPoints: String = "localhost:9042"
-    var keyspace: String = ""                       // required — blank throws at install
+    var keyspace: String = ""                       // default keyspace; blank throws at install unless extra keyspaces are declared (see below)
     var localDatacenter: String = "datacenter1"
     var autoCreateKeyspace: Boolean = false
     var replicationStrategy: ReplicationStrategy = ReplicationStrategy.SimpleStrategy(replicationFactor = 1)
@@ -129,6 +130,7 @@ class KandraConfig {
     var batchMaxChunkSize: Int = 100
     var batchAutoChunk: Boolean = true
     var healthCheck: Boolean = true
+    var healthCheckCacheTtlMs: Long = 500           // cache window for /kandra/health; 0 = query on every request
     var eventListener: KandraEventListener? = null
 
     val pool: PoolConfig
@@ -143,7 +145,9 @@ class KandraConfig {
     val speculativeExecution: SpeculativeExecutionConfig
     val shutdown: ShutdownConfig
     val metrics: MetricsConfig
+    val throttle: ThrottleConfig
 
+    fun keyspace(name: String, block: KeyspaceConfig.() -> Unit = {})   // declare an extra keyspace
     fun register(vararg classes: KClass<*>)
     fun <T : Any> validate(klass: KClass<T>, validator: KandraValidator<T>)
     inline fun <reified T : Any> validate(noinline validator: (T) -> List<KandraValidationError>)
@@ -162,6 +166,28 @@ but a malformed entry with no numeric suffix after the last colon throws a raw
 top-level `KandraConfig` properties — there is no `batch { }` DSL block in this module. Don't go
 looking for one.
 </Callout>
+
+## Extra keyspaces — `keyspace("name") { }` / `KeyspaceConfig`
+
+One `install(Kandra)` and one `CqlSession` can serve several keyspaces. `keyspace = "..."` stays the default; each extra keyspace is
+declared with settings only, and entity membership comes from `@ScyllaTable(keyspace = "...")` alone.
+
+```kotlin
+install(Kandra) {
+    keyspace = "core"
+    keyspace("billing") {                     // class KeyspaceConfig
+        autoCreate = false                    // true runs CREATE KEYSPACE IF NOT EXISTS for it at startup
+        replicationStrategy = null            // null inherits the plugin-level replicationStrategy
+    }
+    register(User::class, Invoice::class)     // Invoice is @ScyllaTable("invoices", keyspace = "billing")
+}
+```
+
+An entity naming a keyspace that is neither the default nor declared fails with `KandraSchemaException` before connecting. The default
+`keyspace` may be left blank only if at least one extra keyspace is declared and every entity names its own. Declared names must be valid
+CQL identifiers, unique, and different from the default (case-insensitive). Bootstrap — keyspace creation, permission validation, DDL for
+`AUTO_CREATE`/`AUTO_MIGRATE`/`VALIDATE`, and DDL locks — runs per keyspace. See the
+[multi-keyspace setup guide](/guides/multi-keyspace-setup) and the [recipe](/recipes/multiple-keyspaces).
 
 ## `ReplicationStrategy`
 
@@ -186,11 +212,12 @@ replicationStrategy = ReplicationStrategy.NetworkTopologyStrategy(
 
 ```kotlin
 class PoolConfig {
-    var localRequestsPerConnection: Int = 1024
     var maxRequestsPerConnection: Int = 32768
     var heartbeatIntervalSeconds: Int = 30
     var requestTimeoutMillis: Long = 5000
     var connectionTimeoutMillis: Long = 5000
+    var localPoolSize: Int = 1     // connections per node in the local DC  -> CONNECTION_POOL_LOCAL_SIZE
+    var remotePoolSize: Int = 1    // connections per node in a remote DC   -> CONNECTION_POOL_REMOTE_SIZE
 }
 ```
 
@@ -202,10 +229,14 @@ pool {
 }
 ```
 
+Each pooled connection multiplexes up to `maxRequestsPerConnection` requests, so the real per-node concurrency ceiling is
+`localPoolSize * maxRequestsPerConnection`. Raise `localPoolSize` only after profiling real load — each connection is a TCP socket plus driver-side
+heap — and note Kandra uses the stock DataStax driver, not a shard-aware one, so pool size is a coarser lever than shard-aware routing.
+
 <Callout kind="gotcha">
-`localRequestsPerConnection` is declared but **not** actually applied by the driver config builder —
-only `maxRequestsPerConnection`, `requestTimeoutMillis`, `connectionTimeoutMillis`, and
-`heartbeatIntervalSeconds` are wired. Setting it changes nothing today.
+`remotePoolSize` only matters once cross-DC failover is genuinely enabled (`loadBalancing.dcAwareFailover = true` **and**
+`failover.onLocalDcUnavailable = FailoverPolicy.RETRY_REMOTE_DC`); otherwise the driver never opens remote-DC connections and the value is ignored.
+An older `localRequestsPerConnection` field was declared but never wired and has been removed (GH #69).
 </Callout>
 
 ## `auth { }` — `AuthConfig`
@@ -322,6 +353,36 @@ contacted.
 no code path reading them — the driver's own default token-aware load-balancing policy applies
 regardless of `tokenAware`'s value, and the actual DC-failover retry mechanics live in the driver's
 load-balancing policy, not an explicit delay loop honoring `remoteRetryDelayMs`.
+</Callout>
+
+## `throttle { }` — `ThrottleConfig`
+
+```kotlin
+class ThrottleConfig {
+    var enabled: Boolean = false
+    var maxConcurrentRequests: Int = 10_000   // max in-flight requests once enabled
+    var maxQueueSize: Int = 10_000            // extra requests queued beyond that; the rest are rejected immediately
+}
+```
+
+Wires the DataStax driver's `ConcurrencyLimitingRequestThrottler` for client-side backpressure against a slow or overloaded
+cluster (compaction storms, a partial multi-DC outage, a burst of application concurrency). Off by default — the driver's own
+default throttler never queues or rejects, which is what every deployment ran under before this block existed. It throttles only
+`session.execute`/`executeAsync` admission and is unrelated to `BatchEngine.inFlightCount`, which exists purely for graceful-shutdown
+draining.
+
+```kotlin
+throttle { enabled = true; maxConcurrentRequests = 2_000; maxQueueSize = 5_000 }
+```
+
+A request rejected because the queue is full surfaces as
+[`KandraThrottledException`](/modules/kandra-core) (not the raw driver `RequestThrottlingException`), and `retry { }` **never** retries
+it, regardless of `retryOn`.
+
+<Callout kind="gotcha">
+`throttle` interacts with `speculativeExecution`: every speculative copy counts toward `maxConcurrentRequests`, so enabling both can
+self-throttle under tail latency — a burst of slow requests each spawn extra in-flight copies right when the throttle is nearest its
+limit. Raise `maxConcurrentRequests`/`maxQueueSize`, or keep speculative execution conservative, if you turn both on.
 </Callout>
 
 ## `shutdown { }` — `ShutdownConfig`

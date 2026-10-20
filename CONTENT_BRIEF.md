@@ -57,8 +57,9 @@ Known facts already verified this session (reuse, don't re-derive):
   `KandraEventListener.onEventualWriteFailed` if wired; it does not self-heal. Don't describe this as
   merely "a bounded lag window" — the failure mode is a lookup row that stays wrong until something
   external intervenes, not just briefly stale.
-- Dokka is published at `https://dev-pasaka.github.io/kandra/v0.4.3/` (verified live) — **note the
-  published Dokka version (0.4.3) lags the current source (0.4.5)**; use the `dokkaClassUrl` /
+- Dokka is published at `https://dev-pasaka.github.io/kandra/` (verified live 2026-10-20: it redirects to
+  v0.5.0, matching the source) — **publishing Dokka is a separate step from tagging, so it can lag a release; re-check
+  `DOKKA_PUBLISHED_VERSION` in `lib/site-config.ts` each time**; use the `dokkaClassUrl` /
   `dokkaModuleUrl` / `dokkaPackageUrl` helpers from `lib/dokka.ts`, don't hand-build Dokka URLs. Their
   slug rule (verified against the live site): `PartitionKey` → `-partition-key/index.html`.
 
@@ -85,7 +86,7 @@ Denormalization is normal and correct here, not a workaround.
 - `<SideBySide leftLabel="..." rightLabel="..." left={...} right={...} />` — two-column code comparison
   (e.g. entity ⇄ generated DDL, or relational-instinct-vs-Kandra-way). Pass actual fenced code blocks
   (` ```kotlin `, ` ```sql `) as `left`/`right` JSX children — see pattern below.
-- `<VersionNote>optional context</VersionNote>` — small inline badge, "as of Kandra v0.4.5".
+- `<VersionNote>optional context</VersionNote>` — small inline badge, "as of Kandra v0.x.y".
 - Fenced code blocks: use standard MDX fences with a language tag. Add `title="path/to/File.kt"` in the
   meta string for a filename tab (e.g. ` ```kotlin title="build.gradle.kts" `). Use `showLineNumbers`
   and `{2,5-7}` (line highlight) or `` `word` `` backtick-in-comment highlighting only where it adds

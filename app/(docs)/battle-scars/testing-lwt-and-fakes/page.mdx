@@ -17,8 +17,10 @@ coverage.
 built for — its own doc comment says it exists to assert *structural* behavior, batch composition,
 save/delete ordering, "rather than data round-trips." But `BatchEngine.saveIfNotExists` and
 optimistic-lock `update()` both check `rs.one()?.getBoolean("[applied]") ?: false` to know whether
-the LWT actually applied. Under the fake, that's always `false`, and `FakePreparedStatement.bind()`
-unconditionally throws on top of that.
+the LWT actually applied. Under the fake, that's always `false`, and when this was audited
+`FakePreparedStatement.bind()` also unconditionally threw, so no repository call got that far.
+(The `bind()` half was fixed later, in 0.4.7 — GH #28 / ISS-040 — so repository calls now run to completion under the
+fake and you can assert on the statements they build. The `[applied]` half is the by-design limitation below and is unchanged.)
 
 <Callout kind="danger" title="Zero coverage, dressed up as 43 passing tests">
 `saveIfNotExists`, optimistic-lock `update()`, and anything going through the real

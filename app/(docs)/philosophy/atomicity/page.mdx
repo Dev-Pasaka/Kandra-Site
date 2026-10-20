@@ -53,7 +53,7 @@ suspend fun assignTodo(todo: Todo, assignment: TodoByAssignee) {
 }
 ```
 
-`KandraRuntime.batch { }` (suspend) and `.batchBlocking { }` (blocking) open a `KandraBatchScope`,
+`KandraRuntime.batch { }` (suspend) and `.batchBlocking { }` (blocking) open a `KandraBatchScope` / `KandraBlockingBatchScope`,
 collect every statement added inside the block, and execute them as one `LOGGED BATCH` when the
 block exits — one round trip, one atomic unit, both rows present or the batch retried until they
 are. In Ktor, you reach it through `application.kandra.batch { }`. Batch APIs are
