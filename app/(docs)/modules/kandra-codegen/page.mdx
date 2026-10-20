@@ -202,6 +202,13 @@ accessors that wrap the exact qualifier `kandraKoin()`/`kandraKodein()` bind und
 `Foo`, `KoinComponent.fooRepo()`/`fooSuspendRepo()` and `DIAware.fooRepo()`/`fooSuspendRepo()` — a
 compile-checked alternative to hand-typed `named("...")`/tag lookups.
 
+The files are `<Entity>KoinDi.kt` and `<Entity>KodeinDi.kt`, written into the entity's own package, and each is
+only emitted when the matching marker type (`org.koin.core.component.KoinComponent` /
+`org.kodein.di.DIAware`) resolves on the compile classpath of the module declaring the entity. They are
+extension **functions**, not properties. See
+[`/modules/kandra-koin`](/modules/kandra-koin#typed-accessors-recommended) and
+[`/modules/kandra-kodein`](/modules/kandra-kodein#typed-accessors-recommended) for usage.
+
 ## What gets *no* special treatment at all
 
 Tracing `KandraProcessor.kt` line by line yields a genuinely useful negative result: only three

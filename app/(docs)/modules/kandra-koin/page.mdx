@@ -95,6 +95,51 @@ class UserService : KoinComponent {
 }
 ```
 
+## Typed accessors (recommended)
+
+The raw lookups above work, but they hand you a star-projected `KandraSuspendRepository<*>` and a qualifier
+string you have to type correctly at every injection site. A typo only fails at runtime, and you need an
+unchecked cast before `save`/`update` are typed. If `kandra-codegen` is in your build, use the generated
+accessors instead:
+
+```kotlin
+// build.gradle.kts of the module that declares your @ScyllaTable entities
+dependencies {
+    ksp("com.kandraorm.kandra:kandra-codegen")
+    implementation("com.kandraorm.kandra:kandra-koin")   // brings koin-core onto the classpath
+}
+```
+
+For each entity the processor emits `<Entity>KoinDi.kt` in the entity's own package, with two
+`KoinComponent` extension functions: the entity class name with its first letter lower-cased, plus `Repo()`
+or `SuspendRepo()`. For `User` and `Transaction` that gives `userRepo()`, `userSuspendRepo()`,
+`transactionRepo()` and `transactionSuspendRepo()`, each returning a properly typed repository:
+
+```kotlin
+import com.example.model.transactionSuspendRepo   // generated, lives in the entity's package
+import com.example.model.userSuspendRepo
+import org.koin.core.component.KoinComponent
+
+class PaymentService : KoinComponent {
+    private val users by lazy { userSuspendRepo() }          // KandraSuspendRepository<User>
+    private val txns  by lazy { transactionSuspendRepo() }   // KandraSuspendRepository<Transaction>
+
+    suspend fun owner(id: UUID): User? = users.findById(id)  // typed, no cast
+}
+```
+
+Underneath they do exactly the lookup from the earlier section, `get<KandraSuspendRepository<*>>(named("UserSuspendRepo"))`
+plus the one cast, so they resolve the same bindings `kandraKoin()` created and the same call-order rule applies.
+Three details trip people up:
+
+- They are **functions, not properties**. Wrap them in `by lazy { }` for a property.
+- They are generated only when `org.koin.core.component.KoinComponent` is on the compile classpath of the module
+  that declares the entity. If `userSuspendRepo()` doesn't resolve, check that module's dependencies first.
+- Import them from the entity's package, not from `io.kandra.koin`.
+
+Inside Ktor route code you don't need DI at all: hoist `application.kandra.suspendRepository<T>()` into a
+`val` once per route-registration function, as [`/tutorial/05-routes`](/tutorial/05-routes) does.
+
 <Callout kind="gotcha" title="Call order: after install(Kandra) AND after Koin is installed">
 `kandraKoin()` calls `getKoin()`, which throws if no Koin instance is attached to the application yet
 — so it must run after `install(Koin) { }` (or `startKoin { }`). It also reads
@@ -112,8 +157,9 @@ string against this exact pattern before assuming the entity wasn't registered.
 
 <Callout kind="gotcha" title="Type-erased bindings always need an unchecked cast">
 `kandraKoin()` binds `KandraRepository<*>`/`KandraSuspendRepository<*>` — star-projected, because
-Koin has no way to recover the entity type parameter at resolution time. Every `inject()`/`get()`
-call needs `as KandraRepository<User>` (or similar) before you get typed `save`/`update` overloads
+Koin has no way to recover the entity type parameter at resolution time. The
+[generated typed accessors](#typed-accessors-recommended) do that cast once, in generated code. A raw
+`inject()`/`get()` call needs `as KandraRepository<User>` (or similar) before you get typed `save`/`update` overloads
 back. Unlike `kandra-kodein`, there is no reified single-entity binder here — `kandraKoin()` is the
 only public entry point, and it always binds every entity in `SchemaRegistry` at once. If you need
 Koin bindings outside a Ktor `Application`, write the `module { single(...) }` block yourself,

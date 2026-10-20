@@ -89,6 +89,29 @@ binders are not interchangeable lookup patterns, and forgetting `Suspend` in the
 common typo.
 </Callout>
 
+## Typed accessors (recommended)
+
+Like Koin, Kodein can't recover the entity type, so the raw `instance<KandraSuspendRepository<*>>(tag = "UserSuspend")`
+lookup returns a star-projected repository and needs an unchecked cast. With `kandra-codegen` in the build and
+`kodein-di` on the entity module's compile classpath, the processor emits `<Entity>KodeinDi.kt` in the entity's
+package with typed `DIAware` extension functions:
+
+```kotlin
+import com.example.model.transactionSuspendRepo   // generated, lives in the entity's package
+import com.example.model.userSuspendRepo
+import org.kodein.di.DIAware
+
+class PaymentService(override val di: DI) : DIAware {
+    private val users by lazy { userSuspendRepo() }          // KandraSuspendRepository<User>
+    private val txns  by lazy { transactionSuspendRepo() }   // KandraSuspendRepository<Transaction>
+}
+```
+
+The names are the entity class name with its first letter lower-cased plus `Repo()` or `SuspendRepo()`. They are
+functions, so wrap them in `by lazy { }` for a property. Underneath they use the tags from the table above
+(`"User"` and `"UserSuspend"`), so you can't get the tag wrong. The codegen setup is the same as in
+[`/modules/kandra-koin`](/modules/kandra-koin#typed-accessors-recommended).
+
 ## `DI.MainBuilder.bindKandraRepository<T>(session, schema, scope)`
 
 ```kotlin

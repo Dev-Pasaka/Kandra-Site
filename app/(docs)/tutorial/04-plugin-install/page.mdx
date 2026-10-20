@@ -213,7 +213,10 @@ instances aren't free](/foundations) (each one builds its own prepared-statement
 inside every request handler would quietly throw both caches away on every single call. `kandraKoin()`
 is still wired up here because it costs nothing and the named bindings are there if this app grows a
 service layer later — just don't reach for `by inject(named("TodoSuspendRepo")))` inside a route
-handler when a single hoisted `val` does the same job more cheaply.
+handler when a single hoisted `val` does the same job more cheaply. In a service class prefer the
+generated, typed `todoSuspendRepo()` accessor over a raw `inject<KandraSuspendRepository<*>>(named(...))`
+(see [`/modules/kandra-koin`](/modules/kandra-koin#typed-accessors-recommended)): no cast, and a wrong name is a
+compile error instead of a runtime one.
 </Callout>
 
 ## Checkpoint
