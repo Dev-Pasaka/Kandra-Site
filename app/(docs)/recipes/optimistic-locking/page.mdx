@@ -57,7 +57,7 @@ with the exact row identity and the version it expected:
 class KandraOptimisticLockException(
     message: String,
     val entityClass: KClass<*>,
-    val partitionKeyValue: Any,
+    val partitionKey: Any,
 )
 ```
 

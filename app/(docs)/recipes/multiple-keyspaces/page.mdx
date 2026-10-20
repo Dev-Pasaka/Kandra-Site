@@ -65,9 +65,19 @@ keyspace, and metrics and debug-log labels use the qualified table name.
 `kandra_migrations` and its locks live in each keyspace. Pass the keyspace when you run them:
 
 ```kotlin
-KandraMigrationRunner(session, staleClaimThreshold, keyspace = "billing")
-KandraMigration.up(session, "billing")   // up(session) still targets the default keyspace
+object V2_AddInvoiceIndex : KandraMigration(version = 2, name = "add invoice index") {
+    override fun up(session: CqlSession) { /* the default keyspace */ }
+    override fun up(session: CqlSession, keyspace: String?) {
+        // called by the runner with the keyspace it was constructed with ("billing" below)
+        session.execute("CREATE INDEX IF NOT EXISTS ON ${keyspace ?: "app"}.invoices (status)")
+    }
+}
+
+KandraMigrationRunner(session, keyspace = "billing").run(V2_AddInvoiceIndex)
 ```
+
+`up(session, keyspace)` defaults to `up(session)`, so a migration written for one keyspace keeps working unchanged. `staleClaimThreshold` is the
+runner's middle constructor parameter (default 10 minutes); pass `keyspace` by name to skip it.
 
 See [`/recipes/migrations`](/recipes/migrations) for the migration model itself.
 
