@@ -157,6 +157,11 @@ the stale cached entry survives and the next optimistic-locked update fails with
 that class of bug entirely.
 </Callout>
 
+<Unreleased issues={[178]}>
+The cache now normalizes `Instant` keys to milliseconds itself, so the stale-entry problem above is fixed on `main`. Truncating where the todo is created
+is still the cleaner habit, since the value you return to clients then matches what is stored.
+</Unreleased>
+
 ## `GET /todos/mine` — the cheapest read this app has
 
 ```kotlin

@@ -165,6 +165,8 @@ Kandra does not ship a metrics backend, and doesn't hard-wire one. `KandraMetric
 ```kotlin
 fun interface KandraMetrics {
     fun record(tableName: String, operation: String, durationMs: Long)
+    fun record(tableName: String, operation: String, durationMs: Long, attempts: Int) // default: calls the 3-arg record
+    fun recordFailure(tableName: String, operation: String, durationMs: Long, attempts: Int, exceptionType: String) {} // default: no-op
 }
 ```
 

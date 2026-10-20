@@ -23,6 +23,12 @@ dependencies {
 tasks.test { useJUnitPlatform() }
 ```
 
+<Unreleased issues={[179, 180, 181]}>
+On `main`, `kandra-test` brings the DataStax driver along (so the `java-driver-core` line above is unnecessary), `KandraTestUtils.reset()` replaces
+`SchemaRegistry.clear()` (no `@OptIn(InternalKandraApi::class)` needed), and `FakeKandraSession.capturedBatchViews()` returns each statement's CQL and bound
+values as a public `CapturedStatement`. This page documents v0.5.0, where the lines above are still required.
+</Unreleased>
+
 ## `FakeKandraSession` — structure, not outcomes
 
 `FakeKandraSession`'s own doc comment describes it as the way to "wire a full repository stack
