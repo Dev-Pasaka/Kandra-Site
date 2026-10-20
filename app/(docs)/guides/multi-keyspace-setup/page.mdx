@@ -1,0 +1,152 @@
+export const metadata = {
+  title: "Guide: setting up multiple keyspaces",
+  description:
+    "A step-by-step walkthrough for serving several keyspaces from one install(Kandra) and one CqlSession: naming, entities, plugin config, startup errors, migrations and tests.",
+};
+
+# Guide: setting up multiple keyspaces
+
+This walks one concrete app from "everything is in one keyspace" to "users live in `core`, invoices live in
+`billing`", on a **single** `install(Kandra)` and a **single** `CqlSession`. It needs Kandra **0.5.0** or later.
+For the short reference version, see [`/recipes/multiple-keyspaces`](/recipes/multiple-keyspaces). For splitting
+the code across Gradle modules, continue with [`/guides/multi-module-architecture`](/guides/multi-module-architecture).
+
+## The model in one paragraph
+
+The keyspace is a property of the **entity**, fixed at compile time by `@ScyllaTable(keyspace = "...")`. The plugin
+config only *declares* which extra keyspaces exist and how to create them. Nothing is chosen per request or per
+tenant, so there is no runtime "switch keyspace" call. Every query for a keyspaced entity is emitted as
+`keyspace.table`, and entities without a keyspace keep their old unqualified CQL, byte for byte.
+
+## Step 1: name your keyspaces once, as constants
+
+Annotation arguments must be compile-time constants, so a plain `val` won't do. Use `const val` and reuse it
+everywhere, so the entity and the plugin config can't drift apart:
+
+```kotlin title="Keyspaces.kt"
+const val CORE_KEYSPACE = "core"
+const val BILLING_KEYSPACE = "billing"
+```
+
+Names must be valid CQL identifiers, unique, and different from each other (case-insensitive). `kandra-codegen`
+rejects an invalid name at build time, and `SchemaRegistry` rejects it again at registration.
+
+## Step 2: put each entity in its keyspace
+
+```kotlin title="Entities.kt"
+import io.kandra.core.annotations.*
+import java.util.UUID
+
+// No keyspace: lives in the plugin's default keyspace ("core" below)
+@ScyllaTable(name = "users")
+data class User(@PartitionKey val id: UUID, val email: String)
+
+@ScyllaTable(name = "invoices", keyspace = BILLING_KEYSPACE)
+data class Invoice(@PartitionKey val id: UUID, val userId: UUID, val total: Long)
+```
+
+Lookup tables (`@LookupIndex`) inherit their parent entity's keyspace; you don't set it separately.
+
+## Step 3: declare the keyspaces in the plugin
+
+```kotlin title="Application.kt"
+import io.kandra.ktor.ReplicationStrategy
+
+fun Application.module() {
+    install(Kandra) {
+        contactPoints = "localhost:9042"
+        localDatacenter = "datacenter1"
+
+        keyspace = CORE_KEYSPACE                 // the default keyspace, unchanged from a single-keyspace app
+        autoCreateKeyspace = true
+        replicationStrategy = ReplicationStrategy.SimpleStrategy(3)
+
+        keyspace(BILLING_KEYSPACE) {             // extra keyspace: settings only
+            autoCreate = true                    // omitted replicationStrategy inherits SimpleStrategy(3)
+        }
+
+        schemaMode = SchemaMode.AUTO_CREATE
+        register(User::class, Invoice::class)
+    }
+}
+```
+
+Three rules to remember:
+
+- `keyspace = "x"` is the default and is used by every entity whose annotation `keyspace` is blank.
+- `keyspace("x") { }` never lists entities. Membership comes only from the annotation.
+- You may leave the default `keyspace` blank **only** if you declare at least one `keyspace("x") { }` and every
+  registered entity names a declared keyspace.
+
+## Step 4: use the repositories as usual
+
+Nothing changes at the call site. The repository for `Invoice` already knows it lives in `billing`:
+
+```kotlin
+val invoices = application.kandra.suspendRepository<Invoice>()
+invoices.save(Invoice(UUID.randomUUID(), userId, 4_200))      // INSERT INTO billing.invoices ...
+val one = invoices.findById(invoiceId)
+```
+
+Generated `*Table` objects (`InvoiceTable`) are identical for keyspaced and non-keyspaced entities, so the query DSL
+looks the same. Metrics and debug-log labels use the qualified name (`billing.invoices`).
+
+## What happens at startup
+
+For **each** keyspace, in turn, Kandra creates it (if `autoCreate` is on), validates permissions, and runs the DDL for
+your `schemaMode` (`AUTO_CREATE`, `AUTO_MIGRATE` or `VALIDATE`). The default keyspace keeps its original DDL lock
+table. Each extra keyspace gets its own `<keyspace>.kandra_ddl_locks`. Your database user therefore needs the
+necessary permissions on every keyspace, not just the default one.
+
+### Errors you may hit, and what they mean
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `KandraSchemaException` naming an entity, its keyspace and the declared keyspaces | The entity's `@ScyllaTable(keyspace)` is neither the default nor declared with `keyspace("x") { }` | Declare it, or fix the typo (this is why Step 1 uses `const val`) |
+| `'keyspace' must be set in the plugin configuration` | Blank default keyspace and no `keyspace("x") { }` declared | Set `keyspace = ...` or declare an extra keyspace |
+| `KandraSchemaException` about a blank entity keyspace | Blank default keyspace, and an entity didn't name a declared keyspace | Give every entity a keyspace, or set a default |
+| Koin/Kodein startup error listing `[keyspace: X]` | Two entities in different keyspaces share a **simple class name** | Rename one class; DI bindings are keyed by simple name |
+| `SimpleStrategy doesn't support tablet replication` | Tablets-enabled ScyllaDB (e.g. Scylla Cloud) | `SimpleStrategy(3, disableTablets = true)`, or use `NetworkTopologyStrategy` |
+
+All of these fail at startup, before any traffic.
+
+## Step 5: migrations are per keyspace
+
+`kandra_migrations` and its locks live **inside** each keyspace, so each keyspace keeps its own migration history.
+Pass the keyspace to the runner, and qualify table names inside the migration CQL:
+
+```kotlin title="BillingMigrations.kt"
+object V1_CreateInvoices : KandraMigration(version = 1, name = "create_invoices") {
+    override fun up(session: CqlSession) {
+        session.execute(
+            "CREATE TABLE IF NOT EXISTS $BILLING_KEYSPACE.invoices " +
+                "(id uuid PRIMARY KEY, user_id uuid, total bigint)"
+        )
+    }
+}
+
+KandraMigrationRunner(application.kandraSession, keyspace = BILLING_KEYSPACE).run(V1_CreateInvoices)
+```
+
+The keyspace must already exist when the runner starts, which is what `keyspace("billing") { autoCreate = true }`
+gives you. See [`/recipes/migrations`](/recipes/migrations) for the migration model (checksums, claim-first locking).
+
+## Step 6: testing
+
+Because the keyspace name is an annotation constant, an integration test can't generate a random keyspace per run the
+way a single-keyspace test can. Use fixed, clearly test-only names (for example `kt_billing`) in the entities your
+tests register, and drop them before and after each test. Never point such a test at a shared cluster using real
+keyspace names. [`/tutorial/12-testing`](/tutorial/12-testing) covers the test backend.
+
+## Tablets and Scylla Cloud
+
+Tablets-enabled clusters reject `SimpleStrategy` unless you opt out. For a keyspace Kandra creates, set
+`ReplicationStrategy.SimpleStrategy(3, disableTablets = true)` (ScyllaDB only; Apache Cassandra rejects the
+option). `NetworkTopologyStrategy` works with tablets and needs no flag. On clusters with
+`tablets_mode_for_new_keyspaces: enforced`, `SimpleStrategy` is rejected even with the flag, so use
+`NetworkTopologyStrategy` there.
+
+## Not supported
+
+- Choosing a keyspace at runtime, per call or per tenant.
+- A dedicated cross-keyspace batch API. A `batch { }` that mixes keyspaces works, with the usual logged-batch cost.

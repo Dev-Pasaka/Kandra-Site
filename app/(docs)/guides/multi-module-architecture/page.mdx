@@ -1,0 +1,168 @@
+export const metadata = {
+  title: "Guide: multi-module architecture",
+  description:
+    "How to split a Ktor app into Gradle feature modules that each own entities in their own keyspace, share one Kandra install and one connection pool, and wire repositories without circular dependencies.",
+};
+
+# Guide: multi-module architecture
+
+A common shape for a larger Ktor service: a thin **app** module plus **feature modules** (`core`, `billing`, `archive`)
+that each own their data. Kandra 0.5.0 supports this directly: each module's entities live in that module's
+keyspace, and the whole app shares one `install(Kandra)` and one `CqlSession` (one connection pool). Read
+[`/guides/multi-keyspace-setup`](/guides/multi-keyspace-setup) first for the keyspace mechanics. This page is about
+how to arrange the code around them.
+
+## The layout
+
+```text
+my-service/
+├── app/        Ktor Application, the ONLY place that calls install(Kandra)
+├── core/       User entity + UserService          keyspace "core"
+├── billing/    Invoice entity + InvoiceService    keyspace "billing"
+└── archive/    ArchivedOrder entity               keyspace "archive"
+```
+
+The dependency direction is one-way: `app` depends on every feature module, and feature modules depend on **Kandra's
+runtime types, not on each other and not on `app`**.
+
+## What each module depends on
+
+```kotlin title="billing/build.gradle.kts"
+plugins { id("com.google.devtools.ksp") }
+
+dependencies {
+    implementation(platform("com.kandraorm.kandra:kandra-bom:__KANDRA_VERSION__"))
+    implementation("com.kandraorm.kandra:kandra-runtime")   // KandraSuspendRepository<T>, query DSL
+    ksp("com.kandraorm.kandra:kandra-codegen")              // generates InvoiceTable in THIS module
+}
+```
+
+```kotlin title="app/build.gradle.kts"
+dependencies {
+    implementation(platform("com.kandraorm.kandra:kandra-bom:__KANDRA_VERSION__"))
+    implementation("com.kandraorm.kandra:kandra-ktor")      // install(Kandra), Application.kandra
+    implementation(project(":core"))
+    implementation(project(":billing"))
+    implementation(project(":archive"))
+}
+```
+
+Feature modules do **not** need `kandra-ktor`. That keeps your domain code free of Ktor and easy to test in isolation.
+Run `kandra-codegen` in every module that declares entities. The generated `*Table` objects land next to the entity.
+
+## What a feature module exposes
+
+Each feature module publishes three things, and nothing more:
+
+```kotlin title="billing/src/main/kotlin/billing/BillingModule.kt"
+package billing
+
+import io.kandra.core.annotations.*
+import io.kandra.runtime.repository.KandraSuspendRepository
+import java.util.UUID
+
+const val BILLING_KEYSPACE = "billing"                          // 1. the keyspace name
+
+@ScyllaTable(name = "invoices", keyspace = BILLING_KEYSPACE)
+data class Invoice(@PartitionKey val id: UUID, val userId: UUID, val total: Long)
+
+val BILLING_ENTITIES = arrayOf(Invoice::class)                  // 2. its entity list
+
+class InvoiceService(private val invoices: KandraSuspendRepository<Invoice>) {   // 3. a service
+    suspend fun issue(userId: UUID, total: Long): Invoice =
+        Invoice(UUID.randomUUID(), userId, total).also { invoices.save(it) }
+
+    suspend fun find(id: UUID): Invoice? = invoices.findById(id)
+}
+```
+
+The service takes its repository **as a constructor argument**. It never reaches for `Application.kandra` or a DI container,
+which is what makes the module independent of the app and trivially unit-testable.
+
+## What the app module does
+
+The app is the single composition root. It declares every keyspace, registers every entity list, and hands each
+service its repository:
+
+```kotlin title="app/src/main/kotlin/app/Application.kt"
+fun Application.module() {
+    install(Kandra) {
+        contactPoints = "localhost:9042"
+        localDatacenter = "datacenter1"
+
+        keyspace = CORE_KEYSPACE
+        autoCreateKeyspace = true
+        replicationStrategy = ReplicationStrategy.SimpleStrategy(3)
+
+        keyspace(BILLING_KEYSPACE) { autoCreate = true }
+        keyspace(ARCHIVE_KEYSPACE) { autoCreate = true }
+
+        register(*CORE_ENTITIES, *BILLING_ENTITIES, *ARCHIVE_ENTITIES)
+    }
+
+    val users = UserService(kandra.suspendRepository<User>())
+    val invoices = InvoiceService(kandra.suspendRepository<Invoice>())
+
+    routing {
+        billingRoutes(invoices)          // each feature module contributes its routes
+        userRoutes(users)
+    }
+}
+```
+
+<Callout kind="note" title="There is no automatic discovery">
+Kandra does not scan the classpath or let a module register itself. The app module lists every keyspace and every entity
+explicitly, as above. That is deliberate: startup validation (an entity naming an undeclared keyspace fails fast with
+`KandraSchemaException`) only works because the list is in one visible place. If you add a module and forget its
+`keyspace(...)` block or its entity list, the first symptom is that startup error, not a silent missing table.
+</Callout>
+
+Build each repository **once**, at startup, and pass it in. Repository instances aren't free (each one has its own
+prepared-statement cache and, with `@CacheResult`, its own cache), so don't construct them per request. The tutorial
+explains this in [`/tutorial/05-routes`](/tutorial/05-routes).
+
+## Using a DI container instead
+
+If you prefer Koin or Kodein, `kandraKoin()` / `kandraKodein()` bind a repository per registered entity **across all
+modules** in one go. Feature modules can then use the generated, typed accessors (`invoiceSuspendRepo()`) from a
+`KoinComponent`, as long as that module has Koin on its compile classpath and `kandra-codegen` in its build. See
+[`/modules/kandra-koin`](/modules/kandra-koin#typed-accessors-recommended). One rule matters here: bindings are keyed by the
+entity's **simple class name**, so two entities with the same name in different modules (`billing.Entry` and
+`archive.Entry`) fail at startup with an error listing each class and its keyspace. Rename one.
+
+## Migrations: each module owns its own
+
+Because `kandra_migrations` lives inside each keyspace, a feature module can ship its own migration objects and the app
+runs them against that module's keyspace:
+
+```kotlin title="billing/.../BillingMigrations.kt"
+val BILLING_MIGRATIONS = arrayOf(V1_CreateInvoices, V2_AddCurrency)
+```
+
+```kotlin title="app/.../Application.kt"
+KandraMigrationRunner(kandraSession, keyspace = BILLING_KEYSPACE).run(*BILLING_MIGRATIONS)
+KandraMigrationRunner(kandraSession, keyspace = ARCHIVE_KEYSPACE).run(*ARCHIVE_MIGRATIONS)
+```
+
+Two things to get right: migration CQL must **qualify its own table names** (`CREATE TABLE billing.invoices ...`),
+because the runner does not switch the session's keyspace, and the keyspace must already exist (use `autoCreate = true`).
+Details in [`/guides/multi-keyspace-setup`](/guides/multi-keyspace-setup#step-5-migrations-are-per-keyspace).
+
+## Design rules that keep this healthy
+
+- **One keyspace, one owner.** Only the owning module reads and writes its tables. If `billing` needs a user's email, it
+  asks `core` through an interface, rather than reading `core.users` directly. Cassandra and ScyllaDB have no
+  cross-keyspace joins, so a shared table is just a hidden coupling.
+- **Denormalize across the boundary.** Store what `billing` needs (say, `userEmail`) on the `Invoice` itself, as you
+  would for any partition-key-driven model.
+- **Avoid cross-keyspace atomicity.** A `batch { }` mixing keyspaces works, but it is a logged batch with the usual
+  cost and no cross-keyspace transaction. Design write paths so each module's write stands on its own.
+- **Keep names unique.** Simple class names must be unique across modules if you use Koin/Kodein.
+- **Don't try to select a keyspace at runtime.** The keyspace is the entity's, at compile time. Per-tenant keyspaces
+  need a different design.
+
+## Testing a feature module
+
+Because services take repositories as constructor arguments, you can test `InvoiceService` against `kandra-test`'s fake
+session or a real container without starting the app or any other module. See
+[`/tutorial/12-testing`](/tutorial/12-testing) and [`/modules/kandra-test`](/modules/kandra-test).

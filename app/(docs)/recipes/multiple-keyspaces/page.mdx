@@ -10,6 +10,9 @@ export const metadata = {
 in its own keyspace, but you don't want a `CqlSession` and connection pool per keyspace. Since **0.5.0**,
 one `install(Kandra)` and one session can serve many keyspaces.
 
+For a step-by-step walkthrough, see [`/guides/multi-keyspace-setup`](/guides/multi-keyspace-setup); for splitting the code into Gradle
+modules, see [`/guides/multi-module-architecture`](/guides/multi-module-architecture).
+
 ## The scenario
 
 A `core` keyspace for users and a `billing` keyspace for invoices, in the same Ktor app.

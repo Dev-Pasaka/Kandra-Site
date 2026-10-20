@@ -63,6 +63,11 @@ export const RECIPE_PAGES: NavItem[] = [
   { title: "Social feed capstone", href: "/recipes/social-feed-capstone" },
 ];
 
+export const GUIDE_PAGES: NavItem[] = [
+  { title: "Multi-keyspace setup", href: "/guides/multi-keyspace-setup" },
+  { title: "Multi-module architecture", href: "/guides/multi-module-architecture" },
+];
+
 export const BATTLE_SCAR_PAGES: NavItem[] = [
   { title: "Clustering keys & lookup tables", href: "/battle-scars/clustering-keys-and-lookup-tables" },
   { title: "The batch-scope shadowing saga", href: "/battle-scars/batch-scope-shadowing" },
@@ -99,6 +104,10 @@ export const NAV_SECTIONS: NavSection[] = [
     items: [{ title: "Overview", href: "/recipes" }, ...RECIPE_PAGES],
   },
   {
+    title: "Guides",
+    items: GUIDE_PAGES,
+  },
+  {
     title: "Reference",
     items: [{ title: "API reference", href: "/reference" }],
   },
@@ -133,6 +142,7 @@ function flattenForPagination(): NavItem[] {
     ...MODULE_PAGES,
     { title: "Recipes overview", href: "/recipes" },
     ...RECIPE_PAGES,
+    ...GUIDE_PAGES,
     { title: "Battle scars overview", href: "/battle-scars" },
     ...BATTLE_SCAR_PAGES,
     { title: "Changelog", href: "/changelog" },
