@@ -17,6 +17,7 @@ package com.example.todos
 import com.example.todos.model.Todo
 import com.example.todos.model.User
 import io.kandra.core.KandraAuth
+import io.kandra.ktor.ReplicationStrategy
 import io.kandra.ktor.SchemaMode
 import io.kandra.ktor.Kandra
 import io.kandra.koin.kandraKoin
@@ -39,6 +40,7 @@ fun Application.module() {
         keyspace = "todos"
         localDatacenter = "datacenter1"
         autoCreateKeyspace = true
+        replicationStrategy = ReplicationStrategy.SimpleStrategy(replicationFactor = 1, disableTablets = true)
         schemaMode = SchemaMode.AUTO_CREATE
 
         register(User::class, Todo::class)
@@ -64,17 +66,21 @@ fun Application.module() {
 ```kotlin
 keyspace = "todos"
 autoCreateKeyspace = true
+replicationStrategy = ReplicationStrategy.SimpleStrategy(replicationFactor = 1, disableTablets = true)
 schemaMode = SchemaMode.AUTO_CREATE
 ```
 
 `keyspace` has no default — a blank value throws `KandraSchemaException` immediately, the very first
 check the plugin runs, before any network call. `autoCreateKeyspace = true` tells Kandra to run
 `CREATE KEYSPACE IF NOT EXISTS todos WITH replication = {'class': 'SimpleStrategy',
-'replication_factor': 1}` (the default `ReplicationStrategy.SimpleStrategy(replicationFactor = 1)`)
+'replication_factor': 1} AND tablets = {'enabled': false}` (the `SimpleStrategy(replicationFactor = 1, disableTablets = true)` above)
 against a bootstrap session before attaching to it — right for local dev against the single-node
 Scylla from [page 02](/tutorial/02-project-setup), and wrong for most real deployments, where the
 keyspace and its replication factor are provisioned by ops ahead of time and the app role often
-shouldn't have `CREATE KEYSPACE` permission at all. `SchemaMode.AUTO_CREATE` is what actually runs
+shouldn't have `CREATE KEYSPACE` permission at all. The `disableTablets = true` part is not optional against the `scylladb/scylla:latest` image from page 02: current ScyllaDB creates new keyspaces with
+tablets enabled, tablets keyspaces reject `SimpleStrategy`, and without the flag startup fails with `InvalidConfigurationInQueryException: SimpleStrategy
+doesn't support tablet replication`. The flag is ScyllaDB-only (Cassandra rejects it) and only for local dev like this.
+`SchemaMode.AUTO_CREATE` is what actually runs
 the `CREATE TABLE IF NOT EXISTS` DDL from [page 03](/tutorial/03-entities) for every class passed to
 `register(...)`, at this `install(Kandra) { }` call — not lazily on first request.
 

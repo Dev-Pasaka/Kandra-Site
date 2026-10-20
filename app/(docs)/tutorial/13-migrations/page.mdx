@@ -38,7 +38,7 @@ independent `ALTER TABLE todos ADD priority INT` statements can fire concurrentl
 other with no lock between them. It usually "works" — one wins, the others fail loudly with a CQL
 error the instance may not handle gracefully at startup — but "usually works, no explicit
 coordination" is exactly the kind of thing that's fine until a deploy timing coincidence makes it
-not fine, in production, unattended. `kandra-migrate` exists specifically to replace "usually
+not fine, in production, unattended. `kandra-migrate` (add `implementation("com.kandraorm.kandra:kandra-migrate")` to `build.gradle.kts` — it isn't in page 02's dependency list) exists specifically to replace "usually
 works" with an actual guarantee here.
 
 <Callout kind="note">
