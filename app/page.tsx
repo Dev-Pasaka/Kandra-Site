@@ -42,7 +42,7 @@ const COMPARISON_ROWS = [
     label: "Cross-table writes",
     raw: "BatchStatement is available; atomicity discipline is on you",
     spring: "Manual, non-atomic by default",
-    kandra: "@LookupIndex + logged batches, atomic by construction",
+    kandra: "@LookupIndex + logged batches — atomic by default (EVENTUAL is an explicit opt-out)",
   },
   {
     label: "How it wires up",
@@ -91,7 +91,7 @@ const PAIN_POINTS = [
     q: "Why does this need ALLOW FILTERING, and why is everyone telling me not to use it?",
     problem:
       "Cassandra will let you write a query that triggers a full-cluster scatter-gather scan, and it will degrade a production cluster badly under load. Most ORMs don't stop you.",
-    fix: "Kandra's predicate query DSL (find {} / findAll {}) structurally cannot express ALLOW FILTERING — every predicate resolves through a partition key, @LookupIndex, or @SecondaryIndex, or the query throws at build time. The one exception is findActive() on @SoftDelete entities without a @SecondaryIndex on the marker: it throws unless you explicitly pass allowFullScan = true, and then logs a WARN naming the cost.",
+    fix: "Kandra's predicate query DSL (find {} / findAll {}) structurally cannot express ALLOW FILTERING — every predicate resolves through a partition key, @LookupIndex, or @SecondaryIndex, or the query throws KandraQueryException as soon as it is built — it is never sent to the cluster as a scan. The one exception is findActive() on @SoftDelete entities without a @SecondaryIndex on the marker: it throws unless you explicitly pass allowFullScan = true, and then logs a WARN naming the cost.",
     href: "/foundations",
     icon: SearchX,
   },
@@ -118,7 +118,7 @@ const PAIN_POINTS = [
     q: "Why does my read work in dev but throw in production?",
     problem:
       "Partition-scoped design (or its absence) is invisible on a small dev dataset and catastrophic at scale.",
-    fix: "Kandra's schema and query validation run at plugin install — startup — not first request. A query that can't be served without a full scan is caught before deploy, not discovered under load.",
+    fix: "Kandra's schema validation (keys, indexes, permissions, and VALIDATE mode against the live cluster) runs at plugin install — startup — not on the first request. A query that can't be served without a full scan is rejected with KandraQueryException when it is built, instead of silently running as a scan you only notice under load.",
     href: "/philosophy/schema-safety",
     icon: ServerCrash,
   },

@@ -4,6 +4,6 @@
 todoRepo.deleteById(ownerId, createdAt, todoId) // deletes exactly one row
 
 todoRepo.deleteById(ownerId)
-// Fails at call time: KandraSchemaException, naming the missing
-// clustering-key column — not a silent partition wipe.
+// Fails at call time: KandraSchemaException listing the 3 key columns it
+// requires (owner_id, created_at, todo_id) — not a silent partition wipe.
 ```

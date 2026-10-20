@@ -1,7 +1,9 @@
 ```kotlin title="Application.kt"
 import io.kandra.ktor.*
+import org.koin.ktor.plugin.Koin
 
 fun Application.configureDatabase() {
+    install(Koin) { }   // must come first: kandraKoin() throws if Koin isn't installed yet
     install(Kandra) {
         contactPoints = "localhost:9042"
         keyspace = "quickstart"
@@ -12,6 +14,6 @@ fun Application.configureDatabase() {
         register(Todo::class)
         auth { provider = KandraAuth.static("cassandra", "cassandra") } // local dev only
     }
-    kandraKoin()
+    kandraKoin()   // binds a typed repository pair per registered entity
 }
 ```
