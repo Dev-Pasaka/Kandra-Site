@@ -222,3 +222,18 @@ Next: [`/tutorial`](/tutorial) builds a real multi-user app — a todo list — 
 through shipping, with every decision explained as it's made. It's deliberately more thorough than
 this page; that's the point.
 </Callout>
+
+## Using Kandra with Claude Code
+
+Kandra ships [Claude Code](https://claude.com/claude-code) skills as an installable plugin: a project-wide overview, a `kandra-setup` skill for
+adding Kandra to a build, and one exhaustive skill per module (`kandra-core`, `kandra-runtime`, `kandra-ktor`, `kandra-koin`, `kandra-kodein`,
+`kandra-codegen`, `kandra-test`, `kandra-multidc`, `kandra-migrate`, `kandra-jakarta`). Each documents every public class and function in its module,
+including footguns the compiler won't catch — such as `update(old, new)` taking two entities.
+
+```
+/plugin marketplace add Dev-Pasaka/kandra
+/plugin install kandra@kandra
+```
+
+Claude Code then loads the relevant skill automatically while you define entities, call repositories, configure `install(Kandra)`, wire DI,
+write tests, or author a migration.

@@ -486,12 +486,14 @@ class ConsistencyConfig {
     var defaultRead: KandraConsistency = KandraConsistency.LOCAL_ONE
     var defaultWrite: KandraConsistency = KandraConsistency.LOCAL_QUORUM
     var defaultSerialConsistency: KandraConsistency = KandraConsistency.LOCAL_SERIAL
+    var strictMode: Boolean = false        // opt-in, WARN-only: flags R + W <= RF and LOCAL_ONE/ONE in multi-DC setups
 }
 
 class DebugConfig {
     var logQueries: Boolean = false        // CQL template only, never bound values — a PII guard
     var logSlowQueriesMs: Long = 0L        // 0 = disabled
     var logBatches: Boolean = false        // checked by save()/saveAll() only, not update()/delete()
+    var rawQueryStrictMode: Boolean = false   // true: raw()/rawQuery() throw KandraQueryException on a spliced string literal instead of just warning
 }
 
 class RetryConfig {
@@ -499,8 +501,14 @@ class RetryConfig {
     var backoffMillis: Long = 100
     var maxBackoffMillis: Long = 2000
     var retryOn: Set<KClass<out Throwable>> = setOf(WriteTimeoutException::class, ReadTimeoutException::class, NoNodeAvailableException::class)
+    var jitter: Boolean = true
 }
 ```
+
+`jitter` (default `true`) applies "equal jitter" to the linear backoff — half the computed delay plus a random amount up to the other half — so
+many concurrent callers hitting the same transient failure don't retry in lockstep and turn a blip into a retry burst. Set it to `false` for fully
+deterministic delays (for example in a timing test). `KandraThrottledException` and the versioned `@Version` update are never retried, whatever
+`retryOn` contains.
 
 These are the same classes `kandra-ktor`'s `retry { }`/`debug { }`/`consistency { }` blocks
 configure — see [`/modules/kandra-ktor`](/modules/kandra-ktor).
@@ -509,19 +517,29 @@ configure — see [`/modules/kandra-ktor`](/modules/kandra-ktor).
 
 ```kotlin
 class KandraBatchScope internal constructor(session: CqlSession, batchEngine: BatchEngine) {
-    fun <T : Any> KandraRepository<T>.saveInBatch(entity: T, ttlSeconds: Int? = null)
-    fun <T : Any> KandraSuspendRepository<T>.saveInBatch(entity: T, ttlSeconds: Int? = null)
-    fun <T : Any> KandraRepository<T>.deleteInBatch(entity: T)
-    fun <T : Any> KandraSuspendRepository<T>.deleteInBatch(entity: T)
+    suspend fun <T : Any> KandraSuspendRepository<T>.saveInBatch(entity: T, ttlSeconds: Int? = null)
+    suspend fun <T : Any> KandraSuspendRepository<T>.saveInBatchAndGet(entity: T, ttlSeconds: Int? = null): T   // entity with generated values resolved
+    suspend fun <T : Any> KandraSuspendRepository<T>.deleteInBatch(entity: T)
     fun <T : Any> KandraSuspendRepository<T>.saveIfNotExistsInBatch(entity: T): Boolean   // always throws
+}
+
+// batchBlocking { } takes a separate scope type with the same extensions on the blocking repository:
+class KandraBlockingBatchScope internal constructor(batchEngine: BatchEngine) {
+    fun <T : Any> KandraRepository<T>.saveInBatch(entity: T, ttlSeconds: Int? = null)
+    fun <T : Any> KandraRepository<T>.saveInBatchAndGet(entity: T, ttlSeconds: Int? = null): T
+    fun <T : Any> KandraRepository<T>.deleteInBatch(entity: T)
 }
 ```
 
-`@ExperimentalKandraApi`. Only reachable via `KandraRuntime.batch { }` (suspend) /
-`batchBlocking { }`. Collects statements from `saveInBatch`/`deleteInBatch` calls — same
+`@ExperimentalKandraApi`. `KandraBatchScope` is reachable only via the suspend `KandraRuntime.batch { }`;
+`batchBlocking { }` opens the distinct `KandraBlockingBatchScope`, so each overload set resolves unambiguously and a blocking
+repository inside a suspend batch is a compile error. `saveInBatchAndGet` is `saveInBatch` that also returns the entity as it will
+be persisted, with `@GeneratedUuid`/`@CreatedAt`/`@UpdatedAt` already resolved (it does **not** inject an initial `@Version`, unlike
+standalone `save()`). Collects statements from `saveInBatch`/`deleteInBatch` calls — same
 primary-row-plus-`BATCH`-lookup shape as the standalone methods, but `EVENTUAL` lookups are **not**
-included — into one list, then executes them as a single `LOGGED BATCH` on scope exit via a plain
-**blocking** `session.execute(batch)`, even inside the `suspend fun batch { }` variant. No cache
+included — into one list, then executes them as a single `LOGGED BATCH` on scope exit — via `session.executeSuspend`
+(through `BatchEngine.executeBatchScopeSuspend`) in `batch { }`, so it does not block the coroutine's thread, and via a blocking
+`session.execute(batch)` in `batchBlocking { }`; both keep the shutdown gate, retry, and in-flight tracking. No cache
 invalidation happens for entities saved/deleted through a batch scope — batch collection bypasses
 the repositories' own `save`/`delete`, which are what call `cache.invalidate`.
 

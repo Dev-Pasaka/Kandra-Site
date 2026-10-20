@@ -1,7 +1,7 @@
 export const metadata = {
   title: "12. Testing",
   description:
-    "FakeKandraSession vs KandraTestcontainers — genuinely different tools for genuinely different jobs, including ISS-020's honest limits on what the fake can and can't exercise.",
+    "FakeKandraSession vs KandraTestcontainers — genuinely different tools for genuinely different jobs, including ISS-020's honest limits on what the fake can and can't prove.",
 };
 
 # 12. Testing
@@ -18,96 +18,70 @@ dependencies {
 }
 ```
 
-## `FakeKandraSession` — what it's actually for today
+## `FakeKandraSession` — structure, not outcomes
 
 `FakeKandraSession`'s own doc comment describes it as the way to "wire a full repository stack
 without Testcontainers" and assert on *structural* behavior — did a batch collect the right
-statements, is the shape right. Read literally, that sounds like exactly what you'd want for
-verifying [page 06](/tutorial/06-denormalization)'s `KandraBatchScope` call actually produces two
-`INSERT`s, or [page 07](/tutorial/07-concurrency)'s `update()` actually issues an
-`IF version = ?` clause.
+statements, is the shape right. That is exactly what you want for verifying
+[page 06](/tutorial/06-denormalization)'s `KandraBatchScope` call actually produces two `INSERT`s, or
+[page 07](/tutorial/07-concurrency)'s `update()` actually issues an `IF version = ?` clause: the real repository,
+`StatementBuilder` and `BatchEngine` code runs, and the statements it builds are captured.
 
-<Callout kind="gotcha" title="It doesn't currently do that — verified from source, not assumed">
-`FakeKandraSession.execute()` always returns an empty result set. Every statement-building path in
-`kandra-runtime` — `insertPrimary`, the versioned `UPDATE ... IF version = ?` builder, `counterUpdate`,
-`selectById`, all of it — calls `session.prepare(cql)` and then `.bind(...)` to produce the
-`BoundStatement` it actually executes. `FakePreparedStatement.bind(...)` **unconditionally
-throws** `UnsupportedOperationException`, regardless of how many arguments are passed. That's not
-limited to `repo.save()`/`repo.findById()` — `KandraBatchScope.saveInBatch()`'s internal
-`collectSave()` builds its statements through the exact same `StatementBuilder.insertPrimary(...)`
-call, so it hits the same `bind()` and throws too. There is currently no way to call
-`repo.save(entity)`, `repo.update(old, new)`, or `todoRepo.saveInBatch(todo)` inside a
-`runtime.batch { }` block against a `FakeKandraSession` and have it succeed — every one of them
-throws `UnsupportedOperationException: FakePreparedStatement.bind() not supported in
-FakeKandraSession.` This is tracked, deliberately, as
-[`ISS-020`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-020-fake-session-lwt-semantics.md)
-— a documented limitation, not a bug someone forgot to fix.
+<Callout kind="gotcha" title="What the fake cannot do — verified from source">
+`FakeKandraSession.execute()` always returns an empty result set with `wasApplied() == true`, and
+`FakeBoundStatement` does no CQL type encoding and stores no rows. So it can show you *what was built*, never what
+the database *did* with it. There is no seam to make an LWT appear to fail, so `saveIfNotExists() == false` and a
+`KandraOptimisticLockException` conflict — the two things page 07's whole optimistic-locking story depends on —
+cannot be produced through it. That is tracked, deliberately, as
+[`ISS-020`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/issues/ISS-020-fake-session-lwt-semantics.md) — a
+documented limitation, not a bug someone forgot to fix. ISS-020's own takeaway, stated plainly in the issue:
+*"don't read '43 unit tests passing' as evidence that LWT/optimistic-locking/collection mutation paths work —
+they are exercised for the first time by the Testcontainers suite."*
 </Callout>
 
-There's also no seam to make an LWT appear to fail: `FakeResultSet.wasApplied()` is hardcoded
-`true` with no override point. Even if `bind()` didn't throw, there is currently no way to make
-`FakeKandraSession` simulate `saveIfNotExists() == false` or a `KandraOptimisticLockException`
-conflict — the two things page 07's whole optimistic-locking story depends on. ISS-020's own
-takeaway, stated plainly in the issue: *"don't read '43 unit tests passing' as evidence that
-LWT/optimistic-locking/collection mutation paths work — they are exercised for the first time by
-the Testcontainers suite."*
+<Callout kind="note" title="Older versions threw here">
+Before 0.4.7 (GH #28 / ISS-040), `FakePreparedStatement.bind(...)` unconditionally threw `UnsupportedOperationException`, so
+any repository call failed immediately under `KandraTestUtils.inMemory(...)`. That is fixed; this page used to carry a
+test asserting the throw, which would now fail.
+</Callout>
 
-So what's the fake actually good for? Capturing a `BatchStatement` you build and execute yourself —
-`SimpleStatement`s don't need `prepare()`/`bind()`, so they work fine:
+So what is the fake good for? Asserting on the statements a repository call builds. `inMemory(...)` wires its own
+`FakeKandraSession` — read it back from `runtime.session`:
 
 ```kotlin
 import io.kandra.test.FakeKandraSession
-import com.datastax.oss.driver.api.core.cql.BatchStatement
-import com.datastax.oss.driver.api.core.cql.DefaultBatchType
-import com.datastax.oss.driver.api.core.cql.SimpleStatement
+import io.kandra.test.KandraTestUtils
+import com.datastax.oss.driver.api.core.cql.BoundStatement
+import io.kandra.core.SchemaRegistry
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.assertThrows
 
-class TodoBatchCaptureTest {
-
-    private val fakeSession = FakeKandraSession()
+class TodoSaveStructureTest {
 
     @AfterEach
-    fun tearDown() = fakeSession.reset()
+    fun tearDown() = SchemaRegistry.clear()   // schema registration is process-global
 
     @Test
-    fun `hand-built batch statements are captured for structural assertions`() {
-        val batch = BatchStatement.newInstance(DefaultBatchType.LOGGED)
-            .add(SimpleStatement.newInstance(
-                "INSERT INTO todos (owner_id, created_at, title) VALUES (?, ?, ?)",
-                UUID.randomUUID(), Instant.now(), "Ship the release"
-            ))
-            .add(SimpleStatement.newInstance(
-                "INSERT INTO todos_by_assignee (assignee_id, created_at, todo_id) VALUES (?, ?, ?)",
-                UUID.randomUUID(), Instant.now(), UUID.randomUUID()
-            ))
-
-        fakeSession.execute(batch)
-
-        assertEquals(1, fakeSession.capturedBatches().size)
-        assertEquals(2, fakeSession.capturedBatches().single().size)
-    }
-
-    @Test
-    fun `saveInBatch throws under FakeKandraSession — regression guard for ISS-020`() {
-        val runtime = io.kandra.test.KandraTestUtils.inMemory(Todo::class)
+    fun `save builds one LOGGED batch with the primary INSERT`() {
+        val runtime = KandraTestUtils.inMemory(Todo::class)
+        val session = runtime.session as FakeKandraSession
         val todoRepo = runtime.repository(Todo::class)
 
-        assertThrows<UnsupportedOperationException> {
-            todoRepo.save(Todo(UUID.randomUUID(), Instant.now(), UUID.randomUUID(), "x", null))
-        }
+        todoRepo.save(Todo(UUID.randomUUID(), Instant.now(), UUID.randomUUID(), "Ship the release", null))
+
+        val batch = session.capturedBatches().single()
+        val queries = batch.map { (it as BoundStatement).preparedStatement.query }
+        assertEquals(1, queries.size)
+        assertEquals(true, queries.single().startsWith("INSERT INTO todos "))
 
         runtime.close()
-        io.kandra.core.SchemaRegistry.clear()
     }
 }
 ```
 
-The second test isn't decoration — it's a live assertion that this limitation still holds on
-whatever Kandra version the build is pinned to. If a future Kandra release makes `FakeKandraSession`
-smarter, this test starts failing and tells you the limitation section above needs rewriting.
+The bound values themselves are available through `FakeBoundStatement.boundValues()`, but that class is `internal`
+to `kandra-test`, so from your own module assert on the public driver API as above.
 
 ## `KandraTestcontainers` — where LWT, atomicity, and soft-delete timing actually get exercised
 
@@ -240,18 +214,18 @@ class DenormalizedWriteAtomicityIntegrationTest {
 
 Both writes landing (or, if you kill the container mid-batch in a more elaborate failure-injection
 test, both **not** landing) is the actual atomicity guarantee `LOGGED BATCH` provides — and it's
-only observable against something that actually executes CQL. `FakeKandraSession` would need
-`bind()` to not throw just to get this far, which — per ISS-020, above — it currently doesn't.
+only observable against something that actually executes CQL. `FakeKandraSession` can
+show that the batch was built with both `INSERT`s, but it cannot show that the database applied them atomically — per ISS-020, above.
 
 ## The dividing line, stated plainly
 
 | Question | Tool |
 |---|---|
-| "Did my code call `saveInBatch` on the two repos I expected, in the right order?" (hand-built statements only) | `FakeKandraSession` |
+| "Did my code call `saveInBatch` on the two repos I expected, in the right order?" | `FakeKandraSession` |
 | "Does marking a todo done twice concurrently actually conflict?" | `KandraTestcontainers` |
 | "Does soft-deleting a todo leave it readable until the TTL, not gone immediately?" | `KandraTestcontainers` |
 | "Does the denormalized write from page 06 really land both rows atomically?" | `KandraTestcontainers` |
-| "Is this CQL string what I think it is?" | Either — `FakeKandraSession` is faster if you're not exercising real Kandra repository calls |
+| "Is this CQL string what I think it is?" | Either — `FakeKandraSession` is faster when you only need to see the statement, not its effect |
 
 Anything touching LWT, real row state after a write, or cross-table atomicity: reach for
 `KandraTestcontainers`. It's slower — the shared container's first access in a test run blocks on a
