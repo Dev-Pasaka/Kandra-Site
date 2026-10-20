@@ -79,6 +79,7 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import java.time.Instant
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 
 fun Route.todoRoutes() {
@@ -90,7 +91,7 @@ fun Route.todoRoutes() {
 
         val todo = Todo(
             ownerId = ownerId,
-            createdAt = Instant.now(),
+            createdAt = Instant.now().truncatedTo(ChronoUnit.MILLIS),
             todoId = UUID.randomUUID(),
             title = req.title,
             assigneeId = req.assigneeId,
@@ -143,10 +144,18 @@ private suspend fun ApplicationCall.ownerIdOrRespondBadRequest(): UUID? {
 
 ## `POST /todos` — create
 
-Ordinary `save()` — no `@LookupIndex`, no batch, nothing exotic. `createdAt = Instant.now()` is set
+Ordinary `save()` — no `@LookupIndex`, no batch, nothing exotic. `createdAt = Instant.now().truncatedTo(ChronoUnit.MILLIS)` is set
 right here, once, by application code, per [page 03](/tutorial/03-entities)'s resolution: this is the
 value that becomes the row's clustering key, and it's the same value the response body hands back to
 the caller so they can address this exact todo later.
+
+<Callout kind="gotcha" title="Truncate to milliseconds — Cassandra's timestamp does">
+`Instant.now()` has microsecond precision on most JVMs, but a CQL `timestamp` stores milliseconds. If you hand the caller the untruncated value, the
+row still resolves (the codec truncates on the way in), but anything keyed on the *caller-supplied* `Instant` no longer matches the entity read back
+from the database — most visibly the `@CacheResult` cache that `findById` fills (page 10): `update()` invalidates by the stored millisecond key, so
+the stale cached entry survives and the next optimistic-locked update fails with a spurious `409`. Truncating once, where the todo is created, avoids
+that class of bug entirely.
+</Callout>
 
 ## `GET /todos/mine` — the cheapest read this app has
 

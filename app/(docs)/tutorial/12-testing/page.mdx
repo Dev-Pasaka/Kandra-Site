@@ -15,7 +15,12 @@ a green test that never actually exercised the behavior you think it did.
 dependencies {
     testImplementation("com.kandraorm.kandra:kandra-test:__KANDRA_VERSION__")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")          // kandra-test doesn't bring JUnit
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testImplementation("com.datastax.oss:java-driver-core:4.17.0")        // FakeKandraSession/CqlSession appear in your test code
 }
+
+tasks.test { useJUnitPlatform() }
 ```
 
 ## `FakeKandraSession` — structure, not outcomes
@@ -52,11 +57,13 @@ So what is the fake good for? Asserting on the statements a repository call buil
 import io.kandra.test.FakeKandraSession
 import io.kandra.test.KandraTestUtils
 import com.datastax.oss.driver.api.core.cql.BoundStatement
+import io.kandra.core.InternalKandraApi
 import io.kandra.core.SchemaRegistry
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.assertEquals
 
+@OptIn(InternalKandraApi::class)   // io.kandra.core.InternalKandraApi — SchemaRegistry is an internal API
 class TodoSaveStructureTest {
 
     @AfterEach
@@ -92,8 +99,8 @@ semantics: real `IF version = ?` LWT evaluation, real `LOGGED BATCH` atomicity, 
 
 ```kotlin title="build.gradle.kts"
 dependencies {
-    testImplementation("org.testcontainers:cassandra:1.20.4")
-    testImplementation("org.testcontainers:junit-jupiter:1.20.4")
+    testImplementation("org.testcontainers:cassandra:1.21.4")
+    testImplementation("org.testcontainers:junit-jupiter:1.21.4")
 }
 ```
 

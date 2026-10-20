@@ -167,7 +167,7 @@ fun Route.todoRoutes() {
         val ownerId = call.ownerIdOrRespondBadRequest() ?: return@post
         val req = call.receive<CreateTodoRequest>()
         val todo = Todo(
-            ownerId = ownerId, createdAt = Instant.now(), todoId = UUID.randomUUID(),
+            ownerId = ownerId, createdAt = Instant.now().truncatedTo(ChronoUnit.MILLIS), todoId = UUID.randomUUID(),
             title = req.title, assigneeId = req.assigneeId,
         )
 
@@ -196,6 +196,17 @@ fun Route.todoRoutes() {
         call.respond(TodoByAssigneePage(page.items, page.nextPageToken, page.hasMore))
     }
 }
+```
+
+`TodoByAssigneePage` is the same shape as page 05's `TodoPage`, for the denormalized rows — add it next to `TodoPage` in `routes/TodoDtos.kt`:
+
+```kotlin title="routes/TodoDtos.kt"
+@Serializable
+data class TodoByAssigneePage(
+    val items: List<com.example.todos.model.TodoByAssignee>,
+    val nextPageToken: String?,
+    val hasMore: Boolean,
+)
 ```
 
 <Callout kind="danger" title="application.kandra.batch { }, saveInBatch — the exact shape, verified">

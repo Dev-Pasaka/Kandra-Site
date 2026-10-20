@@ -149,7 +149,7 @@ until a lookup came back empty.
 </Callout>
 
 So `Todo` sets `createdAt` itself, once, explicitly, before calling `save()` — normally
-`Instant.now()` at the point a todo is created — and that exact value is threaded through every
+`Instant.now().truncatedTo(ChronoUnit.MILLIS)` at the point a todo is created (CQL `timestamp` is millisecond precision; page 05 explains what goes wrong if you skip the truncation) — and that exact value is threaded through every
 subsequent read, write, and route parameter for that row. `@CreatedAt` stays off `Todo` entirely.
 This is the resolution the rest of this tutorial builds on: **`Todo.createdAt` carries
 `@ClusteringKey(order = ClusteringOrder.DESC)` only, has no default value, and is always supplied by

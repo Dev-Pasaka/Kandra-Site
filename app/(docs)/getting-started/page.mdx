@@ -131,6 +131,7 @@ fun Application.module() {
         keyspace = "quickstart"
         localDatacenter = "datacenter1"
         autoCreateKeyspace = true
+        replicationStrategy = ReplicationStrategy.SimpleStrategy(replicationFactor = 1, disableTablets = true)   // see the note below
         schemaMode = SchemaMode.AUTO_CREATE
         register(User::class)
         auth { provider = KandraAuth.static("cassandra", "cassandra") } // local dev only, see below
@@ -142,6 +143,14 @@ fun Application.module() {
 `schemaMode = SchemaMode.AUTO_CREATE` runs `CREATE TABLE IF NOT EXISTS` for every registered
 entity at startup — right for a quickstart, not what you'd run in a production deploy pipeline (see
 [`/philosophy/schema-safety`](/philosophy/schema-safety)).
+
+<Callout kind="gotcha" title="`disableTablets = true` — current ScyllaDB images need it for SimpleStrategy">
+`scylladb/scylla:latest` creates new keyspaces with **tablets** enabled, and a tablets keyspace cannot use `SimpleStrategy`. Without the
+`replicationStrategy` line above, this app fails at startup with `InvalidConfigurationInQueryException: SimpleStrategy doesn't support
+tablet replication` while it tries to `CREATE KEYSPACE`. `disableTablets = true` appends `AND tablets = {'enabled': false}` to that statement.
+It is ScyllaDB-only (Cassandra rejects the option) and is for local single-node dev; a real cluster should provision its keyspace ahead of
+time or use `NetworkTopologyStrategy`, which needs no flag.
+</Callout>
 
 <Callout kind="gotcha" title="The auth block isn't optional, even for an unauthenticated local cluster">
 `AuthConfig.provider` defaults to `KandraAuth.fromEnv()`, and `install(Kandra)` calls it
