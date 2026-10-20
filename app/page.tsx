@@ -248,7 +248,7 @@ export default function HomePage() {
           </a>
         </div>
         <ul className="mt-8 flex flex-wrap items-center justify-center gap-y-2 text-sm text-ink-muted">
-          {["Kotlin 2.1+", "ScyllaDB", "Cassandra", "Ktor plugin", "Maven Central", "Apache 2.0"].map((t, i) => (
+          {["Kotlin 2.3+", "ScyllaDB", "Cassandra", "Ktor plugin", "Maven Central", "Apache 2.0"].map((t, i) => (
             <li key={t} className="inline-flex items-center">
               {i > 0 && <span aria-hidden="true" className="mx-3 text-ink-faint">&middot;</span>}
               {t}
@@ -460,7 +460,7 @@ export default function HomePage() {
                 <span className="text-ink-faint select-none">$ </span>
                 {`./gradlew dependencies | grep kandra`}
                 {"\n"}
-                <span className="text-ink-muted">{`+--- ke.co.coinx.kandra:kandra-runtime:${KANDRA_VERSION}`}</span>
+                <span className="text-ink-muted">{`+--- com.kandraorm.kandra:kandra-runtime:${KANDRA_VERSION}`}</span>
               </code>
             </pre>
           </div>

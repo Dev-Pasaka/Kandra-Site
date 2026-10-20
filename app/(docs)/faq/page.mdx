@@ -149,17 +149,16 @@ to cover, and not yet claimed as production-proven by any named adopter.
 
 ## What Kotlin/JVM/Ktor versions does this need?
 
-Per `gradle.properties` and `docs/USER_GUIDE.md` (current as of v0.4.5):
+Per `gradle.properties` and `docs/USER_GUIDE.md` (current as of v0.5.0):
 
-- Kotlin **2.1.21** (pinned deliberately — Kotlin 2.0.0 has a parser bug against Java 25 in
-  Gradle's embedded compiler)
+- Kotlin **2.3.21** (Ktor 3.6 is compiled with Kotlin 2.3 metadata, so consumers need Kotlin 2.3+)
 - Build/run with **JDK 21** — the default JDK 25 breaks the Kotlin compiler embedded in Gradle
   8.11 for this project; `README.md` calls this out explicitly (`JAVA_HOME=<jdk-21-path>`)
-- Ktor **2.3.13**
+- Ktor **3.6.0** (CI also runs 3.5.2 and the latest 3.x; Ktor 2.x is not supported since 0.5.0)
 - DataStax Java Driver **4.17.0**
 - Gradle **8.11** (per `gradle.properties`; the project's own real-cluster test report notes the
   actual wrapper it ran with was 9.3.0 — a known, low-severity doc/config drift, not a Kandra bug)
-- KSP **2.1.21-2.0.1** (for `kandra-codegen`)
+- KSP **2.3.12** (for `kandra-codegen`)
 
 ## How do I adopt Kandra on an existing Cassandra/ScyllaDB app incrementally?
 

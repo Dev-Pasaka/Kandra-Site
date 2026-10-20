@@ -45,9 +45,9 @@ const STALE_PATTERNS = [
   },
   {
     name: "hand-hardcoded dependency version",
-    regex: /ke\.co\.coinx\.kandra:[\w-]+:\d+\.\d+\.\d+/,
+    regex: /com\.kandraorm\.kandra:[\w-]+:\d+\.\d+\.\d+/,
     message:
-      "Found a literal version number on a ke.co.coinx.kandra:* dependency coordinate. Dependency " +
+      "Found a literal version number on a com.kandraorm.kandra:* dependency coordinate. Dependency " +
       "snippets should use the __KANDRA_VERSION__ placeholder (substituted at build time from " +
       "lib/site-config.ts by lib/remark-kandra-version.mjs), not a hand-typed version string.",
   },

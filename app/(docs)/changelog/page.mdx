@@ -13,6 +13,54 @@ file per version, newest first. Every fix here links to the `docs/issues/ISS-NNN
 the actual root cause — this page summarizes, it doesn't replace those. See
 [`/battle-scars`](/battle-scars) for the narrative version of the bugs below.
 
+## 0.5.0
+
+Released 2026-10-20. Multi-keyspace support, a move to Ktor 3 / Kotlin 2.3, and a new Maven group. Full
+upstream entry: [`docs/changelog/0.5.0.md`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/changelog/0.5.0.md).
+
+### Breaking or behavior-changing
+
+- **Maven group moved** from `ke.co.coinx.kandra` to `com.kandraorm.kandra`. Update your dependency
+  declarations; Kotlin packages (`io.kandra.*`) and APIs are unchanged. Versions up to 0.4.7 stay on Maven
+  Central under the old group.
+- **Ktor 3.6 / Kotlin 2.3.** Built and tested against Ktor 3.6.0, Kotlin 2.3.21, Koin 4.2.2 and Kodein 7.33.0.
+  **Ktor 2.x is no longer supported** and consumers need Kotlin 2.3+. CI also runs the Ktor-facing modules
+  against Ktor 3.5.2 and the latest 3.x ([#160](https://github.com/Dev-Pasaka/kandra/issues/160)). Ktor 4.x is
+  not covered.
+
+### Added
+
+- **Multiple keyspaces.** `@ScyllaTable(keyspace = "")` puts an entity in a keyspace; `keyspace("name") { }` in
+  `install(Kandra)` declares extra keyspaces on the same session. DDL, permission checks, locks and
+  migrations run per keyspace, and runtime CQL is keyspace-qualified. See
+  [`/recipes/multiple-keyspaces`](/recipes/multiple-keyspaces).
+- `KandraMigrationRunner(session, staleClaimThreshold, keyspace)` and `KandraMigration.up(session, keyspace)`.
+- `ReplicationStrategy.SimpleStrategy(replicationFactor, disableTablets = false)`: opt-in
+  `AND tablets = {'enabled': false}` so `SimpleStrategy` works on tablets-enabled ScyllaDB.
+- `kandra-test`: `KandraTestBackend` (`KANDRA_TEST_BACKEND=docker|cloud`) and `KandraCloud`, an env-driven
+  live-cluster harness. Cloud tests skip when unconfigured.
+- The Koin/Kodein same-simple-name collision error lists each class with its `[keyspace: X]`.
+
+## 0.4.8
+
+Released 2026-10-15. Five fixes ([#152](https://github.com/Dev-Pasaka/kandra/issues/152)–[#156](https://github.com/Dev-Pasaka/kandra/issues/156)),
+all found by verifying the freshly published 0.4.7 artifacts against this site's quickstart. Full upstream
+entry: [`docs/changelog/0.4.8.md`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/changelog/0.4.8.md).
+
+### Fixed
+
+- Integration modules exposed `kandra-core`/`kandra-runtime` at `runtime` scope, so depending on `kandra-ktor`
+  alone couldn't compile against `io.kandra.core.annotations.*`. They are now `api` dependencies
+  ([#152](https://github.com/Dev-Pasaka/kandra/issues/152)).
+- `@SoftDelete`'s marker write left a permanent key+marker husk row; added `markerTtlSeconds` and wrote the
+  marker as an `INSERT` under that TTL ([#154](https://github.com/Dev-Pasaka/kandra/issues/154)).
+- `@SoftDelete` reads threw once a deleted row's TTL expired when a property was non-nullable; registration
+  now rejects such an entity up front ([#153](https://github.com/Dev-Pasaka/kandra/issues/153)).
+- `kandra-codegen` emitted an invalid empty `package` line for entities in the default package
+  ([#156](https://github.com/Dev-Pasaka/kandra/issues/156)).
+- Documented the supported Ktor range ([#155](https://github.com/Dev-Pasaka/kandra/issues/155)); superseded
+  by the Ktor 3 move in 0.5.0.
+
 ## 0.4.7
 
 Released 2026-10-12. No version was cut between 0.4.6 (2026-07-23) and this release, so it

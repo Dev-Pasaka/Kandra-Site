@@ -35,9 +35,9 @@ docker compose up -d
 
 ```kotlin title="build.gradle.kts"
 plugins {
-    kotlin("jvm") version "2.1.21"
-    kotlin("plugin.serialization") version "2.1.21"
-    id("com.google.devtools.ksp") version "2.1.21-2.0.1"
+    kotlin("jvm") version "2.3.21"
+    kotlin("plugin.serialization") version "2.3.21"
+    id("com.google.devtools.ksp") version "2.3.12"
     application
 }
 
@@ -50,16 +50,16 @@ repositories {
 }
 
 dependencies {
-    val kandraBom = platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__")
+    val kandraBom = platform("com.kandraorm.kandra:kandra-bom:__KANDRA_VERSION__")
     implementation(kandraBom)
     ksp(kandraBom)
-    implementation("ke.co.coinx.kandra:kandra-ktor")
-    ksp("ke.co.coinx.kandra:kandra-codegen")
+    implementation("com.kandraorm.kandra:kandra-ktor")
+    ksp("com.kandraorm.kandra:kandra-codegen")
 
-    implementation("io.ktor:ktor-server-core:2.3.13")
-    implementation("io.ktor:ktor-server-netty:2.3.13")
-    implementation("io.ktor:ktor-server-content-negotiation:2.3.13")
-    implementation("io.ktor:ktor-serialization-kotlinx-json:2.3.13")
+    implementation("io.ktor:ktor-server-core:3.6.0")
+    implementation("io.ktor:ktor-server-netty:3.6.0")
+    implementation("io.ktor:ktor-server-content-negotiation:3.6.0")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.6.0")
     implementation("org.slf4j:slf4j-simple:2.0.9")
 }
 ```
@@ -74,8 +74,10 @@ dependencies {
   [kandra#152](https://github.com/Dev-Pasaka/kandra/issues/152) if you're pinned to an older one.
 - **`kandra-codegen`** runs at build time through KSP and generates a type-safe `UserTable` for the
   query DSL.
-- **Ktor 2.3.x.** Kandra is built and tested against Ktor 2.3. Ktor 3 hasn't been tested with it yet
-  ([kandra#160](https://github.com/Dev-Pasaka/kandra/issues/160) tracks real CI coverage for 3.x).
+- **Ktor 3.x and Kotlin 2.3+.** Since 0.5.0 Kandra is built and tested against Ktor 3.6, and CI also runs
+  the Ktor-facing modules against Ktor 3.5.2 and the latest published 3.x
+  ([kandra#160](https://github.com/Dev-Pasaka/kandra/issues/160)). Ktor 2.x is no longer supported; if
+  you're on it, stay on Kandra 0.4.x (group `ke.co.coinx.kandra`).
 
 [`/tutorial/02-project-setup`](/tutorial/02-project-setup) explains each dependency in depth,
 including the dependency-injection modules (`kandra-koin`, `kandra-kodein`).

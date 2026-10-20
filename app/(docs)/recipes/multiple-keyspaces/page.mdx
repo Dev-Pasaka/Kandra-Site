@@ -1,0 +1,96 @@
+export const metadata = {
+  title: "Recipe: multiple keyspaces",
+  description:
+    "One install(Kandra) and one CqlSession serving many keyspaces: @ScyllaTable(keyspace), keyspace(\"x\") { } declarations, startup errors, per-keyspace migrations, and SimpleStrategy on tablets-enabled ScyllaDB.",
+};
+
+# Recipe: multiple keyspaces
+
+**Problem:** your app is split into feature modules (billing, archive, core) and each should own its tables
+in its own keyspace, but you don't want a `CqlSession` and connection pool per keyspace. Since **0.5.0**,
+one `install(Kandra)` and one session can serve many keyspaces.
+
+## The scenario
+
+A `core` keyspace for users and a `billing` keyspace for invoices, in the same Ktor app.
+
+**1. Put the keyspace on the entity.** It is a compile-time property of the entity, the single source of
+truth for which keyspace a table lives in. Blank (the default) means the plugin's default keyspace.
+
+```kotlin title="Invoice.kt"
+import io.kandra.core.annotations.*
+import java.util.UUID
+
+@ScyllaTable(name = "invoices", keyspace = "billing")
+data class Invoice(@PartitionKey val id: UUID, val total: Long)
+```
+
+**2. Declare the extra keyspaces in the plugin.** `keyspace("x") { }` carries settings only; entities are
+never populated through it.
+
+```kotlin title="Application.kt"
+install(Kandra) {
+    keyspace = "core"                       // default keyspace (unchanged)
+    keyspace("billing") {                   // extra keyspace: settings only
+        autoCreate = true
+        replicationStrategy = ReplicationStrategy.SimpleStrategy(3)
+    }
+    register(User::class, Invoice::class)   // Invoice is @ScyllaTable(keyspace = "billing")
+}
+```
+
+Kandra then emits keyspace-qualified CQL (`billing.invoices`) for `Invoice`, and unqualified CQL for
+entities without a keyspace, byte-for-byte the same as before 0.5.0. Lookup tables inherit their parent's
+keyspace, and metrics and debug-log labels use the qualified table name.
+
+## What happens at startup
+
+- Keyspace creation, permission validation, and DDL for `AUTO_CREATE` / `AUTO_MIGRATE` / `VALIDATE` run **per
+  keyspace**. The default keyspace keeps its original DDL lock table; each extra keyspace gets its own
+  `<ks>.kandra_ddl_locks`.
+- An entity naming a keyspace that is neither the default nor declared with `keyspace("x") { }` throws
+  `KandraSchemaException` before any connection is attempted. The message names the entity, the keyspace,
+  and the declared keyspaces.
+- Keyspace names must be valid CQL identifiers, unique, and different from the default (case-insensitive).
+  `kandra-codegen` rejects a bad name at build time.
+- A blank default `keyspace = ""` is allowed **only** when at least one `keyspace("x") { }` is declared, and
+  then every entity must name a declared keyspace. A `keyspace("x") { }` block with no `replicationStrategy`
+  inherits the plugin-level one.
+
+## Migrations are per keyspace
+
+`kandra_migrations` and its locks live in each keyspace. Pass the keyspace when you run them:
+
+```kotlin
+KandraMigrationRunner(session, staleClaimThreshold, keyspace = "billing")
+KandraMigration.up(session, "billing")   // up(session) still targets the default keyspace
+```
+
+See [`/recipes/migrations`](/recipes/migrations) for the migration model itself.
+
+## DI modules
+
+`kandra-koin` and `kandra-kodein` still bind per entity. If two entities in different keyspaces share a
+simple class name, startup fails, and the error now lists each class with its `[keyspace: X]` so you can see
+which two collide.
+
+## Tablets-enabled ScyllaDB (Scylla Cloud)
+
+Clusters with tablets enabled reject `SimpleStrategy` keyspaces (`SimpleStrategy doesn't support tablet
+replication`). Opt in per keyspace:
+
+```kotlin
+replicationStrategy = ReplicationStrategy.SimpleStrategy(3, disableTablets = true)
+```
+
+Kandra then appends `AND tablets = {'enabled': false}` to `CREATE KEYSPACE`. It works for the default and
+extra keyspaces, and the default is `false` (DDL unchanged). It is ScyllaDB only; Apache Cassandra rejects
+the `tablets` option. `NetworkTopologyStrategy` works with tablets and needs no flag. Clusters configured
+with `tablets_mode_for_new_keyspaces: enforced` reject `SimpleStrategy` even with the flag, so use
+`NetworkTopologyStrategy` there.
+
+## Not supported
+
+- Choosing the keyspace at runtime, per call, or per tenant. The keyspace is fixed on the entity.
+- A dedicated cross-keyspace batch API. A `batch { }` that mixes keyspaces works, with the usual logged-batch
+  cost.

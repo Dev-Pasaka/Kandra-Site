@@ -17,9 +17,9 @@ Package root for everything from here on: `com.example.todos`.
 
 ```kotlin title="build.gradle.kts"
 plugins {
-    kotlin("jvm") version "2.1.21"
-    kotlin("plugin.serialization") version "2.1.21"
-    id("com.google.devtools.ksp") version "2.1.21-2.0.1"
+    kotlin("jvm") version "2.3.21"
+    kotlin("plugin.serialization") version "2.3.21"
+    id("com.google.devtools.ksp") version "2.3.12"
     application
 }
 
@@ -33,26 +33,26 @@ repositories {
 
 dependencies {
     // Kandra
-    val kandraBom = platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__")
+    val kandraBom = platform("com.kandraorm.kandra:kandra-bom:__KANDRA_VERSION__")
     implementation(kandraBom)
     ksp(kandraBom)
-    implementation("ke.co.coinx.kandra:kandra-ktor")
-    implementation("ke.co.coinx.kandra:kandra-koin")
-    ksp("ke.co.coinx.kandra:kandra-codegen")
-    testImplementation("ke.co.coinx.kandra:kandra-test")
+    implementation("com.kandraorm.kandra:kandra-ktor")
+    implementation("com.kandraorm.kandra:kandra-koin")
+    ksp("com.kandraorm.kandra:kandra-codegen")
+    testImplementation("com.kandraorm.kandra:kandra-test")
 
     // Koin's Ktor plugin, used directly in Application.kt (page 04)
-    implementation("io.insert-koin:koin-ktor:3.5.6")
+    implementation("io.insert-koin:koin-ktor:4.2.2")
 
     // Caffeine — see the note below on why this is split runtimeOnly/testImplementation
     runtimeOnly("com.github.ben-manes.caffeine:caffeine:3.1.8")
     testImplementation("com.github.ben-manes.caffeine:caffeine:3.1.8")
 
     // Ktor server
-    implementation("io.ktor:ktor-server-core:2.3.13")
-    implementation("io.ktor:ktor-server-netty:2.3.13")
-    implementation("io.ktor:ktor-server-content-negotiation:2.3.13")
-    implementation("io.ktor:ktor-serialization-kotlinx-json:2.3.13")
+    implementation("io.ktor:ktor-server-core:3.6.0")
+    implementation("io.ktor:ktor-server-netty:3.6.0")
+    implementation("io.ktor:ktor-server-content-negotiation:3.6.0")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.6.0")
 
     // Logging
     implementation("io.github.oshai:kotlin-logging-jvm:6.0.9")
@@ -61,25 +61,26 @@ dependencies {
 ```
 
 <Callout kind="note">
-Kotlin/KSP versions here (`2.1.21` / `2.1.21-2.0.1`) match what Kandra itself is built and tested
+Kotlin/KSP versions here (`2.3.21` / `2.3.12`) match what Kandra itself is built and tested
 against. KSP processor versions are tied tightly to the Kotlin compiler version that built them —
 mismatch them and you get a cryptic KSP resolution failure at build time, not a clear "wrong
 version" error. Pinning to the same numbers Kandra ships with is the least-surprising choice.
 
-The same goes for Ktor and the JDK: Kandra is built and tested against Ktor 2.3 and compiled for
-Java 21, so you need JDK 21 or newer. Ktor 3 hasn't been tested with Kandra yet
-([kandra#155](https://github.com/Dev-Pasaka/kandra/issues/155)), so stay on 2.3.x for now.
+The same goes for Ktor and the JDK: Kandra is built and tested against Ktor 3.6 (Ktor 2.x is no
+longer supported, [kandra#160](https://github.com/Dev-Pasaka/kandra/issues/160)) and compiled for
+Java 21, so you need JDK 21 or newer. Ktor 3.6 itself is compiled with Kotlin 2.3, so your project
+needs Kotlin 2.3 or newer.
 </Callout>
 
 ### `kandra-bom` — one version string, not five
 
 ```kotlin
-val kandraBom = platform("ke.co.coinx.kandra:kandra-bom:__KANDRA_VERSION__")
+val kandraBom = platform("com.kandraorm.kandra:kandra-bom:__KANDRA_VERSION__")
 implementation(kandraBom)
 ksp(kandraBom)
 ```
 
-Every other `ke.co.coinx.kandra:*` dependency below omits its version entirely. The BOM
+Every other `com.kandraorm.kandra:*` dependency below omits its version entirely. The BOM
 (`java-platform`) pins all of them to v{KANDRA_VERSION} as version *constraints*, so every Kandra
 module is guaranteed to come from the same release without you repeating the version string and
 risking one of them drifting out of sync on the next upgrade.
@@ -87,7 +88,7 @@ risking one of them drifting out of sync on the next upgrade.
 A platform only applies to the Gradle configuration you add it to. `implementation(kandraBom)`
 covers the `implementation` and `testImplementation` lines, but `kandra-codegen` is resolved through
 the separate `ksp` configuration, so the BOM is added there too. Without `ksp(kandraBom)`, the
-build fails with `Could not find ke.co.coinx.kandra:kandra-codegen:.`. This is the same
+build fails with `Could not find com.kandraorm.kandra:kandra-codegen:.`. This is the same
 pattern as Spring Boot's BOM or the Kotlin BOM — nothing Kandra-specific about the mechanism, just
 applied to Kandra's own module set.
 
@@ -124,7 +125,7 @@ this tutorial don't change, only the wiring in [page 04](/tutorial/04-plugin-ins
 ### `kandra-codegen` (via `ksp`) — type-safe `*Table` references
 
 ```kotlin
-ksp("ke.co.coinx.kandra:kandra-codegen")
+ksp("com.kandraorm.kandra:kandra-codegen")
 ```
 
 This is a KSP `SymbolProcessor` that scans for `@ScyllaTable`-annotated classes at compile time and
@@ -140,7 +141,7 @@ no column-name typo reaching a live query — depends on this codegen step runni
 ### `kandra-test` — test-only
 
 ```kotlin
-testImplementation("ke.co.coinx.kandra:kandra-test")
+testImplementation("com.kandraorm.kandra:kandra-test")
 ```
 
 Ships `FakeKandraSession` (a fast, in-process fake for the CQL session — useful for checking what
@@ -170,7 +171,7 @@ don't silently no-op either) so it's already in place when page 10 turns the ann
 
 ### Ktor server dependencies
 
-Standard Ktor 2.3.13 server pieces, nothing Kandra-specific: `ktor-server-core` +
+Standard Ktor 3.6.0 server pieces, nothing Kandra-specific: `ktor-server-core` +
 `ktor-server-netty` for the HTTP server itself, `ktor-server-content-negotiation` +
 `ktor-serialization-kotlinx-json` so route handlers can `call.receive<CreateTodoRequest>()` and
 `call.respond(todo)` as JSON without hand-rolling serialization.

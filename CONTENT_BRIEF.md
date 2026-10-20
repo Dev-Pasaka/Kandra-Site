@@ -25,7 +25,7 @@ Primary sources, in order of trust:
 5. `docs/changelog/*.md`, `docs/history/*.md`, `docs/test-plan*/`
 
 Known facts already verified this session (reuse, don't re-derive):
-- Current version: **0.4.5** (`gradle.properties`). Maven coordinates use groupId `ke.co.coinx.kandra`;
+- Current version: **0.5.0** (`gradle.properties`; always re-check the latest tag). Maven coordinates use groupId `com.kandraorm.kandra`;
   Kotlin package namespace is `io.kandra.*` — these are genuinely different strings, both correct.
 - Query DSL has no `+` prefix: `UserTable.email eq "x"`.
 - `KandraBatchScope` methods: `saveInBatch`, `deleteInBatch`, `saveIfNotExistsInBatch` (not

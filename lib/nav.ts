@@ -59,6 +59,7 @@ export const RECIPE_PAGES: NavItem[] = [
   { title: "Caching", href: "/recipes/caching" },
   { title: "Migrations", href: "/recipes/migrations" },
   { title: "Multi-DC deployment", href: "/recipes/multi-dc-deployment" },
+  { title: "Multiple keyspaces", href: "/recipes/multiple-keyspaces" },
   { title: "Social feed capstone", href: "/recipes/social-feed-capstone" },
 ];
 

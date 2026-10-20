@@ -1,7 +1,7 @@
 export const metadata = {
   title: "Recipes",
   description:
-    "Task-oriented, worked examples for real problems — lookup tables, time-series, soft delete, counters, optimistic locking, multi-table writes, caching, migrations, multi-DC, and a full social-feed capstone.",
+    "Task-oriented, worked examples for real problems — lookup tables, time-series, soft delete, counters, optimistic locking, multi-table writes, caching, migrations, multi-DC, multiple keyspaces, and a full social-feed capstone.",
 };
 
 # Recipes
@@ -27,6 +27,7 @@ have — they assume the partition/clustering-key mental model, not a relational
 | [Caching](/recipes/caching) | You need a hot `findById` path to stop hitting ScyllaDB on every request — `@CacheResult`, Caffeine's `compileOnly` split, and a real bug where cache invalidation silently missed every clustering-keyed entity. |
 | [Migrations](/recipes/migrations) | You need versioned, safe schema changes instead of `AUTO_CREATE` in production — `kandra-migrate`, a checksum that actually detects an edited migration, and claim-first LWT locking so two starting instances can't double-apply one. |
 | [Multi-DC deployment](/recipes/multi-dc-deployment) | You're running across more than one datacenter and need to decide, concretely, how reads/writes/failover behave — a full `KandraConfig` walkthrough, the consistency resolution order, and the `LOCAL_SERIAL`-vs-`SERIAL` footgun. |
+| [Multiple keyspaces](/recipes/multiple-keyspaces) | Several feature modules need their own keyspace but should share one `install(Kandra)` and one connection pool — `@ScyllaTable(keyspace = ...)`, `keyspace("x") { }`, per-keyspace migrations and DDL locks, and the opt-in for `SimpleStrategy` on tablets-enabled ScyllaDB. |
 | [Social feed capstone](/recipes/social-feed-capstone) | You want to see it all composed into one real app — posts, tags, likes, pagination, soft delete, built and run against a live 3-node cluster, bugs and all, honestly reported. |
 
 <Callout kind="tip">
