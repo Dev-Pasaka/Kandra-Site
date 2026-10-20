@@ -13,6 +13,27 @@ file per version, newest first. Every fix here links to the `docs/issues/ISS-NNN
 the actual root cause — this page summarizes, it doesn't replace those. See
 [`/battle-scars`](/battle-scars) for the narrative version of the bugs below.
 
+## 0.5.1
+
+Released 2026-10-20. A cache-invalidation fix and `kandra-test` usability improvements; a drop-in upgrade from 0.5.0. Full upstream entry:
+[`docs/changelog/0.5.1.md`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/changelog/0.5.1.md).
+
+### Fixed
+
+- **`@CacheResult` invalidation with microsecond `Instant` keys** ([#178](https://github.com/Dev-Pasaka/kandra/issues/178)). `findById` cached under the caller's untruncated `Instant`
+  while `save`/`update`/`delete` invalidated under the millisecond value read back from the database, so the stale entity — with its old `@Version` — survived and the next
+  optimistic-locked `update()` failed with a spurious `KandraOptimisticLockException`. `KandraCache` now normalizes keys on read, write and invalidate.
+
+### Changed — `kandra-test`
+
+- The DataStax driver is an `api` dependency of `kandra-test`, `kandra-runtime` and `kandra-ktor`
+  ([#179](https://github.com/Dev-Pasaka/kandra/issues/179)).
+- `KandraTestUtils.reset()` / `KandraRuntime.closeAndReset()` clear the schema registry without `@OptIn(InternalKandraApi::class)`
+  ([#180](https://github.com/Dev-Pasaka/kandra/issues/180)).
+- `FakeKandraSession.capturedStatementViews()` / `capturedBatchViews()` expose each statement's CQL and bound values, including unset-vs-`null`
+  ([#181](https://github.com/Dev-Pasaka/kandra/issues/181)).
+- `KandraTestcontainers.newContainerSession(keyspace)`: a Docker-only session with 30 s timeouts, used by the multi-keyspace tests instead of a bare `CqlSession.builder()`.
+
 ## 0.5.0
 
 Released 2026-10-20. Multi-keyspace support, a move to Ktor 3 / Kotlin 2.3, and a new Maven group. Full

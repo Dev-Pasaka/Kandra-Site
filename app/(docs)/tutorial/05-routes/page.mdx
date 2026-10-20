@@ -157,10 +157,11 @@ the stale cached entry survives and the next optimistic-locked update fails with
 that class of bug entirely.
 </Callout>
 
-<Unreleased issues={[178]}>
-The cache now normalizes `Instant` keys to milliseconds itself, so the stale-entry problem above is fixed on `main`. Truncating where the todo is created
-is still the cleaner habit, since the value you return to clients then matches what is stored.
-</Unreleased>
+<Callout kind="note" title="Fixed in 0.5.1">
+From 0.5.1 the cache normalizes `Instant` keys to milliseconds itself ([#178](https://github.com/Dev-Pasaka/kandra/issues/178)), so the stale-entry problem above
+no longer occurs. On 0.5.0 and earlier, truncating is required. Truncating where the todo is created is still the cleaner habit, since the value you return
+to clients then matches what is stored.
+</Callout>
 
 ## `GET /todos/mine` — the cheapest read this app has
 

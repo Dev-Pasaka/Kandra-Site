@@ -17,17 +17,17 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")          // kandra-test doesn't bring JUnit
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    testImplementation("com.datastax.oss:java-driver-core:4.17.0")        // FakeKandraSession/CqlSession appear in your test code
 }
 
 tasks.test { useJUnitPlatform() }
 ```
 
-<Unreleased issues={[179, 180, 181]}>
-On `main`, `kandra-test` brings the DataStax driver along (so the `java-driver-core` line above is unnecessary), `KandraTestUtils.reset()` replaces
-`SchemaRegistry.clear()` (no `@OptIn(InternalKandraApi::class)` needed), and `FakeKandraSession.capturedBatchViews()` returns each statement's CQL and bound
-values as a public `CapturedStatement`. This page documents v0.5.0, where the lines above are still required.
-</Unreleased>
+<Callout kind="note" title="On 0.5.0 and earlier">
+Since 0.5.1 `kandra-test` brings the DataStax driver along, `KandraTestUtils.reset()` replaces `SchemaRegistry.clear()` (no `@OptIn(InternalKandraApi::class)`),
+and `FakeKandraSession.capturedBatchViews()` returns each statement's CQL and bound values as a public `CapturedStatement`
+([#179](https://github.com/Dev-Pasaka/kandra/issues/179), [#180](https://github.com/Dev-Pasaka/kandra/issues/180), [#181](https://github.com/Dev-Pasaka/kandra/issues/181)).
+On 0.5.0, add `testImplementation("com.datastax.oss:java-driver-core:4.17.0")` and use `@OptIn(InternalKandraApi::class)` with `SchemaRegistry.clear()`.
+</Callout>
 
 ## `FakeKandraSession` — structure, not outcomes
 
@@ -62,18 +62,14 @@ So what is the fake good for? Asserting on the statements a repository call buil
 ```kotlin
 import io.kandra.test.FakeKandraSession
 import io.kandra.test.KandraTestUtils
-import com.datastax.oss.driver.api.core.cql.BoundStatement
-import io.kandra.core.InternalKandraApi
-import io.kandra.core.SchemaRegistry
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.assertEquals
 
-@OptIn(InternalKandraApi::class)   // io.kandra.core.InternalKandraApi — SchemaRegistry is an internal API
 class TodoSaveStructureTest {
 
     @AfterEach
-    fun tearDown() = SchemaRegistry.clear()   // schema registration is process-global
+    fun tearDown() = KandraTestUtils.reset()   // schema registration is process-global
 
     @Test
     fun `save builds one LOGGED batch with the primary INSERT`() {
@@ -83,10 +79,9 @@ class TodoSaveStructureTest {
 
         todoRepo.save(Todo(UUID.randomUUID(), Instant.now(), UUID.randomUUID(), "Ship the release", null))
 
-        val batch = session.capturedBatches().single()
-        val queries = batch.map { (it as BoundStatement).preparedStatement.query }
-        assertEquals(1, queries.size)
-        assertEquals(true, queries.single().startsWith("INSERT INTO todos "))
+        val batch = session.capturedBatchViews().single()          // List<CapturedStatement(cql, values)>
+        assertEquals(1, batch.size)
+        assertEquals(true, batch.single().cql.startsWith("INSERT INTO todos "))
 
         runtime.close()
     }
