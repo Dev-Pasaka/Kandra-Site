@@ -100,7 +100,7 @@ Calling a blocking repository's `saveInBatch` inside a suspend `batch { }` — w
 coroutine's dispatcher thread — is a compile error rather than a silent foot-gun.
 </Callout>
 
-<Callout kind="tip" title="Clearing a column inside the batch (unreleased, next: 0.5.2 — [#189](https://github.com/Dev-Pasaka/kandra/issues/189))">
+<Callout kind="tip" title="Clearing a column inside the batch (0.5.2 — [#189](https://github.com/Dev-Pasaka/kandra/issues/189))">
 `saveInBatch()` leaves a `null` column unchanged (UNSET). To clear it atomically with the other writes, use
 `saveWithNullsInBatch()`, e.g. `claims.saveWithNullsInBatch(claim.copy(releasedAt = null))` next to `audit.saveInBatch(...)`.
 On 0.5.1 there was no way to do this; store a sentinel value instead.

@@ -214,8 +214,8 @@ compatibility, not the real target database. If a difference between Cassandra a
 query-planner behavior matters to what you're testing, this container won't surface it.
 </Callout>
 
-<Callout kind="note" title="Testcontainers dependency (unreleased, next: 0.5.2 — [#190](https://github.com/Dev-Pasaka/kandra/issues/190))">
-From the next release `kandra-test` brings `org.testcontainers:cassandra` and `org.testcontainers:testcontainers` (1.21.4) as `api`
+<Callout kind="note" title="Testcontainers dependency (0.5.2 — [#190](https://github.com/Dev-Pasaka/kandra/issues/190))">
+Since 0.5.2 `kandra-test` brings `org.testcontainers:cassandra` and `org.testcontainers:testcontainers` (1.21.4) as `api`
 dependencies. On 0.5.1 add `testImplementation("org.testcontainers:cassandra:1.21.4")` yourself, or
 `KandraTestcontainers.freshKeyspace()` fails with `NoClassDefFoundError: org/testcontainers/containers/CassandraContainer`.
 </Callout>

@@ -159,7 +159,7 @@ hard-deleted entity removes every lookup row, `BATCH` or `EVENTUAL`, in the same
 `@SoftDelete` entities specifically, lookup rows are deliberately *not* touched at all — see
 [`/recipes/soft-delete`](/recipes/soft-delete).)
 
-<Callout kind="tip" title="Looking up by a clustering key (unreleased, next: 0.5.2 — [#187](https://github.com/Dev-Pasaka/kandra/issues/187))">
+<Callout kind="tip" title="Looking up by a clustering key (0.5.2 — [#187](https://github.com/Dev-Pasaka/kandra/issues/187))">
 The indexed property can itself be part of the primary key. `@ClusteringKey @LookupIndex(tableSuffix = "by_request") val requestId: UUID`
 on a `(userId, requestId)` table gives you `find { SupportRecoveryTable.requestId eq id }` without knowing `userId`. On 0.5.1 this
 shape generated invalid DDL; keep a separate table written in the same batch there.

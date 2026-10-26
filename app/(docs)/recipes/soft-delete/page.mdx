@@ -83,7 +83,7 @@ issued by `delete()`. Here is what happens over time:
   ones you don't need to keep" step required anymore (see [kandra#154](https://github.com/Dev-Pasaka/kandra/issues/154)
   for the full before/after).
 
-<Callout kind="note" title="Enum columns and soft delete (unreleased, next: 0.5.2 — [#198](https://github.com/Dev-Pasaka/kandra/issues/198))">
+<Callout kind="note" title="Enum columns and soft delete (0.5.2 — [#198](https://github.com/Dev-Pasaka/kandra/issues/198))">
 The soft-delete rewrite now encodes values through `KandraCodec` like every other write. Through 0.5.1 it bound raw property
 values, so a `@SoftDelete` entity with an enum (or custom-encoded) column or key failed `delete()` with
 `CodecNotFoundException`.

@@ -165,7 +165,7 @@ names, either — a lookup table name can still collide with an unrelated real t
 careful with naming.
 </Callout>
 
-<Callout kind="note" title="Unreleased (next: 0.5.2): @LookupIndex on a key column — [#187](https://github.com/Dev-Pasaka/kandra/issues/187)">
+<Callout kind="note" title="0.5.2: @LookupIndex on a key column — [#187](https://github.com/Dev-Pasaka/kandra/issues/187)">
 `@LookupIndex` may go on a `@ClusteringKey` or `@PartitionKey` property, e.g. to find a row of a `(userId, requestId)` table by
 `requestId` alone; the lookup table holds the indexed column once plus the other key columns. Through 0.5.1 the generated lookup
 DDL declared it twice, and `CREATE TABLE` failed with `Duplicate column '…' declaration`.
@@ -194,7 +194,7 @@ validation, because there's no `!isTransient` filter on that branch. Don't combi
 you about.
 </Callout>
 
-<Callout kind="note" title="Unreleased (next: 0.5.2): reserved words as column names — [#188](https://github.com/Dev-Pasaka/kandra/issues/188)">
+<Callout kind="note" title="0.5.2: reserved words as column names — [#188](https://github.com/Dev-Pasaka/kandra/issues/188)">
 A column named after a reserved CQL word (`token`, `order`, `from`, `default`, `select`, …) is double-quoted automatically in all
 generated CQL (DDL, writes, reads, lookups, indexes, query-DSL predicates). Only words that Cassandra 4.1 or ScyllaDB 2026.1
 actually reject are quoted (measured, not guessed), so `timestamp`, `type`, `key`, `ttl` and other unreserved words, and the DDL
