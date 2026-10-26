@@ -8,10 +8,51 @@ export const metadata = {
 
 # Changelog
 
-Current version: **v{KANDRA_VERSION}** (`gradle.properties`), matching the latest entry below. One
+Current version: **v{KANDRA_VERSION}** (`gradle.properties`), matching the latest released entry below (the Unreleased section is on `main` but not yet published). One
 file per version, newest first. Every fix here links to the `docs/issues/ISS-NNN-*.md` writeup with
 the actual root cause — this page summarizes, it doesn't replace those. See
 [`/battle-scars`](/battle-scars) for the narrative version of the bugs below.
+
+## Unreleased (next: 0.5.2)
+
+Fixed on `main`, not yet published to Maven Central. Mostly fixes reported while building the Circaso backend. It is a drop-in
+upgrade from 0.5.1 except for one behavior change to versioned `update()`. Full upstream entry:
+[`docs/changelog/unreleased.md`](https://github.com/Dev-Pasaka/kandra/blob/main/docs/changelog/unreleased.md).
+
+### Fixed
+
+- **`@LookupIndex` on a key column** ([#187](https://github.com/Dev-Pasaka/kandra/issues/187)). On a `@ClusteringKey`/`@PartitionKey` property it generated a lookup table declaring the
+  column twice (`Duplicate column … declaration`). The lookup table now holds it once.
+- **Reserved words as column names** ([#188](https://github.com/Dev-Pasaka/kandra/issues/188)). `token`, `order`, `from`, `default`, … are quoted in all generated CQL. The quoted set
+  was measured against Cassandra 4.1 and ScyllaDB 2026.1, so DDL for every other entity is unchanged. Reserved table or keyspace names
+  are rejected at registration.
+- **Clearing columns in a batch or update** ([#189](https://github.com/Dev-Pasaka/kandra/issues/189)). New `saveWithNullsInBatch` / `saveWithNullsInBatchAndGet` and
+  `updateWithNulls` / `updateWithNullsAndGet`.
+- **`kandra-test` brings Testcontainers** ([#190](https://github.com/Dev-Pasaka/kandra/issues/190)). `org.testcontainers:cassandra`/`testcontainers` are `api` dependencies, so
+  `KandraTestcontainers.freshKeyspace()` no longer fails with `NoClassDefFoundError`.
+- **Migration checksums ignore source layout** ([#191](https://github.com/Dev-Pasaka/kandra/issues/191)). Kotlin's inline source map (from `forEach`/`map`/`use` in `up()`) no
+  longer reaches the hash, so reformatting a migration file is safe. Checksums stored by 0.5.1 are accepted and upgraded automatically.
+- **Soft delete with enum columns** ([#198](https://github.com/Dev-Pasaka/kandra/issues/198)). Values are encoded through `KandraCodec`, so `delete()` no longer fails with
+  `CodecNotFoundException`.
+
+- **Migration claims under clock skew** ([#203](https://github.com/Dev-Pasaka/kandra/issues/203)). Marking a migration `APPLIED`, releasing a failed
+  one, and upgrading its checksum are now conditional writes. Before, a lagging application clock could make them silently lose to the
+  claim's LWT, leaving a migration that ran stuck in `CLAIMED`.
+
+- **LWT timeouts at startup** ([#205](https://github.com/Dev-Pasaka/kandra/issues/205)). Replicas starting together contend on the migration and DDL-lock
+  rows; a timed-out CAS write used to crash the replica. Every such write now re-reads its row and continues or retries. The driver's connection-init
+  query timeout also follows `pool { requestTimeoutMillis }` instead of staying at 5 s.
+
+### Changed
+
+- **Versioned `update()` leaves `null` columns UNSET** ([#189](https://github.com/Dev-Pasaka/kandra/issues/189)). Through 0.5.1 it wrote a tombstone for every null column on every
+  versioned update. If you relied on it to clear a column, call `updateWithNulls()`.
+
+### Performance
+
+- **Migration-runner startup** ([#194](https://github.com/Dev-Pasaka/kandra/issues/194)). One plain read instead of DDL plus an LWT when the keyspace is already bootstrapped, a single
+  jar index instead of a full scan per migration, and one checksum per migration per run. Runtime findings from the same review are
+  tracked in [#199](https://github.com/Dev-Pasaka/kandra/issues/199).
 
 ## 0.5.1
 

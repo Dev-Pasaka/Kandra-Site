@@ -97,6 +97,20 @@ in the message itself: *"Never modify a migration after it has been applied."* T
 is a new migration (`V3_...`) that corrects whatever `V2_...` got wrong — never editing `V2_...` in
 place.
 
+<Callout kind="note" title="Reformatting a migration file is safe (unreleased, next: 0.5.2 — [#191](https://github.com/Dev-Pasaka/kandra/issues/191))">
+The snippet above is the original ISS-017 fix. Today the bytes are normalized first: line-number tables, local-variable tables,
+the target bytecode version, and Kotlin's inline source map (SMAP) are excluded. The SMAP matters as soon as `up()` calls an
+inline function such as `forEach`: it records line numbers and the file's line count in the `@SourceDebugExtension` annotation.
+Through 0.5.1 those were hashed, so reformatting the file, or adding a line anywhere in it, failed an applied migration. Upgrading
+is automatic: a checksum stored by an older Kandra is accepted and rewritten to the new form. On 0.5.1, write `up()` with a plain
+`for` loop.
+</Callout>
+
+<Callout kind="tip" title="Cheap startup when nothing is pending (unreleased, next: 0.5.2 — [#194](https://github.com/Dev-Pasaka/kandra/issues/194))">
+A runner against an already-bootstrapped keyspace detects it with one plain read (no DDL, no LWT), and the application jar is
+indexed once instead of scanned for every migration.
+</Callout>
+
 ## Concurrent runners: the claim-first locking pattern
 
 <Callout kind="gotcha" title="ISS-018: two app instances starting simultaneously could both run the same migration">

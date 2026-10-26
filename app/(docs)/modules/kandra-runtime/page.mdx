@@ -163,6 +163,14 @@ via `updateForce`, the **old** lookup row for the previous email is never delete
 `update(old, new)` correctly diffs a real "before" against a real "after."
 </Callout>
 
+<Callout kind="note" title="Unreleased (next: 0.5.2): clearing columns through update() — [#189](https://github.com/Dev-Pasaka/kandra/issues/189)">
+`updateWithNulls(old, new, …)` / `updateWithNullsAndGet(…)` are `update()` / `updateAndGet()` with one difference: a `null`
+property is written as `NULL` (clearing the stored value) instead of being left UNSET. They work for plain and `@Version`
+entities, with the same version check and lookup maintenance. Also from that release, a **versioned `update()` leaves `null`
+columns UNSET**, like `save()` and a plain `update()`. Through 0.5.1 it bound `NULL` for every null column, writing a tombstone
+per null column on every update; if you relied on that to clear a column, switch to `updateWithNulls()`.
+</Callout>
+
 ### Delete family
 
 ```kotlin
@@ -566,6 +574,12 @@ Distinct names (`saveInBatch`, not `save`) make the wrong call a compile error i
 no-atomicity bug. `saveIfNotExistsInBatch` always throws `KandraQueryException` — LWT can't share a
 `LOGGED BATCH` with regular statements, and this is the guard that says so instead of producing a
 batch the driver would reject or mishandle.
+</Callout>
+
+<Callout kind="note" title="Unreleased (next: 0.5.2): saveWithNullsInBatch — [#189](https://github.com/Dev-Pasaka/kandra/issues/189)">
+Both scopes gain `saveWithNullsInBatch(entity, ttlSeconds)` and `saveWithNullsInBatchAndGet(…)`: the batch counterpart of
+`saveWithNulls()`, so a column can be cleared atomically with the batch's other writes. `saveInBatch()` keeps leaving a
+`null` column UNSET.
 </Callout>
 
 ## `CqlSession` extensions — `io.kandra.runtime.driver`

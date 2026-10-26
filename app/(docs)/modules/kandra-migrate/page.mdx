@@ -88,6 +88,12 @@ modify a migration after it has been applied anywhere — the checksum check exi
 catch you if you do, not to be routed around.
 </Callout>
 
+<Callout kind="note" title="Unreleased (next: 0.5.2): checksums ignore source layout — [#191](https://github.com/Dev-Pasaka/kandra/issues/191)">
+The normalizer also drops every string held by Kotlin's `@kotlin.jvm.internal.SourceDebugExtension` annotation (the inline source
+map, with line numbers), so a migration whose `up()` calls `forEach`/`map`/`use` keeps its checksum when the file is reformatted.
+A stored checksum computed by 0.5.1 or earlier is accepted and rewritten on the first run after upgrading.
+</Callout>
+
 ## `KandraMigrationRunner`
 
 ```kotlin
@@ -154,6 +160,19 @@ the keyspace (ScyllaDB DDL isn't transactional either), even though its claim wa
 will be retried from the top on the next `run()`. Write `up()` bodies idempotently
 (`IF NOT EXISTS`/`IF EXISTS`) so a partial-then-retried migration doesn't blow up on the second
 attempt.
+</Callout>
+
+<Callout kind="tip" title="Unreleased (next: 0.5.2): startup cost — [#194](https://github.com/Dev-Pasaka/kandra/issues/194)">
+Constructing a runner against an already-bootstrapped keyspace does one plain `SELECT` of its lock row instead of
+`CREATE TABLE IF NOT EXISTS` plus a losing `IF NOT EXISTS` LWT; the jar is indexed once per JVM; each checksum is computed once per
+`run()`; the runner's statements are prepared once.
+</Callout>
+
+<Callout kind="gotcha" title="Unreleased (next: 0.5.2): claim writes and clock skew — [#203](https://github.com/Dev-Pasaka/kandra/issues/203)">
+The claim is an `INSERT … IF NOT EXISTS` LWT, so its cells carry the Paxos ballot timestamp. On 0.5.1, `markApplied` and the release
+after a failed `up()` were plain writes carrying the client's timestamp. If the application clock lagged the cluster's, they lost to
+the claim and the row stayed `CLAIMED`. From the next release they are conditional (`IF status = 'CLAIMED'`). On 0.5.1, keep
+application clocks NTP-synced with the cluster.
 </Callout>
 
 ### `history(): List<MigrationHistory>`

@@ -135,6 +135,13 @@ identically wouldn't trip it), not a source-text diff, but it catches every *beh
 which the old version could never catch under any circumstance.
 </Callout>
 
+<Callout kind="note" title="Reformatting is safe from the next release ([#191](https://github.com/Dev-Pasaka/kandra/issues/191))">
+`listOf(...).forEach { session.execute(it) }` in `up()` makes Kotlin embed an inline source map (line numbers, file length) in the
+class. Through 0.5.1 that was hashed, so reformatting `V1_AddTodoPriority.kt`, or adding a line anywhere in it, tripped the mismatch
+below even though the CQL hadn't changed. The next release excludes it and upgrades stored checksums automatically. On 0.5.1, use a
+plain `for` loop in `up()`.
+</Callout>
+
 Try to change `V1_AddTodoPriority`'s CQL after it's been applied anywhere — say, to
 `ADD priority TINYINT` instead of `INT` — and the next `run()` call against an environment that
 already has version 1 recorded throws:
