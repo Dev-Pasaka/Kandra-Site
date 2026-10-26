@@ -18,7 +18,7 @@ export const SITE_REPO_URL = "https://github.com/Dev-Pasaka/Kandra-Site";
 // again; re-check the live site on each release and bump it when Dokka catches up. Module
 // reference pages surface any gap explicitly instead of silently linking to stale docs.
 export const DOKKA_BASE_URL = "https://dev-pasaka.github.io/kandra";
-export const DOKKA_PUBLISHED_VERSION = "0.5.1";
+export const DOKKA_PUBLISHED_VERSION = "0.5.2";
 
 export const KANDRA_MODULES = [
   "kandra-bom",
